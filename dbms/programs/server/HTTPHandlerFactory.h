@@ -9,6 +9,7 @@
 #include "InterserverIOHTTPHandler.h"
 #include "NotFoundHandler.h"
 #include "PingRequestHandler.h"
+#include "OnlyParseHandler.h"
 #include "ReplicasStatusHandler.h"
 #include "RootRequestHandler.h"
 
@@ -50,6 +51,8 @@ public:
                 return new RootRequestHandler(server);
             if (uri == "/ping")
                 return new PingRequestHandler(server);
+            if (startsWith(uri, "/only_parse"))
+                return new OnlyParseHandler(server.context());
             else if (startsWith(uri, "/replicas_status"))
                 return new ReplicasStatusHandler(server.context());
         }
