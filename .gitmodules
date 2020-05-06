@@ -151,3 +151,6 @@
 [submodule "website/images/feathericons"]
 	path = website/images/feathericons
 	url = https://github.com/feathericons/feather
+[submodule "contrib/krb5"]
+	path = contrib/krb5
+	url = https://github.com/krb5/krb5
