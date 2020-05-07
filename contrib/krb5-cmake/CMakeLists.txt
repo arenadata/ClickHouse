@@ -38,7 +38,58 @@ set(KRB5_SRC
         ${KRB5_INCLUDE_DIR}/util/support/hashtab.c
         ${KRB5_INCLUDE_DIR}/util/support/mkstemp.c
         ${KRB5_INCLUDE_DIR}/util/support/t_unal.c
-)
+        ${KRB5_INCLUDE_DIR}/lib/rpc/pmap_prot.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/auth_gss.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/pmap_prot2.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/auth_gssapi.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/pmap_rmt.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/auth_gssapi_misc.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/rpc_callmsg.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/auth_none.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/rpc_commondata.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/auth_unix.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/rpc_dtablesize.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/authgss_prot.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/rpc_prot.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/authunix_prot.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/bindresvport.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_auth.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/clnt_generic.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_auth_gss.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/clnt_perror.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_auth_gssapi.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/clnt_raw.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_auth_none.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/clnt_simple.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_auth_unix.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/clnt_tcp.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_raw.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/clnt_udp.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_run.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_simple.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/dyn.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_tcp.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/svc_udp.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/unit-test
+        ${KRB5_INCLUDE_DIR}/lib/rpc/dyntest.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/get_myaddress.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_alloc.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/getrpcent.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_array.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/getrpcport.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_float.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_mem.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/libgssrpc.exports
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_rec.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/pmap_clnt.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_reference.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/pmap_getmaps.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_sizeof.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/pmap_getport.c
+        ${KRB5_INCLUDE_DIR}/lib/rpc/xdr_stdio.c
+        )
 
 add_library(krb5 ${KRB5_SRC})
 
