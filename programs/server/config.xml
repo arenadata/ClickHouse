@@ -159,7 +159,7 @@
     -->
     <!-- <umask>022</umask> -->
 
-    <!-- Perform mlockall after startup to lower first queries latency
+    <!-- Perform mlockgit submodule addall after startup to lower first queries latency
           and to prevent clickhouse executable from being paged out under high IO load.
          Enabling this option is recommended but will lead to increased startup time for up to a few seconds.
     -->

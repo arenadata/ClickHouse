@@ -2,6 +2,8 @@ if(NOT ARCH_ARM AND NOT OS_FREEBSD AND NOT APPLE AND USE_PROTOBUF)
     option(ENABLE_HDFS "Enable HDFS" ${ENABLE_LIBRARIES})
 endif()
 
+set(USE_INTERNAL_HDFS3_LIBRARY 1)
+
 if(ENABLE_HDFS)
 option(USE_INTERNAL_HDFS3_LIBRARY "Set to FALSE to use system HDFS3 instead of bundled" ${NOT_UNBUNDLED})
 
@@ -12,6 +14,7 @@ if(NOT EXISTS "${ClickHouse_SOURCE_DIR}/contrib/libhdfs3/include/hdfs/hdfs.h")
     set(MISSING_INTERNAL_HDFS3_LIBRARY 1)
     set(USE_INTERNAL_HDFS3_LIBRARY 0)
 endif()
+
 
 if(NOT USE_INTERNAL_HDFS3_LIBRARY)
     find_library(HDFS3_LIBRARY hdfs3)

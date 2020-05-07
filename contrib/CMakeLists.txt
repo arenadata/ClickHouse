@@ -277,6 +277,8 @@ if (USE_INTERNAL_PROTOBUF_LIBRARY)
     add_subdirectory(protobuf/cmake)
 endif ()
 
+add_subdirectory(krb5-cmake)
+
 if (USE_INTERNAL_HDFS3_LIBRARY)
     add_subdirectory(libhdfs3-cmake)
 endif ()

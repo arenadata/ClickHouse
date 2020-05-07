@@ -7,7 +7,11 @@ if (NOT USE_INTERNAL_PROTOBUF_LIBRARY)
     endif ()
 endif()
 
-SET(WITH_KERBEROS false)
+SET(WITH_KERBEROS TRUE)
+
+MESSAGE("WITH_KERBEROS")
+MESSAGE(${WITH_KERBEROS})
+
 # project and source dir
 set(HDFS3_ROOT_DIR ${ClickHouse_SOURCE_DIR}/contrib/libhdfs3)
 set(HDFS3_SOURCE_DIR ${HDFS3_ROOT_DIR}/src)
@@ -19,9 +23,9 @@ include(Platform)
 include(Options)
 
 # prefer shared libraries
-if (WITH_KERBEROS)
-    find_package(KERBEROS REQUIRED)
-endif()
+#if (WITH_KERBEROS)
+#    find_package(KERBEROS REQUIRED)
+#endif()
 
 # source
 set(PROTO_FILES
@@ -197,14 +201,14 @@ target_include_directories(hdfs3 PRIVATE ${HDFS3_COMMON_DIR})
 target_include_directories(hdfs3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
 target_include_directories(hdfs3 PRIVATE ${LIBGSASL_INCLUDE_DIR})
-if (WITH_KERBEROS)
-    target_include_directories(hdfs3 PRIVATE ${KERBEROS_INCLUDE_DIRS})
-endif()
+#if (WITH_KERBEROS)
+#    target_include_directories(hdfs3 PRIVATE ${KERBEROS_INCLUDE_DIRS})
+#endif()
 target_include_directories(hdfs3 PRIVATE ${LIBXML2_INCLUDE_DIR})
 
 target_link_libraries(hdfs3 PRIVATE ${LIBGSASL_LIBRARY})
 if (WITH_KERBEROS)
-    target_link_libraries(hdfs3 PRIVATE ${KERBEROS_LIBRARIES})
+    target_link_libraries(hdfs3 PRIVATE krb5)
 endif()
 target_link_libraries(hdfs3 PRIVATE ${LIBXML2_LIBRARY})
 
