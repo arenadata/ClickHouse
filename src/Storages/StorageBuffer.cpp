@@ -245,6 +245,18 @@ Pipes StorageBuffer::read(
     for (auto & buf : buffers)
         pipes_from_buffers.emplace_back(std::make_shared<BufferSource>(column_names, buf, *this));
 
+    /// Convert pipes from table to structure from buffer.
+    if (!pipes_from_buffers.empty() && !pipes_from_dst.empty()
+        && !blocksHaveEqualStructure(pipes_from_buffers.front().getHeader(), pipes_from_dst.front().getHeader()))
+    {
+        for (auto & pipe : pipes_from_dst)
+            pipe.addSimpleTransform(std::make_shared<ConvertingTransform>(
+                    pipe.getHeader(),
+                    pipes_from_buffers.front().getHeader(),
+                    ConvertingTransform::MatchColumnsMode::Name,
+                    context));
+    }
+
     /** If the sources from the table were processed before some non-initial stage of query execution,
       * then sources from the buffers must also be wrapped in the processing pipeline before the same stage.
       */
@@ -696,7 +708,10 @@ void StorageBuffer::writeBlockToDestination(const Block & block, StoragePtr tabl
     for (const auto & column : block_to_write)
         list_of_columns->children.push_back(std::make_shared<ASTIdentifier>(column.name));
 
-    InterpreterInsertQuery interpreter{insert, global_context, allow_materialized};
+    auto insert_context = Context(global_context);
+    insert_context.makeQueryContext();
+
+    InterpreterInsertQuery interpreter{insert, insert_context, allow_materialized};
 
     auto block_io = interpreter.execute();
     block_io.out->writePrefix();

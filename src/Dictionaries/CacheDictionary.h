@@ -55,10 +55,12 @@ public:
         const DictionaryStructure & dict_struct_,
         DictionarySourcePtr source_ptr_,
         DictionaryLifetime dict_lifetime_,
+        size_t strict_max_lifetime_seconds,
         size_t size_,
         bool allow_read_expired_keys_,
         size_t max_update_queue_size_,
         size_t update_queue_push_timeout_milliseconds_,
+        size_t query_wait_timeout_milliseconds,
         size_t max_threads_for_updates);
 
     ~CacheDictionary() override;
@@ -87,9 +89,18 @@ public:
     std::shared_ptr<const IExternalLoadable> clone() const override
     {
         return std::make_shared<CacheDictionary>(
-                database, name, dict_struct, source_ptr->clone(), dict_lifetime, size,
-                allow_read_expired_keys, max_update_queue_size,
-                update_queue_push_timeout_milliseconds, max_threads_for_updates);
+                database,
+                name,
+                dict_struct,
+                getSourceAndUpdateIfNeeded()->clone(),
+                dict_lifetime,
+                strict_max_lifetime_seconds,
+                size,
+                allow_read_expired_keys,
+                max_update_queue_size,
+                update_queue_push_timeout_milliseconds,
+                query_wait_timeout_milliseconds,
+                max_threads_for_updates);
     }
 
     const IDictionarySource * getSource() const override { return source_ptr.get(); }
@@ -206,6 +217,8 @@ private:
         /// Stores both expiration time and `is_default` flag in the most significant bit
         time_point_urep_t data;
 
+        time_point_t strict_max;
+
         /// Sets expiration time, resets `is_default` flag to false
         time_point_t expiresAt() const { return ext::safe_bit_cast<time_point_t>(data & EXPIRES_AT_MASK); }
         void setExpiresAt(const time_point_t & t) { data = ext::safe_bit_cast<time_point_urep_t>(t); }
@@ -276,6 +289,26 @@ private:
 
     Attribute & getAttribute(const std::string & attribute_name) const;
 
+    using SharedDictionarySourcePtr = std::shared_ptr<IDictionarySource>;
+
+    /// Update dictionary source pointer if required and return it. Thread safe.
+    /// MultiVersion is not used here because it works with constant pointers.
+    /// For some reason almost all methods in IDictionarySource interface are
+    /// not constant.
+    SharedDictionarySourcePtr getSourceAndUpdateIfNeeded() const
+    {
+        std::lock_guard lock(source_mutex);
+        if (error_count)
+        {
+            /// Recover after error: we have to clone the source here because
+            /// it could keep connections which should be reset after error.
+            auto new_source_ptr = source_ptr->clone();
+            source_ptr = std::move(new_source_ptr);
+        }
+
+        return source_ptr;
+    }
+
     struct FindResult
     {
         const size_t cell_idx;
@@ -292,15 +325,24 @@ private:
     const std::string name;
     const std::string full_name;
     const DictionaryStructure dict_struct;
-    mutable DictionarySourcePtr source_ptr;
+
+    /// Dictionary source should be used with mutex
+    mutable std::mutex source_mutex;
+    mutable SharedDictionarySourcePtr source_ptr;
+
     const DictionaryLifetime dict_lifetime;
+    const size_t strict_max_lifetime_seconds;
     const bool allow_read_expired_keys;
     const size_t max_update_queue_size;
     const size_t update_queue_push_timeout_milliseconds;
+    const size_t query_wait_timeout_milliseconds;
     const size_t max_threads_for_updates;
 
     Logger * const log;
 
+    /// This lock is used for the inner cache state update function lock it for
+    /// write, when it need to update cache state all other functions just
+    /// readers. Suprisingly this lock is also used for last_exception pointer.
     mutable std::shared_mutex rw_lock;
 
     /// Actual size will be increased to match power of 2
@@ -366,6 +408,12 @@ private:
                 alive_keys(CurrentMetrics::CacheDictionaryUpdateQueueKeys, requested_ids.size()){}
 
         std::vector<Key> requested_ids;
+
+        /// It might seem that it is a leak of performance.
+        /// But aquiring a mutex without contention is rather cheap.
+        std::mutex callback_mutex;
+        bool can_use_callback{true};
+
         PresentIdHandler present_id_handler;
         AbsentIdHandler absent_id_handler;
 
@@ -412,6 +460,7 @@ private:
                     helper.push_back(unit_ptr->requested_ids.size() + helper.back());
                 present_id_handlers.emplace_back(unit_ptr->present_id_handler);
                 absent_id_handlers.emplace_back(unit_ptr->absent_id_handler);
+                update_units.emplace_back(unit_ptr);
             }
 
             concatenated_requested_ids.reserve(total_requested_keys_count);
@@ -428,31 +477,51 @@ private:
 
         void informCallersAboutPresentId(Key id, size_t cell_idx)
         {
-            for (size_t i = 0; i < concatenated_requested_ids.size(); ++i)
+            for (size_t position = 0; position < concatenated_requested_ids.size(); ++position)
             {
-                auto & curr = concatenated_requested_ids[i];
-                if (curr == id)
-                    getPresentIdHandlerForPosition(i)(id, cell_idx);
+                if (concatenated_requested_ids[position] == id)
+                {
+                    auto unit_number = getUpdateUnitNumberForRequestedIdPosition(position);
+                    auto lock = getLockToCurrentUnit(unit_number);
+                    if (canUseCallback(unit_number))
+                        getPresentIdHandlerForPosition(unit_number)(id, cell_idx);
+                }
             }
         }
 
         void informCallersAboutAbsentId(Key id, size_t cell_idx)
         {
-            for (size_t i = 0; i < concatenated_requested_ids.size(); ++i)
-                if (concatenated_requested_ids[i] == id)
-                    getAbsentIdHandlerForPosition(i)(id, cell_idx);
+            for (size_t position = 0; position < concatenated_requested_ids.size(); ++position)
+                if (concatenated_requested_ids[position] == id)
+                {
+                    auto unit_number = getUpdateUnitNumberForRequestedIdPosition(position);
+                    auto lock = getLockToCurrentUnit(unit_number);
+                    if (canUseCallback(unit_number))
+                        getAbsentIdHandlerForPosition(unit_number)(id, cell_idx);
+                }
         }
 
 
     private:
-        PresentIdHandler & getPresentIdHandlerForPosition(size_t position)
+        /// Needed for control the usage of callback to avoid SEGFAULTs.
+        bool canUseCallback(size_t unit_number)
         {
-            return present_id_handlers[getUpdateUnitNumberForRequestedIdPosition(position)];
+            return update_units[unit_number].get()->can_use_callback;
         }
 
-        AbsentIdHandler & getAbsentIdHandlerForPosition(size_t position)
+        std::unique_lock<std::mutex> getLockToCurrentUnit(size_t unit_number)
         {
-            return absent_id_handlers[getUpdateUnitNumberForRequestedIdPosition((position))];
+            return std::unique_lock<std::mutex>(update_units[unit_number].get()->callback_mutex);
+        }
+
+        PresentIdHandler & getPresentIdHandlerForPosition(size_t unit_number)
+        {
+            return update_units[unit_number].get()->present_id_handler;
+        }
+
+        AbsentIdHandler & getAbsentIdHandlerForPosition(size_t unit_number)
+        {
+            return update_units[unit_number].get()->absent_id_handler;
         }
 
         size_t getUpdateUnitNumberForRequestedIdPosition(size_t position)
@@ -463,6 +532,8 @@ private:
         std::vector<Key> concatenated_requested_ids;
         std::vector<PresentIdHandler> present_id_handlers;
         std::vector<AbsentIdHandler> absent_id_handlers;
+
+        std::vector<std::reference_wrapper<UpdateUnitPtr>> update_units;
 
         std::vector<size_t> helper;
     };

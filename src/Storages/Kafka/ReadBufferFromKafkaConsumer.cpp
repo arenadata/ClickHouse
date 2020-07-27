@@ -8,8 +8,14 @@
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int CANNOT_COMMIT_OFFSET;
+}
+
 using namespace std::chrono_literals;
 const auto MAX_TIME_TO_WAIT_FOR_ASSIGNMENT_MS = 15000;
+const auto DRAIN_TIMEOUT_MS = 5000ms;
 
 
 ReadBufferFromKafkaConsumer::ReadBufferFromKafkaConsumer(
@@ -31,14 +37,14 @@ ReadBufferFromKafkaConsumer::ReadBufferFromKafkaConsumer(
     , topics(_topics)
 {
     // called (synchroniously, during poll) when we enter the consumer group
-    consumer->set_assignment_callback([this](const cppkafka::TopicPartitionList& topic_partitions)
+    consumer->set_assignment_callback([this](const cppkafka::TopicPartitionList & topic_partitions)
     {
         LOG_TRACE(log, "Topics/partitions assigned: " << topic_partitions);
         assignment = topic_partitions;
     });
 
     // called (synchroniously, during poll) when we leave the consumer group
-    consumer->set_revocation_callback([this](const cppkafka::TopicPartitionList& topic_partitions)
+    consumer->set_revocation_callback([this](const cppkafka::TopicPartitionList & topic_partitions)
     {
         // Rebalance is happening now, and now we have a chance to finish the work
         // with topics/partitions we were working with before rebalance
@@ -77,20 +83,70 @@ ReadBufferFromKafkaConsumer::ReadBufferFromKafkaConsumer(
 
 ReadBufferFromKafkaConsumer::~ReadBufferFromKafkaConsumer()
 {
-    /// NOTE: see https://github.com/edenhill/librdkafka/issues/2077
     try
     {
         if (!consumer->get_subscription().empty())
-            consumer->unsubscribe();
-        if (!assignment.empty())
-            consumer->unassign();
-        while (consumer->get_consumer_queue().next_event(100ms));
+        {
+            try
+            {
+                consumer->unsubscribe();
+            }
+            catch (const cppkafka::HandleException & e)
+            {
+                LOG_ERROR(log, "Error during unsubscribe: " << e.what());
+            }
+            drain();
+        }
     }
     catch (const cppkafka::HandleException & e)
     {
-        LOG_ERROR(log, "Exception from ReadBufferFromKafkaConsumer destructor: " << e.what());
+        LOG_ERROR(log, "Error while destructing consumer: " << e.what());
+    }
+
+}
+
+// Needed to drain rest of the messages / queued callback calls from the consumer
+// after unsubscribe, otherwise consumer will hang on destruction
+// see https://github.com/edenhill/librdkafka/issues/2077
+//     https://github.com/confluentinc/confluent-kafka-go/issues/189 etc.
+void ReadBufferFromKafkaConsumer::drain()
+{
+    auto start_time = std::chrono::steady_clock::now();
+    cppkafka::Error last_error(RD_KAFKA_RESP_ERR_NO_ERROR);
+
+    while (true)
+    {
+        auto msg = consumer->poll(100ms);
+        if (!msg)
+            break;
+
+        auto error = msg.get_error();
+
+        if (error)
+        {
+            if (msg.is_eof() || error == last_error)
+            {
+                break;
+            }
+            else
+            {
+                LOG_ERROR(log, "Error during draining: " << error);
+            }
+        }
+
+        // i don't stop draining on first error,
+        // only if it repeats once again sequentially
+        last_error = error;
+
+        auto ts = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(ts-start_time) > DRAIN_TIMEOUT_MS)
+        {
+            LOG_ERROR(log, "Timeout during draining.");
+            break;
+        }
     }
 }
+
 
 void ReadBufferFromKafkaConsumer::commit()
 {
@@ -140,16 +196,41 @@ void ReadBufferFromKafkaConsumer::commit()
         // we may need to repeat commit in sync mode in revocation callback,
         // but it seems like existing API doesn't allow us to to that
         // in a controlled manner (i.e. we don't know the offsets to commit then)
-        consumer->commit();
+
+        size_t max_retries = 5;
+        bool commited = false;
+
+        while (!commited && max_retries > 0)
+        {
+            try
+            {
+                // See https://github.com/edenhill/librdkafka/issues/1470
+                // broker may reject commit if during offsets.commit.timeout.ms (5000 by default),
+                // there were not enough replicas available for the __consumer_offsets topic.
+                // also some other temporary issues like client-server connectivity problems are possible
+                consumer->commit();
+                commited = true;
+                PrintOffsets("Committed offset", consumer->get_offsets_committed(consumer->get_assignment()));
+            }
+            catch (const cppkafka::HandleException & e)
+            {
+                LOG_ERROR(log, "Exception during commit attempt: " << e.what());
+            }
+            --max_retries;
+        }
+
+        if (!commited)
+        {
+            // TODO: insert atomicity / transactions is needed here (possibility to rollback, ot 2 phase commits)
+            throw Exception("All commit attempts failed. Last block was already written to target table(s), but was not commited to Kafka.", ErrorCodes::CANNOT_COMMIT_OFFSET);
+        }
     }
     else
     {
-        LOG_TRACE(log,"Nothing to commit.");
+        LOG_TRACE(log, "Nothing to commit.");
     }
 
-    PrintOffsets("Committed offset", consumer->get_offsets_committed(consumer->get_assignment()));
     offsets_stored = 0;
-
     stalled = false;
 }
 
@@ -196,8 +277,13 @@ void ReadBufferFromKafkaConsumer::unsubscribe()
     // it should not raise exception as used in destructor
     try
     {
-        if (!consumer->get_subscription().empty())
-            consumer->unsubscribe();
+        // From docs: Any previous subscription will be unassigned and unsubscribed first.
+        consumer->subscribe(topics);
+
+        // I wanted to avoid explicit unsubscribe as it requires draining the messages
+        // to close the consumer safely after unsubscribe
+        // see https://github.com/edenhill/librdkafka/issues/2077
+        //     https://github.com/confluentinc/confluent-kafka-go/issues/189 etc.
     }
     catch (const cppkafka::HandleException & e)
     {
@@ -222,18 +308,29 @@ void ReadBufferFromKafkaConsumer::resetToLastCommitted(const char * msg)
     }
     auto committed_offset = consumer->get_offsets_committed(consumer->get_assignment());
     consumer->assign(committed_offset);
-    LOG_TRACE(log, msg << "Returned to committed position: " << committed_offset);
-
+    LOG_TRACE(log, msg << " Returned to committed position: " << committed_offset);
 }
 
 /// Do commit messages implicitly after we processed the previous batch.
 bool ReadBufferFromKafkaConsumer::nextImpl()
 {
+
     /// NOTE: ReadBuffer was implemented with an immutable underlying contents in mind.
     ///       If we failed to poll any message once - don't try again.
     ///       Otherwise, the |poll_timeout| expectations get flawn.
-    if (stalled || stopped || !allowed || rebalance_happened)
+
+    // we can react on stop only during fetching data
+    // after block is formed (i.e. during copying data to MV / commiting)  we ignore stop attempts
+    if (stopped)
+    {
+        was_stopped = true;
+        offsets_stored = 0;
         return false;
+    }
+
+    if (stalled || was_stopped || !allowed || rebalance_happened)
+        return false;
+
 
     if (current == messages.end())
     {
@@ -246,7 +343,13 @@ bool ReadBufferFromKafkaConsumer::nextImpl()
             /// Don't drop old messages immediately, since we may need them for virtual columns.
             auto new_messages = consumer->poll_batch(batch_size, std::chrono::milliseconds(poll_timeout));
 
-            if (rebalance_happened)
+            if (stopped)
+            {
+                was_stopped = true;
+                offsets_stored = 0;
+                return false;
+            }
+            else if (rebalance_happened)
             {
                 if (!new_messages.empty())
                 {
@@ -317,7 +420,7 @@ bool ReadBufferFromKafkaConsumer::nextImpl()
 
 void ReadBufferFromKafkaConsumer::storeLastReadMessageOffset()
 {
-    if (!stalled && !rebalance_happened)
+    if (!stalled && !was_stopped && !rebalance_happened)
     {
         consumer->store_offset(*(current - 1));
         ++offsets_stored;

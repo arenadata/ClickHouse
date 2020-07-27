@@ -269,7 +269,7 @@ QueryPipeline InterpreterSelectWithUnionQuery::executeWithProcessors()
     if (!pipelines.empty())
     {
         auto common_header = getCommonHeaderForUnion(headers);
-        main_pipeline.unitePipelines(std::move(pipelines), common_header, *context);
+        main_pipeline.unitePipelines(std::move(pipelines), common_header, *context, context->getSettingsRef().max_threads);
     }
 
     main_pipeline.addInterpreterContext(context);

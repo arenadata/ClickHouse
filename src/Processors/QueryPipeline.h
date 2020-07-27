@@ -122,7 +122,7 @@ public:
 
     void enableQuotaForCurrentStreams();
 
-    void unitePipelines(std::vector<QueryPipeline> && pipelines, const Block & common_header, const Context & context);
+    void unitePipelines(std::vector<QueryPipeline> && pipelines, const Block & common_header, const Context & context, size_t max_threads_limit = 0);
 
     PipelineExecutorPtr execute();
 
@@ -155,8 +155,16 @@ public:
     /// Set upper limit for the recommend number of threads
     void setMaxThreads(size_t max_threads_) { max_threads = max_threads_; }
 
-    /// Convert query pipeline to single pipe.
+    /// Update upper limit for the recommend number of threads
+    void limitMaxThreads(size_t max_threads_)
+    {
+        if (max_threads == 0 || max_threads_ < max_threads)
+            max_threads = max_threads_;
+    }
+
+    /// Convert query pipeline to single or several pipes.
     Pipe getPipe() &&;
+    Pipes getPipes() &&;
 
 private:
     /// Destruction order: processors, header, locks, temporary storages, local contexts

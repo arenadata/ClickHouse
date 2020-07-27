@@ -118,7 +118,8 @@ namespace ErrorCodes
 }
 
 /// Assumes `storage` is set and the table filter (row-level security) is not empty.
-String InterpreterSelectQuery::generateFilterActions(ExpressionActionsPtr & actions, const ASTPtr & row_policy_filter, const Names & prerequisite_columns) const
+String InterpreterSelectQuery::generateFilterActions(
+    ExpressionActionsPtr & actions, const ASTPtr & row_policy_filter, const Names & prerequisite_columns) const
 {
     const auto & db_name = table_id.getDatabaseName();
     const auto & table_name = table_id.getTableName();
@@ -515,8 +516,7 @@ Block InterpreterSelectQuery::getSampleBlockImpl(bool try_move_to_prewhere)
             second_stage,
             options.only_analyze,
             filter_info,
-            source_header
-        );
+            source_header);
 
     if (options.to_stage == QueryProcessingStage::Enum::FetchColumns)
     {
@@ -1042,7 +1042,7 @@ void InterpreterSelectQuery::executeFetchColumns(
     {
         if (!settings.optimize_trivial_count_query || !syntax_analyzer_result->maybe_optimize_trivial_count || !storage
             || query.sample_size() || query.sample_offset() || query.final() || query.prewhere() || query.where()
-            || !query_analyzer->hasAggregation() || processing_stage != QueryProcessingStage::FetchColumns)
+            || filter_info || !query_analyzer->hasAggregation() || processing_stage != QueryProcessingStage::FetchColumns)
             return {};
 
         const AggregateDescriptions & aggregates = query_analyzer->aggregates();
@@ -1272,6 +1272,9 @@ void InterpreterSelectQuery::executeFetchColumns(
             + ", maximum: " + settings.max_columns_to_read.toString(),
             ErrorCodes::TOO_MANY_COLUMNS);
 
+    /// General limit for the number of threads.
+    pipeline.setMaxThreads(settings.max_threads);
+
     /** With distributed query processing, almost no computations are done in the threads,
      *  but wait and receive data from remote servers.
      *  If we have 20 remote servers, and max_threads = 8, then it would not be very good
@@ -1459,15 +1462,18 @@ void InterpreterSelectQuery::executeFetchColumns(
               * But limits on data size to read and maximum execution time are reasonable to check both on initiator and
               *  additionally on each remote server, because these limits are checked per block of data processed,
               *  and remote servers may process way more blocks of data than are received by initiator.
+              *
+              * The limits to throttle maximum execution speed is also checked on all servers.
               */
             if (options.to_stage == QueryProcessingStage::Complete)
             {
                 limits.speed_limits.min_execution_rps = settings.min_execution_speed;
-                limits.speed_limits.max_execution_rps = settings.max_execution_speed;
                 limits.speed_limits.min_execution_bps = settings.min_execution_speed_bytes;
-                limits.speed_limits.max_execution_bps = settings.max_execution_speed_bytes;
-                limits.speed_limits.timeout_before_checking_execution_speed = settings.timeout_before_checking_execution_speed;
             }
+
+            limits.speed_limits.max_execution_rps = settings.max_execution_speed;
+            limits.speed_limits.max_execution_bps = settings.max_execution_speed_bytes;
+            limits.speed_limits.timeout_before_checking_execution_speed = settings.timeout_before_checking_execution_speed;
 
             auto quota = context->getQuota();
 
@@ -1493,8 +1499,8 @@ void InterpreterSelectQuery::executeFetchColumns(
 
         if constexpr (pipeline_with_processors)
         {
-            if (streams.size() == 1 || pipes.size() == 1)
-                pipeline.setMaxThreads(streams.size());
+            if (!storage->isView() && (streams.size() == 1 || pipes.size() == 1))
+                pipeline.setMaxThreads(1);
 
             /// Unify streams. They must have same headers.
             if (streams.size() > 1)

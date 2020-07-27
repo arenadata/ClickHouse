@@ -26,6 +26,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int UNKNOWN_IDENTIFIER;
+    extern const int UNSUPPORTED_JOIN_KEYS;
     extern const int LOGICAL_ERROR;
 }
 
@@ -207,13 +208,11 @@ void TranslateQualifiedNamesMatcher::visit(ASTExpressionList & node, const ASTPt
                 if (tables_with_columns.empty())
                     throw Exception("An asterisk cannot be replaced with empty columns.", ErrorCodes::LOGICAL_ERROR);
                 has_asterisk = true;
-                break;
             }
             else if (const auto * qa = child->as<ASTQualifiedAsterisk>())
             {
                 visit(*qa, child, data); /// check if it's OK before rewrite
                 has_asterisk = true;
-                break;
             }
         }
 
@@ -296,20 +295,52 @@ void TranslateQualifiedNamesMatcher::extractJoinUsingColumns(const ASTPtr ast, D
             {
                 String alias = key->tryGetAlias();
                 if (alias.empty())
-                    throw Exception("Logical error: expected identifier or alias, got: " + key->getID(), ErrorCodes::LOGICAL_ERROR);
+                    throw Exception("Wrong key in USING. Expected identifier or alias, got: " + key->getID(),
+                                    ErrorCodes::UNSUPPORTED_JOIN_KEYS);
                 data.join_using_columns.insert(alias);
             }
     }
 }
 
-void RestoreQualifiedNamesData::visit(ASTIdentifier & identifier, ASTPtr & ast)
+
+void RestoreQualifiedNamesMatcher::Data::changeTable(ASTIdentifier & identifier) const
+{
+    auto match = IdentifierSemantic::canReferColumnToTable(identifier, distributed_table);
+    switch (match)
+    {
+        case IdentifierSemantic::ColumnMatch::AliasedTableName:
+        case IdentifierSemantic::ColumnMatch::TableName:
+        case IdentifierSemantic::ColumnMatch::DbAndTable:
+            IdentifierSemantic::setColumnLongName(identifier, remote_table);
+            break;
+        default:
+            break;
+    }
+}
+
+bool RestoreQualifiedNamesMatcher::needChildVisit(ASTPtr &, const ASTPtr & child)
+{
+    /// Do not go into subqueries
+    if (child->as<ASTSelectWithUnionQuery>())
+        return false; // NOLINT
+    return true;
+}
+
+void RestoreQualifiedNamesMatcher::visit(ASTPtr & ast, Data & data)
+{
+    if (auto * t = ast->as<ASTIdentifier>())
+        visit(*t, ast, data);
+}
+
+void RestoreQualifiedNamesMatcher::visit(ASTIdentifier & identifier, ASTPtr &, Data & data)
 {
     if (IdentifierSemantic::getColumnName(identifier))
     {
         if (IdentifierSemantic::getMembership(identifier))
         {
-            ast = identifier.clone();
-            ast->as<ASTIdentifier>()->restoreCompoundName();
+            identifier.restoreCompoundName();
+            if (data.rename)
+                data.changeTable(identifier);
         }
     }
 }

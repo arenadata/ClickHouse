@@ -502,12 +502,15 @@ private:
             if (!history_file.empty() && !Poco::File(history_file).exists())
                 Poco::File(history_file).createFile();
 
+            LineReader::Patterns query_extenders = {"\\"};
+            LineReader::Patterns query_delimiters = {";", "\\G"};
+
 #if USE_REPLXX
-            ReplxxLineReader lr(Suggest::instance(), history_file, '\\', config().has("multiline") ? ';' : 0);
-#elif USE_READLINE
-            ReadlineLineReader lr(Suggest::instance(), history_file, '\\', config().has("multiline") ? ';' : 0);
+            ReplxxLineReader lr(Suggest::instance(), history_file, config().has("multiline"), query_extenders, query_delimiters);
+#elif defined(USE_READLINE) && USE_READLINE
+            ReadlineLineReader lr(Suggest::instance(), history_file, config().has("multiline"), query_extenders, query_delimiters);
 #else
-            LineReader lr(history_file, '\\', config().has("multiline") ? ';' : 0);
+            LineReader lr(history_file, config().has("multiline"), query_extenders, query_delimiters);
 #endif
 
             /// Enable bracketed-paste-mode only when multiquery is enabled and multiline is
@@ -1361,7 +1364,8 @@ private:
                 }
                 else
                 {
-                    out_logs_buf = std::make_unique<WriteBufferFromFile>(server_logs_file, DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_APPEND | O_CREAT);
+                    out_logs_buf = std::make_unique<WriteBufferFromFile>(
+                        server_logs_file, DBMS_DEFAULT_BUFFER_SIZE, O_WRONLY | O_APPEND | O_CREAT);
                     wb = out_logs_buf.get();
                 }
             }
@@ -1558,6 +1562,11 @@ private:
         auto embedded_stack_trace_pos = text.find("Stack trace");
         if (std::string::npos != embedded_stack_trace_pos && !config().getBool("stacktrace", false))
             text.resize(embedded_stack_trace_pos);
+
+        /// If we probably have progress bar, we should add additional newline,
+        /// otherwise exception may display concatenated with the progress bar.
+        if (need_render_progress)
+            std::cerr << '\n';
 
         std::cerr << "Received exception from server (version " << server_version << "):" << std::endl
             << "Code: " << e.code() << ". " << text << std::endl;
@@ -1794,7 +1803,11 @@ public:
                 std::string text = e.displayText();
                 std::cerr << "Code: " << e.code() << ". " << text << std::endl;
                 std::cerr << "Table №" << i << std::endl << std::endl;
-                exit(e.code());
+                /// Avoid the case when error exit code can possibly overflow to normal (zero).
+                auto exit_code = e.code() % 256;
+                if (exit_code == 0)
+                    exit_code = 255;
+                exit(exit_code);
             }
         }
 

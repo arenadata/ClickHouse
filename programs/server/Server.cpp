@@ -535,7 +535,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
     if (mark_cache_size > max_cache_size)
     {
         mark_cache_size = max_cache_size;
-        LOG_INFO(log, "Mark cache size was lowered to " << formatReadableSizeWithBinarySuffix(uncompressed_cache_size)
+        LOG_INFO(log, "Mark cache size was lowered to " << formatReadableSizeWithBinarySuffix(mark_cache_size)
             << " because the system has low amount of memory");
     }
     global_context->setMarkCache(mark_cache_size);
@@ -641,7 +641,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
     if (!hasLinuxCapability(CAP_SYS_NICE))
     {
-        LOG_INFO(log, "It looks like the process has no CAP_SYS_NICE capability, the setting 'os_thread_nice' will have no effect."
+        LOG_INFO(log, "It looks like the process has no CAP_SYS_NICE capability, the setting 'os_thread_priority' will have no effect."
             " It could happen due to incorrect ClickHouse package installation."
             " You could resolve the problem manually with 'sudo setcap cap_sys_nice=+ep " << executable_path << "'."
             " Note that it will not work on 'nosuid' mounted filesystems.");
