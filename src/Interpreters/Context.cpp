@@ -945,6 +945,7 @@ StoragePtr Context::getViewSource()
 
 Settings Context::getSettings() const
 {
+    auto lock = getLock();
     return settings;
 }
 
@@ -1064,6 +1065,18 @@ String Context::getInitialQueryId() const
     return client_info.initial_query_id;
 }
 
+
+void Context::setCurrentDatabaseNameInGlobalContext(const String & name)
+{
+    if (global_context != this)
+        throw Exception("Cannot set current database for non global context, this method should be used during server initialization", ErrorCodes::LOGICAL_ERROR);
+    auto lock = getLock();
+
+    if (!current_database.empty())
+        throw Exception("Default database name cannot be changed in global context without server restart", ErrorCodes::LOGICAL_ERROR);
+
+    current_database = name;
+}
 
 void Context::setCurrentDatabase(const String & name)
 {
@@ -1973,6 +1986,12 @@ void Context::reloadConfig() const
 
 void Context::shutdown()
 {
+    for (auto & [disk_name, disk] : getDisksMap())
+    {
+        LOG_INFO(shared->log, "Shutdown disk {}", disk_name);
+        disk->shutdown();
+    }
+
     shared->shutdown();
 }
 
