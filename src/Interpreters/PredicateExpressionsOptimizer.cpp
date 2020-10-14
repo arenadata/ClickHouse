@@ -15,6 +15,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int LOGICAL_ERROR;
 }
 
 PredicateExpressionsOptimizer::PredicateExpressionsOptimizer(
@@ -107,6 +108,10 @@ bool PredicateExpressionsOptimizer::tryRewritePredicatesToTables(ASTs & tables_e
 {
     bool is_rewrite_tables = false;
 
+    if (tables_element.size() != tables_predicates.size())
+        throw Exception("Unexpected elements count in predicate push down: `set enable_optimize_predicate_expression = 0` to disable",
+                        ErrorCodes::LOGICAL_ERROR);
+
     for (size_t index = tables_element.size(); index > 0; --index)
     {
         size_t table_pos = index - 1;
@@ -148,8 +153,8 @@ bool PredicateExpressionsOptimizer::tryRewritePredicatesToTable(ASTPtr & table_e
     if (!table_predicates.empty())
     {
         auto optimize_final = settings.enable_optimize_predicate_expression_to_final_subquery;
-        PredicateRewriteVisitor::Data data(context, table_predicates, table_column, optimize_final);
-
+        auto optimize_with = settings.allow_push_predicate_when_subquery_contains_with;
+        PredicateRewriteVisitor::Data data(context, table_predicates, table_column, optimize_final, optimize_with);
         PredicateRewriteVisitor(data).visit(table_element);
         return data.is_rewrite;
     }

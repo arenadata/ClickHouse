@@ -83,7 +83,7 @@ Pipes StorageMySQL::read(
     Pipes pipes;
     /// TODO: rewrite MySQLBlockInputStream
     pipes.emplace_back(std::make_shared<SourceFromInputStream>(
-            std::make_shared<MySQLBlockInputStream>(pool.Get(), query, sample_block, max_block_size_)));
+            std::make_shared<MySQLLazyBlockInputStream>(pool, query, sample_block, max_block_size_, /* auto_close = */ true)));
 
     return pipes;
 }
@@ -175,7 +175,7 @@ public:
         return splitted_blocks;
     }
 
-    std::string dumpNamesWithBackQuote(const Block & block) const
+    static std::string dumpNamesWithBackQuote(const Block & block) 
     {
         WriteBufferFromOwnString out;
         for (auto it = block.begin(); it != block.end(); ++it)
