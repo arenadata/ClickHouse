@@ -43,8 +43,6 @@ public:
     String getName() const override { return "RemovingLowCardinality"; }
     Block getHeader() const override { return header; }
     const BlockMissingValues & getMissingValues() const override { return input->getMissingValues(); }
-    bool isSortedOutput() const override { return input->isSortedOutput(); }
-    const SortDescription & getSortDescription() const override { return input->getSortDescription(); }
 
 protected:
     Block readImpl() override { return transform(input->read()); }
@@ -84,7 +82,7 @@ AggregatingSortedBlockInputStream::AggregatingSortedBlockInputStream(
             continue;
         }
 
-        if (auto simple_aggr = dynamic_cast<const DataTypeCustomSimpleAggregateFunction *>(column.type->getCustomName()))
+        if (const auto *simple_aggr = dynamic_cast<const DataTypeCustomSimpleAggregateFunction *>(column.type->getCustomName()))
         {
             // simple aggregate function
             SimpleAggregateDescription desc{simple_aggr->getFunction(), i};

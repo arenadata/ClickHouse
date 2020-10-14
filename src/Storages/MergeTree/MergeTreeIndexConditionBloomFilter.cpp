@@ -43,13 +43,17 @@ ColumnWithTypeAndName getPreparedSetInfo(const SetPtr & prepared_set)
     if (prepared_set->getDataTypes().size() == 1)
         return {prepared_set->getSetElements()[0], prepared_set->getElementsTypes()[0], "dummy"};
 
-    return {ColumnTuple::create(prepared_set->getSetElements()), std::make_shared<DataTypeTuple>(prepared_set->getElementsTypes()), "dummy"};
+    Columns set_elements;
+    for (auto & set_element : prepared_set->getSetElements())
+        set_elements.emplace_back(set_element->convertToFullColumnIfConst());
+
+    return {ColumnTuple::create(set_elements), std::make_shared<DataTypeTuple>(prepared_set->getElementsTypes()), "dummy"};
 }
 
 bool maybeTrueOnBloomFilter(const IColumn * hash_column, const BloomFilterPtr & bloom_filter, size_t hash_functions)
 {
-    const auto const_column = typeid_cast<const ColumnConst *>(hash_column);
-    const auto non_const_column = typeid_cast<const ColumnUInt64 *>(hash_column);
+    const auto *const const_column = typeid_cast<const ColumnConst *>(hash_column);
+    const auto *const non_const_column = typeid_cast<const ColumnUInt64 *>(hash_column);
 
     if (!const_column && !non_const_column)
         throw Exception("LOGICAL ERROR: hash column must be Const Column or UInt64 Column.", ErrorCodes::LOGICAL_ERROR);
@@ -339,7 +343,7 @@ bool MergeTreeIndexConditionBloomFilter::traverseASTEquals(
         if (which.isTuple() && function->name == "tuple")
         {
             const Tuple & tuple = get<const Tuple &>(value_field);
-            const auto value_tuple_data_type = typeid_cast<const DataTypeTuple *>(value_type.get());
+            const auto *const value_tuple_data_type = typeid_cast<const DataTypeTuple *>(value_type.get());
             const ASTs & arguments = typeid_cast<const ASTExpressionList &>(*function->arguments).children;
 
             if (tuple.size() != arguments.size())

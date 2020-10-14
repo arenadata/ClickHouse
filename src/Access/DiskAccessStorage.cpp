@@ -101,35 +101,35 @@ namespace
 
         for (const auto & query : queries)
         {
-            if (auto create_user_query = query->as<ASTCreateUserQuery>())
+            if (auto * create_user_query = query->as<ASTCreateUserQuery>())
             {
                 if (res)
                     throw Exception("Two access entities in one file " + file_path.string(), ErrorCodes::INCORRECT_ACCESS_ENTITY_DEFINITION);
                 res = user = std::make_unique<User>();
                 InterpreterCreateUserQuery::updateUserFromQuery(*user, *create_user_query);
             }
-            else if (auto create_role_query = query->as<ASTCreateRoleQuery>())
+            else if (auto * create_role_query = query->as<ASTCreateRoleQuery>())
             {
                 if (res)
                     throw Exception("Two access entities in one file " + file_path.string(), ErrorCodes::INCORRECT_ACCESS_ENTITY_DEFINITION);
                 res = role = std::make_unique<Role>();
                 InterpreterCreateRoleQuery::updateRoleFromQuery(*role, *create_role_query);
             }
-            else if (auto create_policy_query = query->as<ASTCreateRowPolicyQuery>())
+            else if (auto * create_policy_query = query->as<ASTCreateRowPolicyQuery>())
             {
                 if (res)
                     throw Exception("Two access entities in one file " + file_path.string(), ErrorCodes::INCORRECT_ACCESS_ENTITY_DEFINITION);
                 res = policy = std::make_unique<RowPolicy>();
                 InterpreterCreateRowPolicyQuery::updateRowPolicyFromQuery(*policy, *create_policy_query);
             }
-            else if (auto create_quota_query = query->as<ASTCreateQuotaQuery>())
+            else if (auto * create_quota_query = query->as<ASTCreateQuotaQuery>())
             {
                 if (res)
                     throw Exception("Two access entities are attached in the same file " + file_path.string(), ErrorCodes::INCORRECT_ACCESS_ENTITY_DEFINITION);
                 res = quota = std::make_unique<Quota>();
                 InterpreterCreateQuotaQuery::updateQuotaFromQuery(*quota, *create_quota_query);
             }
-            else if (auto grant_query = query->as<ASTGrantQuery>())
+            else if (auto * grant_query = query->as<ASTGrantQuery>())
             {
                 if (!user && !role)
                     throw Exception("A user or role should be attached before grant in file " + file_path.string(), ErrorCodes::INCORRECT_ACCESS_ENTITY_DEFINITION);
@@ -312,9 +312,11 @@ void DiskAccessStorage::initialize(const String & directory_path_, Notifications
         throw Exception("Storage " + getStorageName() + " already initialized with another directory", ErrorCodes::LOGICAL_ERROR);
     }
 
-    std::filesystem::create_directories(canonical_directory_path);
-    if (!std::filesystem::exists(canonical_directory_path) || !std::filesystem::is_directory(canonical_directory_path))
-        throw Exception("Couldn't create directory " + canonical_directory_path.string(), ErrorCodes::DIRECTORY_DOESNT_EXIST);
+    std::error_code create_dir_error_code;
+    std::filesystem::create_directories(canonical_directory_path, create_dir_error_code);
+
+    if (!std::filesystem::exists(canonical_directory_path) || !std::filesystem::is_directory(canonical_directory_path) || create_dir_error_code)
+        throw Exception("Couldn't create directory " + canonical_directory_path.string() + " reason: '" + create_dir_error_code.message() + "'", ErrorCodes::DIRECTORY_DOESNT_EXIST);
 
     directory_path = canonical_directory_path;
     initialized = true;
@@ -527,7 +529,7 @@ AccessEntityPtr DiskAccessStorage::readImpl(const UUID & id) const
     if (it == id_to_entry_map.end())
         throwNotFound(id);
 
-    auto & entry = it->second;
+    const auto & entry = it->second;
     if (!entry.entity)
         entry.entity = readAccessEntityFromDisk(id);
     return entry.entity;
