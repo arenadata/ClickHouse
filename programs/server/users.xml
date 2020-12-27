@@ -16,6 +16,10 @@
                  first_or_random - if first replica one has higher number of errors, pick a random one from replicas with minimum number of errors.
             -->
             <load_balancing>random</load_balancing>
+
+						<send_timeout>50000</send_timeout>
+						<receive_timeout>50000</receive_timeout>
+
         </default>
 
         <!-- Profile that allows only read queries. -->

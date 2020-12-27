@@ -1,3 +1,4 @@
+#include <common/logger_useful.h>
 #include <Interpreters/LogicalExpressionsOptimizer.h>
 #include <Core/Settings.h>
 
@@ -112,6 +113,11 @@ void LogicalExpressionsOptimizer::collectDisjunctiveEqualityChains()
         bool found_chain = false;
 
         auto * function = to_node->as<ASTFunction>();
+
+        if (function)
+            function->dumpTree(std::cerr);
+
+
         if (function && function->name == "or" && function->children.size() == 1)
         {
             const auto * expression_list = function->children[0]->as<ASTExpressionList>();
@@ -178,6 +184,12 @@ void LogicalExpressionsOptimizer::collectDisjunctiveEqualityChains()
 
     for (auto & chain : disjunctive_equality_chains_map)
     {
+        LOG_DEBUG(&Poco::Logger::get("LogicalExpressionsOptimizer"),
+            "function_name {}, alias {}", chain.first.or_function->name, chain.first.alias);
+
+        chain.first.or_function->dumpTree(std::cerr);
+
+
         auto & equalities = chain.second;
         auto & equality_functions = equalities.functions;
         std::sort(equality_functions.begin(), equality_functions.end());

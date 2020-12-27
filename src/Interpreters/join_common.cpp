@@ -320,10 +320,10 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
 
     if (table_join.hasUsing())
     {
-        for (size_t i = 0; i < table_join.keyNamesLeft().size(); ++i)
+        for (size_t i = 0; i < table_join.keyNamesLeft()[0].size(); ++i)
         {
-            const String & left_key_name = table_join.keyNamesLeft()[i];
-            const String & right_key_name = table_join.keyNamesRight()[i];
+            const String & left_key_name = table_join.keyNamesLeft()[0][i];
+            const String & right_key_name = table_join.keyNamesRight()[0][i];
 
             size_t left_key_pos = result_sample_block.getPositionByName(left_key_name);
             size_t right_key_pos = saved_block_sample.getPositionByName(right_key_name);
@@ -332,6 +332,7 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
                 left_to_right_key_remap[left_key_pos] = right_key_pos;
         }
     }
+
 
     /// result_sample_block: left_sample_block + left expressions, right not key columns, required right keys
     size_t left_columns_count = result_sample_block.columns() -

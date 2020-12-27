@@ -134,6 +134,9 @@ class HashJoin : public IJoin
 public:
     HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block, bool any_take_last_row_ = false);
 
+    // bool empty() const { return data[0]->type == Type::EMPTY; }
+    // bool overDictionary() const { return data[0]->type == Type::DICT; }
+
     /** Add block of data from right hand of JOIN to the map.
       * Returns false, if some limit was exceeded and you should not insert more data.
       */
@@ -169,7 +172,7 @@ public:
     /// Sum size in bytes of all buffers, used for JOIN maps and for all memory pools.
     size_t getTotalByteCount() const final;
 
-    bool alwaysReturnsEmptySet() const final;
+    // bool alwaysReturnsEmptySet() const final { return isInnerOrRight(getKind()) && data[0]->empty && !overDictionary(); }
 
     ASTTableJoin::Kind getKind() const { return kind; }
     ASTTableJoin::Strictness getStrictness() const { return strictness; }
@@ -180,7 +183,7 @@ public:
     const ColumnWithTypeAndName & rightAsofKeyColumn() const
     {
         /// It should be nullable if nullable_right_side is true
-        return savedBlockSample().getByName(key_names_right.back());
+        return savedBlockSample().getByName(key_names_right[0].back());
     }
 
     /// Different types of keys for maps.
@@ -263,7 +266,7 @@ public:
         }
 
         size_t getTotalByteCountImpl(Type which) const
-        {
+         {
             switch (which)
             {
                 case Type::EMPTY:            return 0;
@@ -318,6 +321,9 @@ public:
         Arena pool;
     };
 
+    using RightTableDataPtr       = std::shared_ptr<RightTableData>;
+    using RightTableDataPtrVector = std::vector<RightTableDataPtr>;
+
     /// We keep correspondence between used_flags and hash table internal buffer.
     /// Hash table cannot be modified during HashJoin lifetime and must be protected with lock.
     void setLock(std::shared_mutex & rwlock)
@@ -329,7 +335,7 @@ public:
 
     std::shared_ptr<RightTableData> getJoinedData() const
     {
-        return data;
+        return data[0];
     }
 
     bool isUsed(size_t off) const { return used_flags.getUsedSafe(off); }
@@ -343,7 +349,8 @@ private:
     ASTTableJoin::Strictness strictness;
 
     /// Names of key columns in right-side table (in the order they appear in ON/USING clause). @note It could contain duplicates.
-    const Names & key_names_right;
+    const NamesVector key_names_right;  /* !!!!! */
+    const NamesVector key_names_left;
 
     bool nullable_right_side; /// In case of LEFT and FULL joins, if use_nulls, convert right-side columns to Nullable.
     bool nullable_left_side; /// In case of RIGHT and FULL joins, if use_nulls, convert left-side columns to Nullable.
@@ -352,21 +359,22 @@ private:
     ASOF::Inequality asof_inequality;
 
     /// Right table data. StorageJoin shares it between many Join objects.
-    std::shared_ptr<RightTableData> data;
     /// Flags that indicate that particular row already used in join.
     /// Flag is stored for every record in hash map.
     /// Number of this flags equals to hashtable buffer size (plus one for zero value).
     /// Changes in hash table broke correspondence,
     /// so we must guarantee constantness of hash table during HashJoin lifetime (using method setLock)
     mutable JoinStuff::JoinUsedFlags used_flags;
-    Sizes key_sizes;
+    RightTableDataPtrVector data;
+    std::vector<Sizes> key_sizes;
 
     /// Block with columns from the right-side table.
     Block right_sample_block;
     /// Block with columns from the right-side table except key columns.
-    Block sample_block_with_columns_to_add;
+    Block sample_block_with_columns_to_add;  /* !!!! */
     /// Block with key columns in the same order they appear in the right-side table (duplicates appear once).
     Block right_table_keys;
+
     /// Block with key columns right-side table keys that are needed in result (would be attached after joined columns).
     Block required_right_keys;
     /// Left table column names that are sources for required_right_keys columns
@@ -380,9 +388,10 @@ private:
     /// If set HashJoin instance is not available for modification (addJoinedBlock)
     std::shared_lock<std::shared_mutex> storage_join_lock;
 
-    void init(Type type_);
+    // void init(Type type_);
+    void init(Type type_, RightTableDataPtr);
 
-    const Block & savedBlockSample() const { return data->sample_block; }
+    const Block & savedBlockSample() const { return data[0]->sample_block; }
 
     /// Modify (structure) right block to save it in block list
     Block structureRightBlock(const Block & stored_block) const;
@@ -393,14 +402,107 @@ private:
         Block & block,
         const Names & key_names_left,
         const Block & block_with_columns_to_add,
-        const Maps & maps) const;
+        const Maps & maps,
+        const Sizes & key_sizes_,
+        HashJoin::Type) const;
 
     void joinBlockImplCross(Block & block, ExtraBlockPtr & not_processed) const;
+
+    // template <typename Maps>
+    // ColumnWithTypeAndName joinGetImpl(const Block & block, const Block & block_with_columns_to_add, const Maps & maps_, HashJoin::Type) const;
 
     static Type chooseMethod(const ColumnRawPtrs & key_columns, Sizes & key_sizes);
 
     bool empty() const;
     bool overDictionary() const;
 };
+
+
+#if 0
+
+class HashJoin : public IJoin
+{
+private:
+    std::vector<std::unique_ptr<HashJoinImpl>> implv;
+    Poco::Logger * log;
+    Names keyNamesLeft;
+
+    Block mergeBlocks(Blocks && blocks, size_t total_rows) const;
+public:
+    HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block);
+
+
+    //        : impl(table_join_, right_sample_block)
+
+
+    bool addJoinedBlock(const Block & block, bool check_limits) override;
+
+    void joinBlock(Block & block, ExtraBlockPtr & not_processed) override;
+
+    void joinTotals(Block & block) const override
+    {
+        for (auto & impl : implv)
+        {
+            impl->joinTotals(block);
+        }
+    }
+
+    void setTotals(const Block & block) override
+    {
+        for (auto & impl : implv)
+        {
+            impl->setTotals(block);
+        }
+    }
+
+    bool hasTotals() const override
+    {
+        bool ret = false;
+
+        for (auto & impl : implv)
+        {
+            if (impl->hasTotals())
+            {
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+    size_t getTotalRowCount() const override
+    {
+        size_t ret = 0;
+
+        for (auto & impl : implv)
+        {
+            ret += impl->getTotalRowCount();
+        }
+
+        return ret;
+    }
+
+    size_t getTotalByteCount() const override
+    {
+        size_t ret = 0;
+
+        for (auto & impl : implv)
+        {
+            ret += impl->getTotalByteCount();
+        }
+
+        return ret;
+    }
+
+    // !!!!!!!!!!!!!!!!!
+    BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & result_sample_block, UInt64 max_block_size) const override
+    {
+        return implv[0]->createStreamWithNonJoinedRows(result_sample_block, max_block_size);
+    }
+};
+
+
+#endif
+
 
 }

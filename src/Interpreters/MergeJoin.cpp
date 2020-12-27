@@ -476,8 +476,8 @@ MergeJoin::MergeJoin(std::shared_ptr<TableJoin> table_join_, const Block & right
     if (nullable_right_side)
         JoinCommon::convertColumnsToNullable(right_columns_to_add);
 
-    makeSortAndMerge(table_join->keyNamesLeft(), left_sort_description, left_merge_description);
-    makeSortAndMerge(table_join->keyNamesRight(), right_sort_description, right_merge_description);
+    makeSortAndMerge(table_join->keyNamesLeft()[0], left_sort_description, left_merge_description);
+    makeSortAndMerge(table_join->keyNamesRight()[0], right_sort_description, right_merge_description);
 
     /// Temporary disable 'partial_merge_join_left_table_buffer_bytes' without 'partial_merge_join_optimizations'
     if (table_join->enablePartialMergeJoinOptimizations())
@@ -590,7 +590,7 @@ bool MergeJoin::saveRightBlock(Block && block)
 Block MergeJoin::modifyRightBlock(const Block & src_block) const
 {
     Block block = materializeBlock(src_block);
-    JoinCommon::removeLowCardinalityInplace(block, table_join->keyNamesRight());
+    JoinCommon::removeLowCardinalityInplace(block, table_join->keyNamesRight()[0]);
     return block;
 }
 
@@ -606,9 +606,9 @@ void MergeJoin::joinBlock(Block & block, ExtraBlockPtr & not_processed)
 {
     if (block)
     {
-        JoinCommon::checkTypesOfKeys(block, table_join->keyNamesLeft(), right_table_keys, table_join->keyNamesRight());
+        JoinCommon::checkTypesOfKeys(block, table_join->keyNamesLeft()[0], right_table_keys, table_join->keyNamesRight()[0]);
         materializeBlockInplace(block);
-        JoinCommon::removeLowCardinalityInplace(block, table_join->keyNamesLeft(), false);
+        JoinCommon::removeLowCardinalityInplace(block, table_join->keyNamesLeft()[0], false);
 
         sortBlock(block, left_sort_description);
 
@@ -679,7 +679,7 @@ void MergeJoin::joinSortedBlock(Block & block, ExtraBlockPtr & not_processed)
 
             if (skip_not_intersected)
             {
-                int intersection = left_cursor.intersect(min_max_right_blocks[i], table_join->keyNamesRight());
+                int intersection = left_cursor.intersect(min_max_right_blocks[i], table_join->keyNamesRight()[0]);
                 if (intersection < 0)
                     break; /// (left) ... (right)
                 if (intersection > 0)
@@ -713,7 +713,7 @@ void MergeJoin::joinSortedBlock(Block & block, ExtraBlockPtr & not_processed)
 
             if (skip_not_intersected)
             {
-                int intersection = left_cursor.intersect(min_max_right_blocks[i], table_join->keyNamesRight());
+                int intersection = left_cursor.intersect(min_max_right_blocks[i], table_join->keyNamesRight()[0]);
                 if (intersection < 0)
                     break; /// (left) ... (right)
                 if (intersection > 0)

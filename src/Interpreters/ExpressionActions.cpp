@@ -43,6 +43,32 @@ namespace ErrorCodes
 }
 
 ExpressionActions::~ExpressionActions() = default;
+// /// Read comment near usage
+// static constexpr auto DUMMY_COLUMN_NAME = "_dummy";
+
+
+// Names ExpressionAction::getNeededColumns() const
+// {
+//     Names res = argument_names;
+
+//     if (table_join)
+//     {
+//         for (const auto & keys_part : table_join->keyNamesLeft())
+//         {
+//             res.insert(res.end(), keys_part.begin(), keys_part.end());
+//         }
+//     }
+
+
+//     for (const auto & column : projection)
+//         res.push_back(column.first);
+
+//     if (!source_name.empty())
+//         res.push_back(source_name);
+
+//     return res;
+// }
+
 
 ExpressionActions::ExpressionActions(ActionsDAGPtr actions_dag_)
 {
@@ -737,8 +763,9 @@ void ExpressionActionsChain::JoinStep::finalize(const Names & required_output_)
 
     /// That's an input columns we need.
     NameSet required_names(required_output_.begin(), required_output_.end());
-    for (const auto & name : analyzed_join->keyNamesLeft())
-        required_names.emplace(name);
+    if (!analyzed_join->keyNamesLeft().empty())
+        for (const auto & name : analyzed_join->keyNamesLeft()[0])
+            required_names.emplace(name);
 
     for (const auto & column : required_columns)
     {

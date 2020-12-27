@@ -35,6 +35,8 @@ TableJoin::TableJoin(const Settings & settings, VolumePtr tmp_volume_)
     , temporary_files_codec(settings.temporary_files_codec)
     , tmp_volume(tmp_volume_)
 {
+    key_names_left.resize(1);
+    key_names_right.resize(1);
 }
 
 void TableJoin::resetCollected()
@@ -47,29 +49,54 @@ void TableJoin::resetCollected()
     columns_added_by_join.clear();
     original_names.clear();
     renames.clear();
+
     left_type_map.clear();
     right_type_map.clear();
     left_converting_actions = nullptr;
     right_converting_actions = nullptr;
+
+    key_names_left.resize(1);
+    key_names_right.resize(1);
 }
 
 void TableJoin::addUsingKey(const ASTPtr & ast)
 {
-    key_names_left.push_back(ast->getColumnName());
-    key_names_right.push_back(ast->getAliasOrColumnName());
+    key_names_left[0].push_back(ast->getColumnName());
+    key_names_right[0].push_back(ast->getAliasOrColumnName());
 
     key_asts_left.push_back(ast);
     key_asts_right.push_back(ast);
 
-    auto & right_key = key_names_right.back();
+    auto & right_key = key_names_right[0].back();
     if (renames.count(right_key))
         right_key = renames[right_key];
 }
 
+
+void TableJoin::addDisjunct(const IAST* addr)
+{
+    if (std::find(disjuncts.begin(), disjuncts.end(), addr) != disjuncts.end())
+    {
+        assert(key_names_left.size() == disjunct_num + 1);
+
+        if (!key_names_left[disjunct_num].empty())
+        {
+            disjunct_num++;
+            key_names_left.resize(disjunct_num+1);
+            key_names_right.resize(disjunct_num+1);
+        }
+    }
+}
+
+void TableJoin::setDisjuncts(std::vector<const IAST*>&& disjuncts_)
+{
+    disjuncts = disjuncts_;
+}
+
 void TableJoin::addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast)
 {
-    key_names_left.push_back(left_table_ast->getColumnName());
-    key_names_right.push_back(right_table_ast->getAliasOrColumnName());
+    key_names_left[disjunct_num].push_back(left_table_ast->getColumnName());
+    key_names_right[disjunct_num].push_back(right_table_ast->getAliasOrColumnName());
 
     key_asts_left.push_back(left_table_ast);
     key_asts_right.push_back(right_table_ast);
@@ -82,9 +109,9 @@ size_t TableJoin::rightKeyInclusion(const String & name) const
         return 0;
 
     size_t count = 0;
-    for (const auto & key_name : key_names_right)
-        if (name == key_name)
-            ++count;
+    for (const auto & key_names : key_names_right)
+        count += std::count(key_names.begin(), key_names.end(), name);
+
     return count;
 }
 
@@ -145,7 +172,9 @@ ASTPtr TableJoin::rightKeysList() const
 
 Names TableJoin::requiredJoinedNames() const
 {
-    NameSet required_columns_set(key_names_right.begin(), key_names_right.end());
+    NameSet required_columns_set;
+    for (const auto& key_names_right_part : key_names_right)
+        required_columns_set.insert(key_names_right_part.begin(), key_names_right_part.end());
     for (const auto & joined_column : columns_added_by_join)
         required_columns_set.insert(joined_column.name);
 
@@ -155,10 +184,11 @@ Names TableJoin::requiredJoinedNames() const
 NameSet TableJoin::requiredRightKeys() const
 {
     NameSet required;
-    for (const auto & name : key_names_right)
-        for (const auto & column : columns_added_by_join)
-            if (name == column.name)
-                required.insert(name);
+    for (const auto& key_names_right_part : key_names_right)
+        for (const auto & name : key_names_right_part)
+            for (const auto & column : columns_added_by_join)
+                if (name == column.name)
+                    required.insert(name);
     return required;
 }
 
@@ -177,36 +207,47 @@ void TableJoin::splitAdditionalColumns(const Block & sample_block, Block & block
 {
     block_others = materializeBlock(sample_block);
 
-    for (const String & column_name : key_names_right)
+    for (const auto& key_names_right_part : key_names_right)
     {
-        /// Extract right keys with correct keys order. There could be the same key names.
-        if (!block_keys.has(column_name))
+
+        for (const String & column_name : key_names_right_part)
         {
-            auto & col = block_others.getByName(column_name);
-            block_keys.insert(col);
-            block_others.erase(column_name);
+            /// Extract right keys with correct keys order. There could be the same key names.
+            if (!block_keys.has(column_name))
+            {
+                auto & col = block_others.getByName(column_name);
+                block_keys.insert(col);
+                block_others.erase(column_name);
+            }
         }
     }
 }
 
 Block TableJoin::getRequiredRightKeys(const Block & right_table_keys, std::vector<String> & keys_sources) const
 {
-    const Names & left_keys = keyNamesLeft();
-    const Names & right_keys = keyNamesRight();
+    const auto & left_keys = keyNamesLeft();
+    const auto & right_keys = keyNamesRight();
     NameSet required_keys(requiredRightKeys().begin(), requiredRightKeys().end());
     Block required_right_keys;
 
-    for (size_t i = 0; i < right_keys.size(); ++i)
+    for (size_t p = 0; p < right_keys.size(); ++p)
     {
-        const String & right_key_name = right_keys[i];
+        const auto & right_keys_part = right_keys[p];
+        const auto & left_keys_part = left_keys[p];
 
-        if (required_keys.count(right_key_name) && !required_right_keys.has(right_key_name))
+        for (size_t i = 0; i < right_keys_part.size(); ++i)
         {
-            const auto & right_key = right_table_keys.getByName(right_key_name);
-            required_right_keys.insert(right_key);
-            keys_sources.push_back(left_keys[i]);
+            const String & right_key_name = right_keys_part[i];
+
+            if (required_keys.count(right_key_name) && !required_right_keys.has(right_key_name))
+            {
+                const auto & right_key = right_table_keys.getByName(right_key_name);
+                required_right_keys.insert(right_key);
+                keys_sources.push_back(left_keys_part[i]);
+            }
         }
     }
+
 
     return required_right_keys;
 }
@@ -298,7 +339,10 @@ bool TableJoin::allowMergeJoin() const
 
     bool all_join = is_all && (isInner(kind()) || isLeft(kind()) || isRight(kind()) || isFull(kind()));
     bool special_left = isLeft(kind()) && (is_any || is_semi);
-    return all_join || special_left;
+
+    bool no_ors = (key_names_right.size() == 1);
+
+    return (all_join || special_left) && no_ors;
 }
 
 bool TableJoin::needStreamWithNonJoinedRows() const
@@ -315,7 +359,7 @@ bool TableJoin::allowDictJoin(const String & dict_key, const Block & sample_bloc
     if (!isLeft(kind()) && !(isInner(kind()) && strictness() == ASTTableJoin::Strictness::All))
         return false;
 
-    const Names & right_keys = keyNamesRight();
+    const Names & right_keys = keyNamesRight()[0];  // !!!
     if (right_keys.size() != 1)
         return false;
 

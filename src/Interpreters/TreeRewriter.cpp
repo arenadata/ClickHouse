@@ -2,6 +2,8 @@
 #include <Core/Defines.h>
 #include <Core/NamesAndTypes.h>
 
+#include <sstream>
+
 #include <Interpreters/TreeRewriter.h>
 #include <Interpreters/LogicalExpressionsOptimizer.h>
 #include <Interpreters/QueryAliasesVisitor.h>
@@ -403,6 +405,187 @@ void setJoinStrictness(ASTSelectQuery & select_query, JoinStrictness join_defaul
     out_table_join = table_join;
 }
 
+void normTree(ASTPtr node)
+{
+    bool only_or = true;
+    bool only_and = true;
+    auto *function = node->as<ASTFunction>();
+    if (function && (function->name == "and" || function->name == "or") && function->children.size() == 1)
+    {
+        auto expression_list = function->children[0]->as<ASTExpressionList>();
+        for (const auto & child : expression_list->children)
+        {
+            auto *f = child->as<ASTFunction>();
+            if (f && f->children.size() == 1)
+            {
+                if (f->name == "or")
+                {
+                    only_and = false;
+                    continue;
+                }
+                if (f->name == "and")
+                {
+                    only_or = false;
+                    continue;
+                }
+            }
+            only_or = only_and = false;
+        }
+
+
+        if ((only_or && function->name == "or") || (only_and && function->name == "and"))
+        {
+
+            ASTs new_children;
+            for (const auto & child : expression_list->children)
+            {
+                auto *f = child->as<ASTFunction>();
+                if (f && (f->name == "or" || f->name == "and"))
+                {
+                    std::copy(child->children[0]->children.begin(),
+                        child->children[0]->children.end(),
+                        std::back_inserter(new_children));
+                }
+                else
+                {
+                    new_children.push_back(child);
+                }
+
+            }
+            function->arguments->children = std::move(new_children);
+        }
+
+        for (auto & child : function->arguments->children)
+        {
+            normTree(child);
+        }
+    }
+}
+
+ASTPtr distribute(ASTPtr node)
+{
+    auto *function = node->as<ASTFunction>();
+
+    assert(function);
+
+    if (function && function->name == "and" && function->children.size() == 1)
+    {
+        auto expression_list = function->children[0]->as<ASTExpressionList>();
+        assert(expression_list);
+
+        if (expression_list)
+        {
+
+
+            auto or_child = std::find_if(expression_list->children.begin(), expression_list->children.end(), [](ASTPtr arg)
+                {
+                    auto * f = arg->as<ASTFunction>();
+                    return f && f->name == "or" && f->children.size() == 1;
+                });
+            if (or_child == expression_list->children.end())
+            {
+                return node;
+            }
+
+
+            ASTs rest_children;
+
+            for (auto & arg : expression_list->children)
+            {
+                // LOG_DEBUG(&Poco::Logger::get("toDNF"), "IDs {} vs. {}", arg->getTreeHash(), (*or_child)->getTreeHash());
+
+                if (arg->getTreeHash() != (*or_child)->getTreeHash())
+                {
+                    rest_children.push_back(arg);
+                }
+            }
+            auto rest = rest_children.size() > 1 ?
+                makeASTFunction("and", rest_children):
+                rest_children[0];
+
+
+            auto * or_child_function = (*or_child)->as<ASTFunction>();
+            assert(or_child_function);
+
+            if (or_child_function)
+            {
+                const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
+                assert(or_child_expression_list);
+
+                if (or_child_expression_list)
+                {
+
+                    ASTs lst;
+                    for (auto & arg : or_child_expression_list->children)
+                    {
+                        ASTs arg_rest_lst;
+                        arg_rest_lst.push_back(arg);
+                        arg_rest_lst.push_back(rest);
+
+                        auto and_node = makeASTFunction("and", arg_rest_lst);
+                        lst.push_back(distribute(and_node));
+                    }
+                    LOG_DEBUG(&Poco::Logger::get("toDNF"), "lst has {} elements", lst.size());
+
+                    auto ret = lst.size()>1 ?
+                        makeASTFunction("or", lst) :
+                        lst[0];
+                    return ret;
+                }
+            }
+
+        }
+
+    }
+    else if (function && function->name == "or" && function->children.size() == 1)
+    {
+        const auto * expression_list = function->children[0]->as<ASTExpressionList>();
+        assert(expression_list);
+
+        if (expression_list)
+        {
+            ASTs lst;
+            for (auto & arg : expression_list->children)
+            {
+                lst.push_back(distribute(arg));
+            }
+
+            auto ret = lst.size()>1 ?
+                makeASTFunction("or", lst) :
+                lst[0];
+            return ret;
+        }
+    }
+    return node;
+}
+
+ASTPtr toDNF(ASTPtr on_expression)
+{
+    std::stringstream ss;
+    on_expression->dumpTree(ss, 0);
+    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression before distribute{}", ss.str());
+
+    normTree(on_expression);
+    std::stringstream ss01;
+    on_expression->dumpTree(ss01, 0);
+    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression after normTree 1 {}", ss01.str());
+
+    auto distributed_expression = distribute(on_expression);
+    std::stringstream ss1;
+    distributed_expression->dumpTree(ss1, 0);
+    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression after distribute {}", ss1.str());
+
+    normTree(distributed_expression);
+
+
+    std::stringstream ss2;
+    distributed_expression->dumpTree(ss2, 0);
+    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression after normTree 2 {}", ss2.str());
+
+    return distributed_expression;
+
+}
+
 /// Find the columns that are obtained by JOIN.
 void collectJoinedColumns(TableJoin & analyzed_join, const ASTSelectQuery & select_query,
                           const TablesWithColumns & tables, const Aliases & aliases, ASTPtr & new_where_conditions)
@@ -429,6 +612,9 @@ void collectJoinedColumns(TableJoin & analyzed_join, const ASTSelectQuery & sele
     else if (table_join.on_expression)
     {
         bool is_asof = (table_join.strictness == ASTTableJoin::Strictness::Asof);
+
+        if (!is_asof)
+            table_join.on_expression = toDNF(table_join.on_expression);
 
         CollectJoinOnKeysVisitor::Data data{analyzed_join, tables[0], tables[1], aliases, is_asof, table_join.kind};
         CollectJoinOnKeysVisitor(data).visit(table_join.on_expression);

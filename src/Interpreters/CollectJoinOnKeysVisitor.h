@@ -41,6 +41,8 @@ public:
         void addJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, const std::pair<size_t, size_t> & table_no);
         void addAsofJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, const std::pair<size_t, size_t> & table_no,
                              const ASOF::Inequality & asof_inequality);
+        void setDisjuncts(const ASTFunction & or_func);
+        void addDisjunct(const ASTFunction & func);
         void asofToJoinKeys();
     };
 
@@ -53,7 +55,8 @@ public:
     static bool needChildVisit(const ASTPtr & node, const ASTPtr &)
     {
         if (auto * func = node->as<ASTFunction>())
-            return func->name == "and";
+            // return func->name == "and";
+            return func->name == "and" || func->name == "or";
         return true;
     }
 

@@ -1,3 +1,5 @@
+// #include <Poco/Logger.h>
+
 #include <Parsers/queryToString.h>
 
 #include <Interpreters/CollectJoinOnKeysVisitor.h>
@@ -34,6 +36,22 @@ bool canMoveToWhere(std::pair<size_t, size_t> table_numbers, ASTTableJoin::Kind 
         (table_numbers.first == table_numbers.second || table_numbers.first == 0 || table_numbers.second == 0);
 }
 
+void CollectJoinOnKeysMatcher::Data::setDisjuncts(const ASTFunction & func)
+{
+    auto expression_list = func.children[0]->as<ASTExpressionList>();
+    std::vector<const IAST*> v;
+    for (const auto & child : expression_list->children)
+    {
+        LOG_DEBUG(&Poco::Logger::get("addDisjunct"), "child {}", static_cast<const void*>(static_cast<const IAST*>(child.get())));
+        v.push_back(child.get());
+    }
+
+    analyzed_join.setDisjuncts(std::move(v));
+}
+
+void CollectJoinOnKeysMatcher::Data::addDisjunct(const ASTFunction & func)
+{
+    analyzed_join.addDisjunct(static_cast<const IAST*>(&func));
 }
 
 void CollectJoinOnKeysMatcher::Data::addJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast,
@@ -77,13 +95,23 @@ void CollectJoinOnKeysMatcher::Data::asofToJoinKeys()
     addJoinKeys(asof_left_key, asof_right_key, {1, 2});
 }
 
-void CollectJoinOnKeysMatcher::visit(const ASTFunction & func, const ASTPtr & ast, Data & data)
+void CollectJoinOnKeysMatcher::visit
+(const ASTFunction & func, const ASTPtr & ast, Data & data)
 {
+
+    if (func.name == "or")
+    {
+        // throw Exception("JOIN ON does not support OR. Unexpected '" + queryToString(ast) + "'", ErrorCodes::NOT_IMPLEMENTED);
+        data.setDisjuncts(func);
+        return;
+    }
+
+    data.addDisjunct(func);
+
     if (func.name == "and")
         return; /// go into children
 
-    if (func.name == "or")
-        throw Exception("JOIN ON does not support OR. Unexpected '" + queryToString(ast) + "'", ErrorCodes::NOT_IMPLEMENTED);
+    LOG_DEBUG(&Poco::Logger::get("addDisjunct"), "func: {}", static_cast<const void*>(static_cast<const IAST*>(&func)));
 
     ASOF::Inequality inequality = ASOF::getInequality(func.name);
     if (func.name == "equals" || inequality != ASOF::Inequality::None)

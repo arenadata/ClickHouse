@@ -47,7 +47,7 @@ private:
       * You must remember both of these options.
       *
       * Query of the form `SELECT ... from t1 ANY LEFT JOIN (SELECT ... from t2) ON expr(t1 columns) = expr(t2 columns)`
-      *     to the subquery will be added expression `expr(t2 columns)`.
+     *     to the subquery will be added expression `expr(t2 columns)`.
       * It's possible to use name `expr(t2 columns)`.
       */
 
@@ -64,10 +64,21 @@ private:
     const size_t max_files_to_merge = 0;
     const String temporary_files_codec = "LZ4";
 
+<<<<<<< HEAD
     Names key_names_left;
     Names key_names_right; /// Duplicating names are qualified.
 
     ASTs key_asts_left;
+=======
+public:  // make it private again
+    NamesVector key_names_left;
+    NamesVector key_names_right; /// Duplicating names are qualified.
+private:
+    size_t disjunct_num = 0;
+    std::vector<const IAST*> disjuncts;
+
+    ASTs key_asts_left;  // ??
+>>>>>>> 81131f6d43... ORs initial
     ASTs key_asts_right;
     ASTTableJoin table_join;
 
@@ -105,7 +116,7 @@ public:
 
     /// for StorageJoin
     TableJoin(SizeLimits limits, bool use_nulls, ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness,
-                 const Names & key_names_right_)
+                 const NamesVector & key_names_right_)
         : size_limits(limits)
         , default_max_bytes(0)
         , join_use_nulls(use_nulls)
@@ -143,6 +154,8 @@ public:
 
     void resetCollected();
     void addUsingKey(const ASTPtr & ast);
+    void addDisjunct(const IAST*);
+    void setDisjuncts(std::vector<const IAST*>&&);
     void addOnKeys(ASTPtr & left_table_ast, ASTPtr & right_table_ast);
 
     bool hasUsing() const { return table_join.using_expression_list != nullptr; }
@@ -182,8 +195,8 @@ public:
     ASTPtr leftKeysList() const;
     ASTPtr rightKeysList() const; /// For ON syntax only
 
-    const Names & keyNamesLeft() const { return key_names_left; }
-    const Names & keyNamesRight() const { return key_names_right; }
+    const NamesVector & keyNamesLeft() const { return key_names_left; }
+    const NamesVector & keyNamesRight() const { return key_names_right; }
     const NamesAndTypesList & columnsFromJoinedTable() const { return columns_from_joined_table; }
     Names columnsAddedByJoin() const
     {
@@ -194,7 +207,7 @@ public:
     }
 
     /// StorageJoin overrides key names (cause of different names qualification)
-    void setRightKeys(const Names & keys) { key_names_right = keys; }
+    void setRightKeys(const Names & keys) { key_names_right.clear(); key_names_right[0] = keys; }
 
     /// Split key and other columns by keys name list
     void splitAdditionalColumns(const Block & sample_block, Block & block_keys, Block & block_others) const;

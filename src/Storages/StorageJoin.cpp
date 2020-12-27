@@ -61,7 +61,7 @@ StorageJoin::StorageJoin(
         if (!metadata_snapshot->getColumns().hasPhysical(key))
             throw Exception{"Key column (" + key + ") does not exist in table declaration.", ErrorCodes::NO_SUCH_COLUMN_IN_TABLE};
 
-    table_join = std::make_shared<TableJoin>(limits, use_nulls, kind, strictness, key_names);
+    table_join = std::make_shared<TableJoin>(limits, use_nulls, kind, strictness, NamesVector(1, key_names));
     join = std::make_shared<HashJoin>(table_join, metadata_snapshot->getSampleBlock().sortColumns(), overwrite);
     restore();
 }
@@ -297,7 +297,7 @@ public:
     JoinSource(HashJoinPtr join_, std::shared_mutex & rwlock, UInt64 max_block_size_, Block sample_block_)
         : SourceWithProgress(sample_block_)
         , join(join_)
-        , lock(rwlock)
+        , lock(rwlock)   // lock(parent.data[0]->rwlock)
         , max_block_size(max_block_size_)
         , sample_block(std::move(sample_block_))
     {
@@ -330,11 +330,11 @@ public:
 protected:
     Chunk generate() override
     {
-        if (join->data->blocks.empty())
+        if (join->data[0]->blocks.empty())
             return {};
 
         Chunk chunk;
-        if (!joinDispatch(join->kind, join->strictness, join->data->maps,
+        if (!joinDispatch(join.kind, join.strictness, join->data[0]->maps,
                 [&](auto kind, auto strictness, auto & map) { chunk = createChunk<kind, strictness>(map); }))
             throw Exception("Logical error: unknown JOIN strictness", ErrorCodes::LOGICAL_ERROR);
         return chunk;
@@ -361,7 +361,7 @@ private:
 
         size_t rows_added = 0;
 
-        switch (join->data->type)
+        switch (join->data[0]->type)
         {
 #define M(TYPE)                                           \
     case HashJoin::Type::TYPE:                                \
@@ -371,7 +371,7 @@ private:
 #undef M
 
             default:
-                throw Exception("Unsupported JOIN keys in StorageJoin. Type: " + toString(static_cast<UInt32>(join->data->type)),
+                throw Exception("Unsupported JOIN keys in StorageJoin. Type: " + toString(static_cast<UInt32>(join->data[0]->type)),
                                 ErrorCodes::UNSUPPORTED_JOIN_KEYS);
         }
 
