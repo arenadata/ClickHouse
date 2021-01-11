@@ -61,6 +61,8 @@ public:
 
 }
 
+class AddedColumns;
+
 /** Data structure for implementation of JOIN.
   * It is just a hash table: keys -> rows of joined ("right") table.
   * Additionally, CROSS JOIN is supported: instead of hash table, it use just set of blocks without keys.
@@ -399,6 +401,17 @@ private:
 
     template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
     void joinBlockImpl(
+        Block & block,
+        const Names & key_names_left,
+        const Block & block_with_columns_to_add,
+        const Maps & maps,
+        const Sizes & key_sizes_,
+        HashJoin::Type,
+        std::unique_ptr<AddedColumns>,
+        size_t existing_columns) const;
+
+    template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
+    std::unique_ptr<AddedColumns> makeAddedColumns(
         Block & block,
         const Names & key_names_left,
         const Block & block_with_columns_to_add,
