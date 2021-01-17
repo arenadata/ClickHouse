@@ -61,6 +61,8 @@ public:
 
 }
 
+using SizesVector = std::vector<Sizes>;
+
 class AddedColumns;
 
 /** Data structure for implementation of JOIN.
@@ -307,6 +309,8 @@ public:
     using MapsAsof = MapsTemplate<AsofRowRefs>;
 
     using MapsVariant = std::variant<MapsOne, MapsAll, MapsAsof>;
+    // using MapsVariant = std::variant<MapsOne, MapsAll, MapsOneFlagged, MapsAllFlagged, MapsAsof>;
+    using MapsVariantPtrVector = std::vector<MapsVariant*>;
     using BlockNullmapList = std::deque<std::pair<const Block *, ColumnPtr>>;
 
     struct RightTableData
@@ -368,7 +372,7 @@ private:
     /// so we must guarantee constantness of hash table during HashJoin lifetime (using method setLock)
     mutable JoinStuff::JoinUsedFlags used_flags;
     RightTableDataPtrVector data;
-    std::vector<Sizes> key_sizes;
+    SizesVector key_sizes;
 
     /// Block with columns from the right-side table.
     Block right_sample_block;
@@ -412,6 +416,15 @@ private:
 
     template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
     std::unique_ptr<AddedColumns> makeAddedColumns(
+        Block & block,
+        const NamesVector & key_names_left,
+        const Block & block_with_columns_to_add,
+        const std::vector<const Maps*> & maps,
+        const SizesVector & key_sizes_,
+        HashJoin::Type) const;
+
+    template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
+    std::unique_ptr<AddedColumns> makeAddedColumnsV(
         Block & block,
         const Names & key_names_left,
         const Block & block_with_columns_to_add,
