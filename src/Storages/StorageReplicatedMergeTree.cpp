@@ -716,7 +716,10 @@ void StorageReplicatedMergeTree::dropReplica(zkutil::ZooKeeperPtr zookeeper, con
         throw Exception("Table was not dropped because ZooKeeper session has expired.", ErrorCodes::TABLE_WAS_NOT_DROPPED);
 
     auto remote_replica_path = zookeeper_path + "/replicas/" + replica;
-    LOG_INFO(logger, "Removing replica {}", remote_replica_path);
+    LOG_INFO(logger, "Removing replica {}, marking it as lost", remote_replica_path);
+    /// Mark itself lost before removing, because the following recursive removal may fail
+    /// and partially dropped replica may be considered as alive one (until someone will mark it lost)
+    zookeeper->trySet(zookeeper_path + "/replicas/" + replica + "/is_lost", "1");
     /// It may left some garbage if replica_path subtree are concurrently modified
     zookeeper->tryRemoveRecursive(remote_replica_path);
     if (zookeeper->exists(remote_replica_path))
@@ -825,7 +828,7 @@ void StorageReplicatedMergeTree::checkTableStructure(const String & zookeeper_pr
 }
 
 void StorageReplicatedMergeTree::setTableStructure(
-ColumnsDescription new_columns, const ReplicatedMergeTreeTableMetadata::Diff & metadata_diff)
+    ColumnsDescription new_columns, const ReplicatedMergeTreeTableMetadata::Diff & metadata_diff)
 {
     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
     StorageInMemoryMetadata old_metadata = getInMemoryMetadata();
@@ -848,7 +851,7 @@ ColumnsDescription new_columns, const ReplicatedMergeTreeTableMetadata::Diff & m
 
     if (!metadata_diff.empty())
     {
-        auto parse_key_expr = [](const String & key_expr)
+        auto parse_key_expr = [] (const String & key_expr)
         {
             ParserNotEmptyExpressionList parser(false);
             auto new_sorting_key_expr_list = parseQuery(parser, key_expr, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
@@ -2159,8 +2162,6 @@ bool StorageReplicatedMergeTree::executeReplaceRange(const LogEntry & entry)
 
 void StorageReplicatedMergeTree::cloneReplica(const String & source_replica, Coordination::Stat source_is_lost_stat, zkutil::ZooKeeperPtr & zookeeper)
 {
-    LOG_INFO(log, "Will mimic {}", source_replica);
-
     String source_path = zookeeper_path + "/replicas/" + source_replica;
 
     /** TODO: it will be deleted! (It is only to support old version of CH server).
@@ -2286,6 +2287,17 @@ void StorageReplicatedMergeTree::cloneReplica(const String & source_replica, Coo
             LOG_WARNING(log, "Source replica does not have part {}. Removing it from working set.", part->name);
         }
     }
+
+    if (getSettings()->detach_old_local_parts_when_cloning_replica)
+    {
+        auto metadata_snapshot = getInMemoryMetadataPtr();
+        for (const auto & part : parts_to_remove_from_working_set)
+        {
+            LOG_INFO(log, "Detaching {}", part->relative_path);
+            part->makeCloneInDetached("clone", metadata_snapshot);
+        }
+    }
+
     removePartsFromWorkingSet(parts_to_remove_from_working_set, true);
 
     for (const String & name : active_parts)
@@ -2313,46 +2325,118 @@ void StorageReplicatedMergeTree::cloneReplica(const String & source_replica, Coo
 
 void StorageReplicatedMergeTree::cloneReplicaIfNeeded(zkutil::ZooKeeperPtr zookeeper)
 {
+    Coordination::Stat is_lost_stat;
+    bool is_new_replica = true;
     String res;
-    if (zookeeper->tryGet(replica_path + "/is_lost", res))
+    if (zookeeper->tryGet(replica_path + "/is_lost", res, &is_lost_stat))
     {
         if (res == "0")
             return;
+        if (is_lost_stat.version)
+            is_new_replica = false;
     }
     else
     {
         /// Replica was created by old version of CH, so me must create "/is_lost".
         /// Note that in old version of CH there was no "lost" replicas possible.
+        /// TODO is_lost node should always exist since v18.12, maybe we can replace `tryGet` with `get` and remove old code?
         zookeeper->create(replica_path + "/is_lost", "0", zkutil::CreateMode::Persistent);
         return;
     }
 
     /// is_lost is "1": it means that we are in repair mode.
-
-    String source_replica;
-    Coordination::Stat source_is_lost_stat;
-    source_is_lost_stat.version = -1;
-
-    for (const String & source_replica_name : zookeeper->getChildren(zookeeper_path + "/replicas"))
+    /// Try choose source replica to clone.
+    /// Source replica must not be lost and should have minimal queue size and maximal log pointer.
+    Strings replicas = zookeeper->getChildren(zookeeper_path + "/replicas");
+    std::vector<zkutil::ZooKeeper::FutureGet> futures;
+    for (const String & source_replica_name : replicas)
     {
+        /// Do not clone from myself.
+        if (source_replica_name == replica_name)
+            continue;
+
         String source_replica_path = zookeeper_path + "/replicas/" + source_replica_name;
 
-        /// Do not clone from myself.
-        if (source_replica_path != replica_path)
+        /// Obviously the following get operations are not atomic, but it's ok to choose good enough replica, not the best one.
+        /// NOTE: We may count some entries twice if log_pointer is moved.
+        futures.emplace_back(zookeeper->asyncTryGet(source_replica_path + "/is_lost"));
+        futures.emplace_back(zookeeper->asyncTryGet(source_replica_path + "/log_pointer"));
+        futures.emplace_back(zookeeper->asyncTryGet(source_replica_path + "/queue"));
+    }
+
+    /// Wait for results before getting log entries
+    for (auto & future : futures)
+        future.wait();
+
+    Strings log_entries = zookeeper->getChildren(zookeeper_path + "/log");
+    size_t max_log_entry = 0;
+    if (!log_entries.empty())
+    {
+        String last_entry = *std::max_element(log_entries.begin(), log_entries.end());
+        max_log_entry = parse<UInt64>(last_entry.substr(strlen("log-")));
+    }
+    /// log_pointer can point to future entry, which was not created yet
+    ++max_log_entry;
+
+    size_t min_replication_lag = std::numeric_limits<size_t>::max();
+    String source_replica;
+    Coordination::Stat source_is_lost_stat;
+    size_t future_num = 0;
+
+    for (const String & source_replica_name : replicas)
+    {
+        if (source_replica_name == replica_name)
+            continue;
+
+        auto get_is_lost     = futures[future_num++].get();
+        auto get_log_pointer = futures[future_num++].get();
+        auto get_queue       = futures[future_num++].get();
+
+        if (get_is_lost.error != Coordination::Error::ZOK)
         {
-            /// Do not clone from lost replicas.
-            String source_replica_is_lost_value;
-            if (!zookeeper->tryGet(source_replica_path + "/is_lost", source_replica_is_lost_value, &source_is_lost_stat)
-                || source_replica_is_lost_value == "0")
-            {
-                source_replica = source_replica_name;
-                break;
-            }
+            LOG_INFO(log, "Not cloning {}, cannot get '/is_lost': {}", Coordination::errorMessage(get_is_lost.error));
+            continue;
+        }
+        else if (get_is_lost.data != "0")
+        {
+            LOG_INFO(log, "Not cloning {}, it's lost");
+            continue;
+        }
+
+        if (get_log_pointer.error != Coordination::Error::ZOK)
+        {
+            LOG_INFO(log, "Not cloning {}, cannot get '/log_pointer': {}", Coordination::errorMessage(get_log_pointer.error));
+            continue;
+        }
+        if (get_queue.error != Coordination::Error::ZOK)
+        {
+            LOG_INFO(log, "Not cloning {}, cannot get '/queue': {}", Coordination::errorMessage(get_queue.error));
+            continue;
+        }
+
+        /// Replica is not lost and we can clone it. Let's calculate approx replication lag.
+        size_t source_log_pointer = get_log_pointer.data.empty() ? 0 : parse<UInt64>(get_log_pointer.data);
+        assert(source_log_pointer <= max_log_entry);
+        size_t replica_queue_lag = max_log_entry - source_log_pointer;
+        size_t replica_queue_size = get_queue.stat.numChildren;
+        size_t replication_lag = replica_queue_lag + replica_queue_size;
+        LOG_INFO(log, "Replica {} has log pointer '{}', approximate {} queue lag and {} queue size",
+                 source_replica_name, get_log_pointer.data, replica_queue_lag, replica_queue_size);
+        if (replication_lag < min_replication_lag)
+        {
+            source_replica = source_replica_name;
+            source_is_lost_stat = get_is_lost.stat;
+            min_replication_lag = replication_lag;
         }
     }
 
     if (source_replica.empty())
         throw Exception("All replicas are lost", ErrorCodes::ALL_REPLICAS_LOST);
+
+    if (is_new_replica)
+        LOG_INFO(log, "Will mimic {}", source_replica);
+    else
+        LOG_WARNING(log, "Will mimic {}", source_replica);
 
     /// Clear obsolete queue that we no longer need.
     zookeeper->removeChildren(replica_path + "/queue");
@@ -3324,8 +3408,10 @@ void StorageReplicatedMergeTree::startup()
     {
         queue.initialize(getDataParts());
 
-        data_parts_exchange_endpoint = std::make_shared<DataPartsExchange::Service>(*this);
-        global_context.getInterserverIOHandler().addEndpoint(data_parts_exchange_endpoint->getId(replica_path), data_parts_exchange_endpoint);
+        InterserverIOEndpointPtr data_parts_exchange_ptr = std::make_shared<DataPartsExchange::Service>(*this);
+        [[maybe_unused]] auto prev_ptr = std::atomic_exchange(&data_parts_exchange_endpoint, data_parts_exchange_ptr);
+        assert(prev_ptr == nullptr);
+        global_context.getInterserverIOHandler().addEndpoint(data_parts_exchange_ptr->getId(replica_path), data_parts_exchange_ptr);
 
         /// In this thread replica will be activated.
         restarting_thread.start();
@@ -3392,15 +3478,15 @@ void StorageReplicatedMergeTree::shutdown()
         global_context.getBackgroundMovePool().removeTask(move_parts_task_handle);
     move_parts_task_handle.reset();
 
-    if (data_parts_exchange_endpoint)
+    auto data_parts_exchange_ptr = std::atomic_exchange(&data_parts_exchange_endpoint, InterserverIOEndpointPtr{});
+    if (data_parts_exchange_ptr)
     {
-        global_context.getInterserverIOHandler().removeEndpointIfExists(data_parts_exchange_endpoint->getId(replica_path));
+        global_context.getInterserverIOHandler().removeEndpointIfExists(data_parts_exchange_ptr->getId(replica_path));
         /// Ask all parts exchange handlers to finish asap. New ones will fail to start
-        data_parts_exchange_endpoint->blocker.cancelForever();
+        data_parts_exchange_ptr->blocker.cancelForever();
         /// Wait for all of them
-        std::unique_lock lock(data_parts_exchange_endpoint->rwlock);
+        std::unique_lock lock(data_parts_exchange_ptr->rwlock);
     }
-    data_parts_exchange_endpoint.reset();
 
     /// We clear all old parts after stopping all background operations. It's
     /// important, because background operations can produce temporary parts
@@ -3779,13 +3865,19 @@ void StorageReplicatedMergeTree::alter(
 
         ReplicatedMergeTreeTableMetadata future_metadata_in_zk(*this, current_metadata);
         if (ast_to_str(future_metadata.sorting_key.definition_ast) != ast_to_str(current_metadata->sorting_key.definition_ast))
-            future_metadata_in_zk.sorting_key = serializeAST(*future_metadata.sorting_key.expression_list_ast);
+        {
+            /// We serialize definition_ast as list, because code which apply ALTER (setTableStructure) expect serialized non empty expression
+            /// list here and we cannot change this representation for compatibility. Also we have preparsed AST `sorting_key.expression_list_ast`
+            /// in KeyDescription, but it contain version column for VersionedCollapsingMergeTree, which shouldn't be defined as a part of key definition AST.
+            /// So the best compatible way is just to convert definition_ast to list and serialize it. In all other places key.expression_list_ast should be used.
+            future_metadata_in_zk.sorting_key = serializeAST(*extractKeyExpressionList(future_metadata.sorting_key.definition_ast));
+        }
 
         if (ast_to_str(future_metadata.sampling_key.definition_ast) != ast_to_str(current_metadata->sampling_key.definition_ast))
-            future_metadata_in_zk.sampling_expression = serializeAST(*future_metadata.sampling_key.expression_list_ast);
+            future_metadata_in_zk.sampling_expression = serializeAST(*extractKeyExpressionList(future_metadata.sampling_key.definition_ast));
 
         if (ast_to_str(future_metadata.partition_key.definition_ast) != ast_to_str(current_metadata->partition_key.definition_ast))
-            future_metadata_in_zk.partition_key = serializeAST(*future_metadata.partition_key.expression_list_ast);
+            future_metadata_in_zk.partition_key = serializeAST(*extractKeyExpressionList(future_metadata.partition_key.definition_ast));
 
         if (ast_to_str(future_metadata.table_ttl.definition_ast) != ast_to_str(current_metadata->table_ttl.definition_ast))
             future_metadata_in_zk.ttl_table = serializeAST(*future_metadata.table_ttl.definition_ast);
@@ -4298,9 +4390,13 @@ bool StorageReplicatedMergeTree::waitForReplicaToProcessLogEntry(
       * To do this, check its node `log_pointer` - the maximum number of the element taken from `log` + 1.
       */
 
-    const auto & check_replica_become_inactive = [this, &replica]()
+    bool waiting_itself = replica == replica_name;
+
+    const auto & stop_waiting = [&]()
     {
-        return !getZooKeeper()->exists(zookeeper_path + "/replicas/" + replica + "/is_active");
+        bool stop_waiting_itself = waiting_itself && is_dropped;
+        bool stop_waiting_non_active = !wait_for_non_active && !getZooKeeper()->exists(zookeeper_path + "/replicas/" + replica + "/is_active");
+        return stop_waiting_itself || stop_waiting_non_active;
     };
     constexpr auto event_wait_timeout_ms = 1000;
 
@@ -4315,7 +4411,7 @@ bool StorageReplicatedMergeTree::waitForReplicaToProcessLogEntry(
         LOG_DEBUG(log, "Waiting for {} to pull {} to queue", replica, log_node_name);
 
         /// Let's wait until entry gets into the replica queue.
-        while (wait_for_non_active || !check_replica_become_inactive())
+        while (!stop_waiting())
         {
             zkutil::EventPtr event = std::make_shared<Poco::Event>();
 
@@ -4363,7 +4459,7 @@ bool StorageReplicatedMergeTree::waitForReplicaToProcessLogEntry(
             LOG_DEBUG(log, "Waiting for {} to pull {} to queue", replica, log_node_name);
 
             /// Let's wait until the entry gets into the replica queue.
-            while (wait_for_non_active || !check_replica_become_inactive())
+            while (!stop_waiting())
             {
                 zkutil::EventPtr event = std::make_shared<Poco::Event>();
 
@@ -4416,10 +4512,8 @@ bool StorageReplicatedMergeTree::waitForReplicaToProcessLogEntry(
 
     /// Third - wait until the entry disappears from the replica queue or replica become inactive.
     String path_to_wait_on = zookeeper_path + "/replicas/" + replica + "/queue/" + queue_entry_to_wait_for;
-    if (wait_for_non_active)
-        return getZooKeeper()->waitForDisappear(path_to_wait_on);
 
-    return getZooKeeper()->waitForDisappear(path_to_wait_on, check_replica_become_inactive);
+    return getZooKeeper()->waitForDisappear(path_to_wait_on, stop_waiting);
 }
 
 
@@ -5686,7 +5780,10 @@ ActionLock StorageReplicatedMergeTree::getActionLock(StorageActionBlockType acti
         return fetcher.blocker.cancel();
 
     if (action_type == ActionLocks::PartsSend)
-        return data_parts_exchange_endpoint ? data_parts_exchange_endpoint->blocker.cancel() : ActionLock();
+    {
+        auto data_parts_exchange_ptr = std::atomic_load(&data_parts_exchange_endpoint);
+        return data_parts_exchange_ptr ? data_parts_exchange_ptr->blocker.cancel() : ActionLock();
+    }
 
     if (action_type == ActionLocks::ReplicationQueue)
         return queue.actions_blocker.cancel();
