@@ -1,5 +1,5 @@
 # docker build -t yandex/clickhouse-test-base .
-FROM ubuntu:19.10
+FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive LLVM_VERSION=10
 
@@ -54,5 +54,12 @@ RUN echo "TSAN_OPTIONS='verbosity=1000 halt_on_error=1 history_size=7'" >> /etc/
   echo "UBSAN_OPTIONS='print_stacktrace=1'" >> /etc/environment; \
   echo "MSAN_OPTIONS='abort_on_error=1'" >> /etc/environment; \
   ln -s /usr/lib/llvm-${LLVM_VERSION}/bin/llvm-symbolizer /usr/bin/llvm-symbolizer;
+
+# Some python2 packages deprecated in ubuntu 20.04, so install them using pip
+RUN add-apt-repository universe \
+    && apt-get install python2 --yes --no-install-recommends \
+    && curl "https://bootstrap.pypa.io/get-pip.py" --output get-pip.py \
+    && python2 get-pip.py \
+    && pip install requests termcolor
 
 CMD sleep 1

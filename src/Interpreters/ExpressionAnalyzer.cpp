@@ -117,11 +117,14 @@ ExpressionAnalyzer::ExpressionAnalyzer(
     const TreeRewriterResultPtr & syntax_analyzer_result_,
     const Context & context_,
     size_t subquery_depth_,
-    bool do_global)
+    bool do_global,
+    SubqueriesForSets subqueries_for_sets_)
     : query(query_), context(context_), settings(context.getSettings())
     , subquery_depth(subquery_depth_)
     , syntax(syntax_analyzer_result_)
 {
+    subqueries_for_sets = std::move(subqueries_for_sets_);
+
     /// external_tables, subqueries_for_sets for global subqueries.
     /// Replaces global subqueries with the generated names of temporary tables that will be sent to remote servers.
     initGlobalSubqueriesAndExternalTables(do_global);
@@ -394,6 +397,16 @@ void ExpressionAnalyzer::getRootActionsNoMakeSet(const ASTPtr & ast, bool no_sub
     visitor_data.updateActions(actions);
 }
 
+void ExpressionAnalyzer::getRootActionsForHaving(const ASTPtr & ast, bool no_subqueries, ExpressionActionsPtr & actions, bool only_consts)
+{
+    LogAST log;
+    ActionsVisitor::Data visitor_data(context, settings.size_limits_for_set, subquery_depth,
+                                   sourceColumns(), actions, prepared_sets, subqueries_for_sets,
+                                   no_subqueries, false, only_consts, true);
+    ActionsVisitor(visitor_data, log.stream()).visit(ast);
+    visitor_data.updateActions(actions);
+}
+
 
 bool ExpressionAnalyzer::makeAggregateDescriptions(ExpressionActionsPtr & actions)
 {
@@ -526,7 +539,7 @@ static bool allowDictJoin(StoragePtr joined_storage, const Context & context, St
     if (!dict)
         return false;
 
-    dict_name = dict->dictionaryName();
+    dict_name = dict->resolvedDictionaryName();
     auto dictionary = context.getExternalDictionariesLoader().getDictionary(dict_name);
     if (!dictionary)
         return false;
@@ -797,7 +810,7 @@ bool SelectQueryExpressionAnalyzer::appendHaving(ExpressionActionsChain & chain,
     ExpressionActionsChain::Step & step = chain.lastStep(aggregated_columns);
 
     step.required_output.push_back(select_query->having()->getColumnName());
-    getRootActions(select_query->having(), only_types, step.actions());
+    getRootActionsForHaving(select_query->having(), only_types, step.actions());
 
     return true;
 }
