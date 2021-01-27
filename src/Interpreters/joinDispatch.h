@@ -100,9 +100,10 @@ inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness stric
     });
 }
 
+
 /// Call function on specified join map
-template <typename Func>
-inline bool joinDispatch_(ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness, Func && func)
+template <typename MapsVariant, typename Func>
+inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness, std::vector<const MapsVariant*> & mapsv, Func && func)
 {
     return static_for<0, KINDS.size() * STRICTNESSES.size()>([&](auto ij)
     {
@@ -112,13 +113,23 @@ inline bool joinDispatch_(ASTTableJoin::Kind kind, ASTTableJoin::Strictness stri
         constexpr auto j = ij % STRICTNESSES.size();
         if (kind == KINDS[i] && strictness == STRICTNESSES[j])
         {
+            using MapType = typename MapGetter<KINDS[i], STRICTNESSES[j]>::Map;
+            std::vector<const MapType*> v;
+            for (const auto & el : mapsv)
+            {
+                v.push_back(&std::get<MapType>(*el));
+            }
+
             func(
                 std::integral_constant<ASTTableJoin::Kind, KINDS[i]>(),
-                std::integral_constant<ASTTableJoin::Strictness, STRICTNESSES[j]>());
+                std::integral_constant<ASTTableJoin::Strictness, STRICTNESSES[j]>(),
+                v
+                /*std::get<typename MapGetter<KINDS[i], STRICTNESSES[j]>::Map>(maps)*/);
             return true;
         }
         return false;
     });
 }
+
 
 }

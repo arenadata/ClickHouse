@@ -22,6 +22,9 @@ void SubqueryForSet::makeSource(std::shared_ptr<InterpreterSelectWithUnionQuery>
 
     sample_block = interpreter->getSampleBlock();
     renameColumns(sample_block);
+
+    LOG_TRACE(&Poco::Logger::get("SubqueryForSet"), "sample_block {}", sample_block.dumpStructure());
+
 }
 
 void SubqueryForSet::renameColumns(Block & block)

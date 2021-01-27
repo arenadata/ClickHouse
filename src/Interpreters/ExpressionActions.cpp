@@ -764,8 +764,9 @@ void ExpressionActionsChain::JoinStep::finalize(const Names & required_output_)
     /// That's an input columns we need.
     NameSet required_names(required_output_.begin(), required_output_.end());
     if (!analyzed_join->keyNamesLeft().empty())
-        for (const auto & name : analyzed_join->keyNamesLeft()[0])
-            required_names.emplace(name);
+        for (const auto & name_part : analyzed_join->keyNamesLeft())
+            for (const auto & name : name_part)
+                required_names.emplace(name);
 
     for (const auto & column : required_columns)
     {

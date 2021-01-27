@@ -187,7 +187,7 @@ public:
     const ColumnWithTypeAndName & rightAsofKeyColumn() const
     {
         /// It should be nullable if nullable_right_side is true
-        return savedBlockSample().getByName(key_names_right[0].back());
+        return savedBlockSample(0 /*!!!*/).getByName(key_names_right[0].back());
     }
 
     /// Different types of keys for maps.
@@ -379,7 +379,7 @@ private:
     /// Block with columns from the right-side table except key columns.
     Block sample_block_with_columns_to_add;  /* !!!! */
     /// Block with key columns in the same order they appear in the right-side table (duplicates appear once).
-    Block right_table_keys;
+    Block right_table_keys;  /* !!!! */
 
     /// Block with key columns right-side table keys that are needed in result (would be attached after joined columns).
     Block required_right_keys;
@@ -397,10 +397,10 @@ private:
     // void init(Type type_);
     void init(Type type_, RightTableDataPtr);
 
-    const Block & savedBlockSample() const { return data[0]->sample_block; }
+    const Block & savedBlockSample(size_t disjunct_num) const { return data[disjunct_num]->sample_block; }
 
     /// Modify (structure) right block to save it in block list
-    Block structureRightBlock(const Block & stored_block) const;
+    Block structureRightBlock(const Block & stored_block, size_t disjunct_num) const;
     void initRightBlockStructure(Block & saved_block_sample);
 
     template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>

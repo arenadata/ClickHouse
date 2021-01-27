@@ -737,6 +737,7 @@ JoinPtr SelectQueryExpressionAnalyzer::appendJoin(ExpressionActionsChain & chain
     ExpressionActionsChain::Step & step = chain.lastStep(columns_after_array_join);
     chain.steps.push_back(std::make_unique<ExpressionActionsChain::JoinStep>(syntax->analyzed_join, table_join, step.getResultColumns()));
     chain.addStep();
+
     return table_join;
 }
 
@@ -824,7 +825,11 @@ JoinPtr SelectQueryExpressionAnalyzer::makeTableJoin(
             NamesWithAliases required_columns_with_aliases = analyzedJoin().getRequiredColumns(
                 joined_block_actions->getSampleBlock(), joined_block_actions->getRequiredColumns());
             for (auto & pr : required_columns_with_aliases)
+            {
+              LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "adding column {}", pr.first);
                 original_right_columns.push_back(pr.first);
+            }
+
 
             /** For GLOBAL JOINs (in the case, for example, of the push method for executing GLOBAL subqueries), the following occurs
                 * - in the addExternalStorage function, the JOIN (SELECT ...) subquery is replaced with JOIN _data1,
@@ -845,6 +850,8 @@ JoinPtr SelectQueryExpressionAnalyzer::makeTableJoin(
             subquery_for_join.addJoinActions(std::make_shared<ExpressionActions>(syntax->analyzed_join->rightConvertingActions()));
 
         subquery_for_join.join = makeJoin(syntax->analyzed_join, subquery_for_join.sample_block, context);
+
+        LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "subquery_for_join.sample_block {}", subquery_for_join.sample_block.dumpStructure());
 
         /// Do not make subquery for join over dictionary.
         if (syntax->analyzed_join->dictionary_reader)
@@ -1451,6 +1458,13 @@ ExpressionAnalysisResult::ExpressionAnalysisResult(
         {
             query_analyzer.appendJoinLeftKeys(chain, only_types || !first_stage);
             before_join = chain.getLastActions();
+
+            LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "before_join {}", before_join->getSampleBlock().dumpStructure());
+
+
+            // !!! LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "before_join 1 {}", chain.getLastActions()->getSampleBlock().dumpStructure());
+            //   ActionsDAG::buildExpressions
+
             join = query_analyzer.appendJoin(chain);
             converting_join_columns = query_analyzer.analyzedJoin().leftConvertingActions();
             chain.addStep();

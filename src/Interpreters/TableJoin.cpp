@@ -217,7 +217,7 @@ void TableJoin::splitAdditionalColumns(const Block & sample_block, Block & block
             {
                 auto & col = block_others.getByName(column_name);
                 block_keys.insert(col);
-                block_others.erase(column_name);
+                // block_others.erase(column_name);
             }
         }
     }
