@@ -48,6 +48,9 @@ DictionaryReader::DictionaryReader(const String & dictionary_name, const Names &
     : result_header(makeResultBlock(result_columns))
     , key_position(key_size + result_header.columns())
 {
+    LOG_TRACE(&Poco::Logger::get("DictionaryReader"), "ctor");
+
+
     if (src_column_names.size() != result_columns.size())
         throw Exception("Columns number mismatch in dictionary reader", ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH);
 
@@ -113,9 +116,12 @@ DictionaryReader::DictionaryReader(const String & dictionary_name, const Names &
 void DictionaryReader::readKeys(const IColumn & keys, Block & out_block, ColumnVector<UInt8>::Container & found,
                                 std::vector<size_t> & positions) const
 {
+
     auto working_block = sample_block.getColumnsWithTypeAndName();
     size_t has_position = key_position + 1;
     size_t size = keys.size();
+
+    LOG_TRACE(&Poco::Logger::get("DictionaryReader"), "readKeys sample_block {}, key_position {}, size {}", sample_block.dumpStructure(), key_position, size);
 
     /// set keys for dictHas()
     ColumnWithTypeAndName & key_column = working_block[key_position];
@@ -140,15 +146,19 @@ void DictionaryReader::readKeys(const IColumn & keys, Block & out_block, ColumnV
     key_column.column = key_column.column->filter(found, -1);
     size_t rows = key_column.column->size();
 
+
     /// calculate dictGet()
     for (const auto & func : functions_get)
         func.execute(working_block, rows);
+
+    LOG_TRACE(&Poco::Logger::get("DictionaryReader"), "rows {}", rows);
 
     /// make result: copy header block with correct names and move data columns
     out_block = result_header.cloneEmpty();
     size_t first_get_position = has_position + 1;
     for (size_t i = 0; i < out_block.columns(); ++i)
     {
+        LOG_TRACE(&Poco::Logger::get("DictionaryReader"), "adding column");
         auto & src_column = working_block[first_get_position + i];
         auto & dst_column = out_block.getByPosition(i);
         dst_column.column = src_column.column;
@@ -158,9 +168,12 @@ void DictionaryReader::readKeys(const IColumn & keys, Block & out_block, ColumnV
 
 Block DictionaryReader::makeResultBlock(const NamesAndTypesList & names)
 {
+    LOG_TRACE(&Poco::Logger::get("DictionaryReader"), "makeResultBlock size {}", names.size());
     Block block;
     for (const auto & nm : names)
     {
+        LOG_TRACE(&Poco::Logger::get("DictionaryReader"), "makeResultBlock {}", nm.name);
+
         ColumnWithTypeAndName column{nullptr, nm.type, nm.name};
         if (column.type->isNullable())
             column.type = typeid_cast<const DataTypeNullable &>(*column.type).getNestedType();

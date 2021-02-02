@@ -935,8 +935,15 @@ NO_INLINE IColumn::Filter joinRightColumns(
     std::vector<KeyGetter> key_getter_vector;
     size_t disjunct_num = added_columns.key_columns.size();
 
-    for (size_t i = 0; i < added_columns.key_columns.size(); ++i)
+    for (size_t i = 0; i < disjunct_num; ++i)
     {
+        LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter {}, {}", added_columns.key_columns[i].size(), added_columns.key_sizes[i].size());
+
+        // if (!added_columns.key_columns[i].empty())
+        // {
+        //     LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter column name {}", added_columns.key_columns[i][0]->getName());
+        // }
+
         auto key_getter = createKeyGetter<KeyGetter, jf.is_asof_join>(added_columns.key_columns[i], added_columns.key_sizes[i]);
         key_getter_vector.push_back(std::move(key_getter));
     }
