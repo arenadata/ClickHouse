@@ -355,7 +355,7 @@ private:
     ASTTableJoin::Strictness strictness;
 
     /// Names of key columns in right-side table (in the order they appear in ON/USING clause). @note It could contain duplicates.
-    const NamesVector key_names_right;  /* !!!!! */
+    const NamesVector key_names_right;
     const NamesVector key_names_left;
 
     bool nullable_right_side; /// In case of LEFT and FULL joins, if use_nulls, convert right-side columns to Nullable.

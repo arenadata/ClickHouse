@@ -208,7 +208,7 @@ public:
     }
 
     /// StorageJoin overrides key names (cause of different names qualification)
-    void setRightKeys(const Names & keys) { key_names_right.clear(); key_names_right[0] = keys; }
+    void setRightKeys(const Names & keys) { key_names_right.clear(); key_names_right.push_back(keys); } // !!!!
 
     /// Split key and other columns by keys name list
     void splitAdditionalColumns(const Block & sample_block, Block & block_keys, Block & block_others) const;

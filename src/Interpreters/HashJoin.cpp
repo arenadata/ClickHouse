@@ -892,6 +892,26 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
     }
 };
 
+template <typename Map, bool add_missing>
+void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset, std::unordered_set<IColumn::Offset> & known_rows)
+{
+    LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: add_missing {}", add_missing);
+    if constexpr (add_missing)
+        added.applyLazyDefaults();
+
+    for (auto it = mapped.begin(); it.ok(); ++it)
+    {
+        LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, current_offset {}, {}", it->row_num, current_offset, it->block->dumpStructure());
+
+        if (!known_rows.contains(it->row_num))
+        {
+            added.appendFromBlock<false>(*it->block, it->row_num);
+            ++current_offset;
+            known_rows.insert(it->row_num);
+        }
+    }
+};
+
 template <bool add_missing, bool need_offset>
 void addNotFoundRow(AddedColumns & added [[maybe_unused]], IColumn::Offset & current_offset [[maybe_unused]])
 {
@@ -939,10 +959,10 @@ NO_INLINE IColumn::Filter joinRightColumns(
     {
         LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter {}, {}", added_columns.key_columns[i].size(), added_columns.key_sizes[i].size());
 
-        // if (!added_columns.key_columns[i].empty())
-        // {
-        //     LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter column name {}", added_columns.key_columns[i][0]->getName());
-        // }
+        if (!added_columns.key_columns[i].empty())
+        {
+            LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter column name {}", added_columns.key_columns[i][0]->getName());
+        }
 
         auto key_getter = createKeyGetter<KeyGetter, jf.is_asof_join>(added_columns.key_columns[i], added_columns.key_sizes[i]);
         key_getter_vector.push_back(std::move(key_getter));
@@ -952,18 +972,24 @@ NO_INLINE IColumn::Filter joinRightColumns(
 
     IColumn::Offset current_offset = 0;
 
+
     for (size_t i = 0; i < rows; ++i)
     {
+        std::unordered_set<IColumn::Offset> known_rows;
         for (size_t d = 0; d < disjunct_num; ++d)
         {
             if constexpr (has_null_map)
             {   // ????
-                if (null_map[d] && !null_map[d]->empty())
+                if (null_map[d] && (*null_map[d])[i] /* !null_map[d]->empty()*/)
                 {
                     addNotFoundRow<jf.add_missing, jf.need_replication>(added_columns, current_offset);
 
                     if constexpr (jf.need_replication)
+                    {
+                        LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (1) [{}] {}", i, current_offset);
                         (*added_columns.offsets_to_replicate)[i] = current_offset;
+                    }
+
                     continue;
                 }
             }
@@ -998,7 +1024,7 @@ NO_INLINE IColumn::Filter joinRightColumns(
                 {
                     setUsed<need_filter>(filter, i);
                     mapped.setUsed();
-                    addFoundRowAll<Map, jf.add_missing>(mapped, added_columns, current_offset);
+                    addFoundRowAll<Map, jf.add_missing>(mapped, added_columns, current_offset, known_rows);
                 }
             }
             else if constexpr (jf.is_any_join && KIND == ASTTableJoin::Kind::Inner)
@@ -1014,7 +1040,15 @@ NO_INLINE IColumn::Filter joinRightColumns(
                     added_columns.appendFromBlock<jf.add_missing>(*mapped.block, mapped.row_num);
                 }
 
-                break;
+                // break;
+
+                if (jf.is_any_join)
+                {
+                    break;
+                }
+                else  // !!!!
+                {
+                }
             }
             else if constexpr (jf.is_any_join && jf.full)
             {
@@ -1040,7 +1074,11 @@ NO_INLINE IColumn::Filter joinRightColumns(
 
 
         if constexpr (jf.need_replication)
+        {
+            LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (2) [{}] {}", i, current_offset);
             (*added_columns.offsets_to_replicate)[i] = current_offset;
+        }
+
     }
 
     added_columns.applyLazyDefaults();
@@ -1143,6 +1181,7 @@ IColumn::Filter dictionaryJoinRightColumns(const TableJoin & table_join, AddedCo
 } /// nameless
 
 
+#if 0
 std::unique_ptr<AddedColumns> joinAddedColumns(
     AddedColumnsV & added_columns_v)
 {
@@ -1173,7 +1212,7 @@ std::unique_ptr<AddedColumns> joinAddedColumns(
 
     return first;   // avoid extra copy
 }
-
+#endif
 
 template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
 std::unique_ptr<AddedColumns> HashJoin::makeAddedColumns(
@@ -1191,15 +1230,17 @@ std::unique_ptr<AddedColumns> HashJoin::makeAddedColumns(
     ColumnRawPtrsVector left_key_columns_vector;
     std::vector<ConstNullMapPtr> null_map_vector;
     std::vector<ColumnPtr> null_map_holder_vector;
+    std::vector<Columns> materialized_keys_vector;
 
     for (const auto & key_names_left_ : key_names_left_vector)
     {
-        Columns materialized_keys = JoinCommon::materializeColumns(block, key_names_left_);
-        ColumnRawPtrs left_key_columns = JoinCommon::getRawPointers(materialized_keys);
+        materialized_keys_vector.emplace_back(JoinCommon::materializeColumns(block, key_names_left_));
+        ColumnRawPtrs left_key_columns = JoinCommon::getRawPointers(materialized_keys_vector.back());
+        // emplace_back ?
         left_key_columns_vector.push_back(std::move(left_key_columns));
 
         null_map_vector.emplace_back();
-        null_map_holder_vector.push_back(extractNestedColumnsAndNullMap(left_key_columns, null_map_vector.back()));
+        null_map_holder_vector.push_back(extractNestedColumnsAndNullMap(left_key_columns_vector.back(), null_map_vector.back()));
     }
 
 
@@ -1395,6 +1436,7 @@ void HashJoin::joinBlockImpl(
                 LOG_TRACE(log, "joinBlockImpl: skipping required right key {} (already added)", right_key.name);
             }
         }
+
     }
 
     LOG_TRACE(log, "block 2 {}",  block.dumpStructure());

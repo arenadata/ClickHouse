@@ -239,7 +239,6 @@ Block TableJoin::getRequiredRightKeys(const Block & right_table_keys, std::vecto
     for (size_t p = 0; p < right_keys.size(); ++p)
     {
         const auto & right_keys_part = right_keys[p];
-        const auto & left_keys_part = left_keys[p];
 
         for (size_t i = 0; i < right_keys_part.size(); ++i)
         {
@@ -249,6 +248,7 @@ Block TableJoin::getRequiredRightKeys(const Block & right_table_keys, std::vecto
             {
                 const auto & right_key = right_table_keys.getByName(right_key_name);
                 required_right_keys.insert(right_key);
+                const auto & left_keys_part = left_keys[p];
                 keys_sources.push_back(left_keys_part[i]);
             }
         }
