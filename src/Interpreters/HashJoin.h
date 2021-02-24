@@ -176,7 +176,7 @@ public:
     /// Sum size in bytes of all buffers, used for JOIN maps and for all memory pools.
     size_t getTotalByteCount() const final;
 
-    // bool alwaysReturnsEmptySet() const final { return isInnerOrRight(getKind()) && data[0]->empty && !overDictionary(); }
+    // bool alwaysReturnsEmptySet() const final { return isInnerOrRight(getKind()) && data/*[0]*/->empty && !overDictionary(); }
 
     ASTTableJoin::Kind getKind() const { return kind; }
     ASTTableJoin::Strictness getStrictness() const { return strictness; }
@@ -187,7 +187,7 @@ public:
     const ColumnWithTypeAndName & rightAsofKeyColumn() const
     {
         /// It should be nullable if nullable_right_side is true
-        return savedBlockSample(0 /*!!!*/).getByName(key_names_right[0].back());
+        return savedBlockSample().getByName(key_names_right[0].back());
     }
 
     /// Different types of keys for maps.
@@ -318,7 +318,7 @@ public:
         Type type = Type::EMPTY;
         bool empty = true;
 
-        MapsVariant maps;
+        std::vector<MapsVariant> maps;
         Block sample_block; /// Block as it would appear in the BlockList
         BlocksList blocks; /// Blocks of "right" table.
         BlockNullmapList blocks_nullmaps; /// Nullmaps for blocks of "right" table (if needed)
@@ -341,7 +341,7 @@ public:
 
     std::shared_ptr<RightTableData> getJoinedData() const
     {
-        return data[0];
+        return data/*[0]*/;
     }
 
     bool isUsed(size_t off) const { return used_flags.getUsedSafe(off); }
@@ -371,7 +371,7 @@ private:
     /// Changes in hash table broke correspondence,
     /// so we must guarantee constantness of hash table during HashJoin lifetime (using method setLock)
     mutable JoinStuff::JoinUsedFlags used_flags;
-    RightTableDataPtrVector data;
+    RightTableDataPtr data;
     SizesVector key_sizes;
 
     /// Block with columns from the right-side table.
@@ -396,11 +396,12 @@ private:
 
     // void init(Type type_);
     void init(Type type_, RightTableDataPtr);
+    void data_map_init(MapsVariant &);
 
-    const Block & savedBlockSample(size_t disjunct_num) const { return data[disjunct_num]->sample_block; }
+    const Block & savedBlockSample() const { return data->sample_block; }
 
     /// Modify (structure) right block to save it in block list
-    Block structureRightBlock(const Block & stored_block, size_t disjunct_num) const;
+    Block structureRightBlock(const Block & stored_block) const;
     void initRightBlockStructure(Block & saved_block_sample);
 
     template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>

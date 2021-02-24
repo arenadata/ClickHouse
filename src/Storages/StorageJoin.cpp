@@ -330,11 +330,11 @@ public:
 protected:
     Chunk generate() override
     {
-        if (join->data[0]->blocks.empty())
+        if (join->data->blocks.empty())
             return {};
 
         Chunk chunk;
-        if (!joinDispatch(join.kind, join.strictness, join->data[0]->maps,
+        if (!joinDispatch(join.kind, join.strictness, join->data->maps[0],
                 [&](auto kind, auto strictness, auto & map) { chunk = createChunk<kind, strictness>(map); }))
             throw Exception("Logical error: unknown JOIN strictness", ErrorCodes::LOGICAL_ERROR);
         return chunk;
@@ -361,7 +361,7 @@ private:
 
         size_t rows_added = 0;
 
-        switch (join->data[0]->type)
+        switch (join->data->type)
         {
 #define M(TYPE)                                           \
     case HashJoin::Type::TYPE:                                \
@@ -371,7 +371,7 @@ private:
 #undef M
 
             default:
-                throw Exception("Unsupported JOIN keys in StorageJoin. Type: " + toString(static_cast<UInt32>(join->data[0]->type)),
+                throw Exception("Unsupported JOIN keys in StorageJoin. Type: " + toString(static_cast<UInt32>(join->data->type)),
                                 ErrorCodes::UNSUPPORTED_JOIN_KEYS);
         }
 
