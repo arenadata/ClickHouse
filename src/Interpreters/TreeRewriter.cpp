@@ -561,26 +561,14 @@ ASTPtr distribute(ASTPtr node)
 
 ASTPtr toDNF(ASTPtr on_expression)
 {
-    std::stringstream ss;
-    on_expression->dumpTree(ss, 0);
-    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression before distribute{}", ss.str());
-
     normTree(on_expression);
     std::stringstream ss01;
-    on_expression->dumpTree(ss01, 0);
-    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression after normTree 1 {}", ss01.str());
 
     auto distributed_expression = distribute(on_expression);
-    std::stringstream ss1;
-    distributed_expression->dumpTree(ss1, 0);
-    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression after distribute {}", ss1.str());
 
     normTree(distributed_expression);
 
 
-    std::stringstream ss2;
-    distributed_expression->dumpTree(ss2, 0);
-    LOG_DEBUG(&Poco::Logger::get("toDNF"), "on_expression after normTree 2 {}", ss2.str());
 
     return distributed_expression;
 

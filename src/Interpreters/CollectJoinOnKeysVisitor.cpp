@@ -36,6 +36,9 @@ bool canMoveToWhere(std::pair<size_t, size_t> table_numbers, ASTTableJoin::Kind 
         (table_numbers.first == table_numbers.second || table_numbers.first == 0 || table_numbers.second == 0);
 }
 
+}
+
+
 void CollectJoinOnKeysMatcher::Data::setDisjuncts(const ASTFunction & func)
 {
     auto expression_list = func.children[0]->as<ASTExpressionList>();

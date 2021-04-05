@@ -1455,10 +1455,6 @@ ExpressionAnalysisResult::ExpressionAnalysisResult(
             query_analyzer.appendJoinLeftKeys(chain, only_types || !first_stage);
             before_join = chain.getLastActions();
 
-            LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "before_join {}", before_join->getSampleBlock().dumpStructure());
-
-
-            // !!! LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "before_join 1 {}", chain.getLastActions()->getSampleBlock().dumpStructure());
             //   ActionsDAG::buildExpressions
 
             join = query_analyzer.appendJoin(chain);

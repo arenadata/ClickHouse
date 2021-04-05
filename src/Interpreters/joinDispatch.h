@@ -78,7 +78,8 @@ inline bool joinDispatchInit(ASTTableJoin::Kind kind, ASTTableJoin::Strictness s
     });
 }
 
-/// Call function on specified join map
+
+// Call function on specified join map
 template <typename MapsVariant, typename Func>
 inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness, MapsVariant & maps, Func && func)
 {
@@ -99,7 +100,6 @@ inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness stric
         return false;
     });
 }
-
 
 /// Call function on specified join map
 template <typename MapsVariant, typename Func>

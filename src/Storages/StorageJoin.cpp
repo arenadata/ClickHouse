@@ -334,7 +334,7 @@ protected:
             return {};
 
         Chunk chunk;
-        if (!joinDispatch(join.kind, join.strictness, join->data->maps[0],
+        if (!joinDispatch(join->kind, join->strictness, join->data->maps[0],
                 [&](auto kind, auto strictness, auto & map) { chunk = createChunk<kind, strictness>(map); }))
             throw Exception("Logical error: unknown JOIN strictness", ErrorCodes::LOGICAL_ERROR);
         return chunk;

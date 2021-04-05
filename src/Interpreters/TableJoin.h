@@ -65,12 +65,6 @@ private:
     const size_t max_files_to_merge = 0;
     const String temporary_files_codec = "LZ4";
 
-<<<<<<< HEAD
-    Names key_names_left;
-    Names key_names_right; /// Duplicating names are qualified.
-
-    ASTs key_asts_left;
-=======
 public:  // make it private again
     NamesVector key_names_left;
     NamesVector key_names_right; /// Duplicating names are qualified.
@@ -79,7 +73,6 @@ private:
     std::vector<const IAST*> disjuncts;
 
     ASTs key_asts_left;  // ??
->>>>>>> 81131f6d43... ORs initial
     ASTs key_asts_right;
     ASTTableJoin table_join;
 
@@ -109,7 +102,7 @@ private:
 
     /// Create converting actions and change key column names if required
     ActionsDAGPtr applyKeyConvertToTable(
-        const ColumnsWithTypeAndName & cols_src, const NameToTypeMap & type_mapping, Names & names_to_rename) const;
+        const ColumnsWithTypeAndName & cols_src, const NameToTypeMap & type_mapping, NamesVector & names_list_to_rename) const;
 
 public:
     TableJoin() = default;

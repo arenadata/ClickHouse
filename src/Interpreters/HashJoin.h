@@ -177,6 +177,7 @@ public:
     size_t getTotalByteCount() const final;
 
     // bool alwaysReturnsEmptySet() const final { return isInnerOrRight(getKind()) && data/*[0]*/->empty && !overDictionary(); }
+    bool alwaysReturnsEmptySet() const final;
 
     ASTTableJoin::Kind getKind() const { return kind; }
     ASTTableJoin::Strictness getStrictness() const { return strictness; }
@@ -410,8 +411,6 @@ private:
         const Names & key_names_left,
         const Block & block_with_columns_to_add,
         const Maps & maps,
-        const Sizes & key_sizes_,
-        HashJoin::Type,
         std::unique_ptr<AddedColumns>,
         size_t existing_columns) const;
 
@@ -420,9 +419,7 @@ private:
         Block & block,
         const NamesVector & key_names_left,
         const Block & block_with_columns_to_add,
-        const std::vector<const Maps*> & maps,
-        const SizesVector & key_sizes_,
-        HashJoin::Type) const;
+        const std::vector<const Maps*> & maps) const;
 
     template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
     std::unique_ptr<AddedColumns> makeAddedColumnsV(

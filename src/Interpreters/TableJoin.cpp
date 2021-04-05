@@ -261,12 +261,16 @@ Block TableJoin::getRequiredRightKeys(const Block & right_table_keys, std::vecto
 
 bool TableJoin::leftBecomeNullable(const DataTypePtr & column_type) const
 {
-    return forceNullableLeft() && column_type->canBeInsideNullable();
+    bool ret = forceNullableLeft() && column_type->canBeInsideNullable();
+    LOG_TRACE(&Poco::Logger::get("leftBecomeNullable"), ret?" true":" false");
+    return ret;
 }
 
 bool TableJoin::rightBecomeNullable(const DataTypePtr & column_type) const
 {
-    return forceNullableRight() && column_type->canBeInsideNullable();
+    bool ret = forceNullableRight() && column_type->canBeInsideNullable();
+    LOG_TRACE(&Poco::Logger::get("rightBecomeNullable"), ret?" true":" false");
+    return ret;
 }
 
 void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
@@ -280,13 +284,18 @@ void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
     }
 
     if (rightBecomeNullable(type))
+    {
+        LOG_TRACE(&Poco::Logger::get("addJoinedColumn"),  " rightBecomeNullable");
         type = makeNullable(type);
+    }
+
 
     columns_added_by_join.emplace_back(joined_column.name, type);
 }
 
 void TableJoin::addJoinedColumnsAndCorrectTypes(NamesAndTypesList & names_and_types, bool correct_nullability) const
 {
+    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"),  " addJoinedColumnsAndCorrectTypes 1");
     ColumnsWithTypeAndName columns;
     for (auto & pair : names_and_types)
         columns.emplace_back(nullptr, std::move(pair.type), std::move(pair.name));
@@ -300,6 +309,7 @@ void TableJoin::addJoinedColumnsAndCorrectTypes(NamesAndTypesList & names_and_ty
 
 void TableJoin::addJoinedColumnsAndCorrectTypes(ColumnsWithTypeAndName & columns, bool correct_nullability) const
 {
+    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"),  " addJoinedColumnsAndCorrectTypes 2");
     for (auto & col : columns)
     {
         if (hasUsing())
@@ -436,37 +446,41 @@ bool TableJoin::inferJoinKeyCommonType(const NamesAndTypesList & left, const Nam
             right_types[col.name] = col.type;
     }
 
-    for (size_t i = 0; i < key_names_left.size(); ++i)
+    for (size_t d = 0; d < key_names_left.size(); ++d)
     {
-        auto ltype = left_types.find(key_names_left[i]);
-        auto rtype = right_types.find(key_names_right[i]);
-        if (ltype == left_types.end() || rtype == right_types.end())
+        for (size_t i = 0; i < key_names_left[d].size(); ++i)
         {
-            /// Name mismatch, give up
-            left_type_map.clear();
-            right_type_map.clear();
-            return false;
-        }
+            auto ltype = left_types.find(key_names_left[d][i]);
+            auto rtype = right_types.find(key_names_right[d][i]);
+            if (ltype == left_types.end() || rtype == right_types.end())
+            {
+                /// Name mismatch, give up
+                left_type_map.clear();
+                right_type_map.clear();
+                return false;
+            }
 
-        if (JoinCommon::typesEqualUpToNullability(ltype->second, rtype->second))
-            continue;
+            if (JoinCommon::typesEqualUpToNullability(ltype->second, rtype->second))
+                continue;
 
-        DataTypePtr supertype;
-        try
-        {
-            supertype = DB::getLeastSupertype({ltype->second, rtype->second});
-        }
-        catch (DB::Exception & ex)
-        {
-            throw Exception(
-                "Type mismatch of columns to JOIN by: " +
-                    key_names_left[i] + ": " + ltype->second->getName() + " at left, " +
-                    key_names_right[i] + ": " + rtype->second->getName() + " at right. " +
+            DataTypePtr supertype;
+            try
+            {
+                supertype = DB::getLeastSupertype({ltype->second, rtype->second});
+            }
+            catch (DB::Exception & ex)
+            {
+                throw Exception(
+                    "Type mismatch of columns to JOIN by: " +
+                    key_names_left[d][i] + ": " + ltype->second->getName() + " at left, " +
+                    key_names_right[d][i] + ": " + rtype->second->getName() + " at right. " +
                     "Can't get supertype: " + ex.message(),
-                ErrorCodes::TYPE_MISMATCH);
+                    ErrorCodes::TYPE_MISMATCH);
+            }
+            left_type_map[key_names_left[d][i]] = right_type_map[key_names_right[d][i]] = supertype;
         }
-        left_type_map[key_names_left[i]] = right_type_map[key_names_right[i]] = supertype;
     }
+
 
     if (!left_type_map.empty() || !right_type_map.empty())
     {
@@ -488,7 +502,7 @@ bool TableJoin::inferJoinKeyCommonType(const NamesAndTypesList & left, const Nam
 }
 
 ActionsDAGPtr TableJoin::applyKeyConvertToTable(
-    const ColumnsWithTypeAndName & cols_src, const NameToTypeMap & type_mapping, Names & names_to_rename) const
+    const ColumnsWithTypeAndName & cols_src, const NameToTypeMap & type_mapping, NamesVector & names_vector_to_rename) const
 {
     ColumnsWithTypeAndName cols_dst = cols_src;
     for (auto & col : cols_dst)
@@ -505,12 +519,16 @@ ActionsDAGPtr TableJoin::applyKeyConvertToTable(
     auto dag = ActionsDAG::makeConvertingActions(
         cols_src, cols_dst, ActionsDAG::MatchColumnsMode::Name, true, !hasUsing(), &key_column_rename);
 
-    for (auto & name : names_to_rename)
+    for (auto & disjunct_names : names_vector_to_rename)
     {
-        const auto it = key_column_rename.find(name);
-        if (it != key_column_rename.end())
-            name = it->second;
+        for (auto & name : disjunct_names)
+        {
+            const auto it = key_column_rename.find(name);
+            if (it != key_column_rename.end())
+                name = it->second;
+        }
     }
+
     return dag;
 }
 

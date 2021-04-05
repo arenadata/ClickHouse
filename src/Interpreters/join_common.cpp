@@ -263,8 +263,12 @@ void joinTotals(const Block & totals, const Block & columns_to_add, const TableJ
 
     if (Block totals_without_keys = totals)
     {
-        for (const auto & name : table_join.keyNamesRight())
-            totals_without_keys.erase(totals_without_keys.getPositionByName(name));
+        for (const auto & name_part : table_join.keyNamesRight())
+        {
+            for (const auto & name : name_part)
+                totals_without_keys.erase(totals_without_keys.getPositionByName(name));
+        }
+
 
         for (auto & col : totals_without_keys)
         {
@@ -332,23 +336,25 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
         required_right_keys = table_join.getRequiredRightKeys(right_table_keys, tmp);
     }
 
-
     std::unordered_map<size_t, size_t> left_to_right_key_remap;
 
     if (table_join.hasUsing())
     {
-        for (size_t i = 0; i < table_join.keyNamesLeft()[p].size(); ++i)
+        for (size_t p = 0; p < table_join.keyNamesLeft().size(); ++p)
         {
-            const String & left_key_name = table_join.keyNamesLeft()[p][i];
-            const String & right_key_name = table_join.keyNamesRight()[p][i];
-
-            size_t left_key_pos = result_sample_block.getPositionByName(left_key_name);
-            size_t right_key_pos = saved_block_sample.getPositionByName(right_key_name);
-
-            if (/*remap_keys && */!required_right_keys.has(right_key_name))
+            for (size_t i = 0; i < table_join.keyNamesLeft()[p].size(); ++i)
             {
-                left_to_right_key_remap[left_key_pos] = right_key_pos;
-                LOG_TRACE(&Poco::Logger::get("NotJoined"), "ctor remap {} {}", right_key_name, left_key_name);
+                const String & left_key_name = table_join.keyNamesLeft()[p][i];
+                const String & right_key_name = table_join.keyNamesRight()[p][i];
+
+                size_t left_key_pos = result_sample_block.getPositionByName(left_key_name);
+                size_t right_key_pos = saved_block_sample.getPositionByName(right_key_name);
+
+                if (!required_right_keys.has(right_key_name))
+                {
+                    left_to_right_key_remap[left_key_pos] = right_key_pos;
+                    LOG_TRACE(&Poco::Logger::get("NotJoined"), "ctor remap {} {}", right_key_name, left_key_name);
+                }
             }
         }
     }
@@ -374,7 +380,6 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
     for (size_t right_pos = 0; right_pos < saved_block_sample.columns(); ++right_pos)
     {
         const String & name = saved_block_sample.getByPosition(right_pos).name;
-
         if (!result_sample_block.has(name))
             continue;
 

@@ -1065,7 +1065,6 @@ void InterpreterSelectQuery::executeImpl(QueryPlan & query_plan, const BlockInpu
 
             if (expressions.before_join)
             {
-                LOG_TRACE(&Poco::Logger::get("InterpreterSelectQuery"), "96 executeImpl header {}", expressions.before_join->getSampleBlock().dumpStructure());
                 QueryPlanStepPtr before_join_step = std::make_unique<ExpressionStep>(
                     query_plan.getCurrentDataStream(),
                     expressions.before_join);

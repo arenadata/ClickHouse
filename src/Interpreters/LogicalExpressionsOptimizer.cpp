@@ -114,10 +114,6 @@ void LogicalExpressionsOptimizer::collectDisjunctiveEqualityChains()
 
         auto * function = to_node->as<ASTFunction>();
 
-        if (function)
-            function->dumpTree(std::cerr);
-
-
         if (function && function->name == "or" && function->children.size() == 1)
         {
             const auto * expression_list = function->children[0]->as<ASTExpressionList>();
@@ -186,9 +182,6 @@ void LogicalExpressionsOptimizer::collectDisjunctiveEqualityChains()
     {
         LOG_DEBUG(&Poco::Logger::get("LogicalExpressionsOptimizer"),
             "function_name {}, alias {}", chain.first.or_function->name, chain.first.alias);
-
-        chain.first.or_function->dumpTree(std::cerr);
-
 
         auto & equalities = chain.second;
         auto & equality_functions = equalities.functions;
