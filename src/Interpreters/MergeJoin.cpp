@@ -466,7 +466,7 @@ MergeJoin::MergeJoin(std::shared_ptr<TableJoin> table_join_, const Block & right
 
     table_join->splitAdditionalColumns(right_sample_block, right_table_keys, right_columns_to_add);
     JoinCommon::removeLowCardinalityInplace(right_table_keys);
-    JoinCommon::removeLowCardinalityInplace(right_sample_block, table_join->keyNamesRight());
+    JoinCommon::removeLowCardinalityInplace(right_sample_block, table_join->keyNamesRight()[0]);
 
     const NameSet required_right_keys = table_join->requiredRightKeys();
     for (const auto & column : right_table_keys)
