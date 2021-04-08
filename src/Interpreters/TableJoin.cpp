@@ -13,8 +13,6 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <DataStreams/materializeBlock.h>
 
-#include <common/logger_useful.h>
-
 namespace DB
 {
 
@@ -285,7 +283,7 @@ void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
 
     if (rightBecomeNullable(type))
     {
-        LOG_TRACE(&Poco::Logger::get("addJoinedColumn"),  " rightBecomeNullable");
+        LOG_TRACE(&Poco::Logger::get("addJoinedColumn"), " rightBecomeNullable");
         type = makeNullable(type);
     }
 
@@ -295,7 +293,7 @@ void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
 
 void TableJoin::addJoinedColumnsAndCorrectTypes(NamesAndTypesList & names_and_types, bool correct_nullability) const
 {
-    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"),  " addJoinedColumnsAndCorrectTypes 1");
+    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"), " addJoinedColumnsAndCorrectTypes 1");
     ColumnsWithTypeAndName columns;
     for (auto & pair : names_and_types)
         columns.emplace_back(nullptr, std::move(pair.type), std::move(pair.name));
@@ -309,7 +307,7 @@ void TableJoin::addJoinedColumnsAndCorrectTypes(NamesAndTypesList & names_and_ty
 
 void TableJoin::addJoinedColumnsAndCorrectTypes(ColumnsWithTypeAndName & columns, bool correct_nullability) const
 {
-    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"),  " addJoinedColumnsAndCorrectTypes 2");
+    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"), " addJoinedColumnsAndCorrectTypes 2");
     for (auto & col : columns)
     {
         if (hasUsing())

@@ -16,10 +16,8 @@
                  first_or_random - if first replica one has higher number of errors, pick a random one from replicas with minimum number of errors.
             -->
             <load_balancing>random</load_balancing>
-
-						<send_timeout>50000</send_timeout>
-						<receive_timeout>50000</receive_timeout>
-
+						<!-- <send_timeout>50000</send_timeout> -->
+						<!-- <receive_timeout>50000</receive_timeout> -->
         </default>
 
         <!-- Profile that allows only read queries. -->
@@ -53,7 +51,7 @@
                   place 'kerberos' element instead of 'password' (and similar) elements.
                  The name part of the canonical principal name of the initiator must match the user name for authentication to succeed.
                  You can also place 'realm' element inside 'kerberos' element to further restrict authentication to only those requests
-                  whose initiator's realm matches it. 
+                  whose initiator's realm matches it.
                  Example: <kerberos />
                  Example: <kerberos><realm>EXAMPLE.COM</realm></kerberos>
 
