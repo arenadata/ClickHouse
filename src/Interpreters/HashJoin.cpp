@@ -797,6 +797,13 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
     size_t total_rows = 0;
     size_t total_bytes = 0;
 
+    Block structured_block = structureRightBlock(block);  /*  !!! */
+
+    data->blocks.emplace_back(std::move(structured_block));
+    Block * stored_block = &data->blocks.back();
+
+    if (rows)
+        data->empty = false;
 
     for (size_t d = 0; d < key_names_right.size(); ++d)
     {
@@ -814,18 +821,12 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
                 save_nullmap |= (*null_map)[i];
         }
 
-        Block structured_block = structureRightBlock(block);  /*  !!! */
 
         {
             if (storage_join_lock.mutex())
                 throw DB::Exception("addJoinedBlock called when HashJoin locked to prevent updates",
                     ErrorCodes::LOGICAL_ERROR);
 
-            data->blocks.emplace_back(std::move(structured_block));
-            Block * stored_block = &data->blocks.back();
-
-            if (rows)
-                data->empty = false;
 
             if (kind != ASTTableJoin::Kind::Cross)
             {
@@ -1029,7 +1030,7 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
 
     for (auto it = mapped.begin(); it.ok(); ++it)
     {
-        LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, current_offset {}, {}", it->row_num, current_offset, it->block->dumpStructure());
+        LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, current_offset {}, addr {}, {}", it->row_num, current_offset, static_cast<const void *>(it->block), it->block->dumpStructure());
 
         if (!known_rows.contains(it->block /*&mapped*//*it->row_num*/))
         {
@@ -1037,6 +1038,10 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
             ++current_offset;
             // known_rows.insert(it->block /*it->row_num*/);
             new_known_rows.push_back(it->block);
+        }
+        else
+        {
+            LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: bypassing");
         }
     }
 
@@ -1089,16 +1094,16 @@ NO_INLINE IColumn::Filter joinRightColumns(
     std::vector<KeyGetter> key_getter_vector;
     size_t disjunct_num = added_columns.key_columns.size();
 
-    for (size_t i = 0; i < disjunct_num; ++i)
+    for (size_t d = 0; d < disjunct_num; ++d)
     {
-        LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter {}, {}", added_columns.key_columns[i].size(), added_columns.key_sizes[i].size());
+        LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter {}, {}", added_columns.key_columns[d].size(), added_columns.key_sizes[d].size());
 
-        if (!added_columns.key_columns[i].empty())
+        if (!added_columns.key_columns[d].empty())
         {
-            LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter column name {}", added_columns.key_columns[i][0]->getName());
+            LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter column name {}", added_columns.key_columns[d][0]->getName());
         }
 
-        auto key_getter = createKeyGetter<KeyGetter, jf.is_asof_join>(added_columns.key_columns[i], added_columns.key_sizes[i]);
+        auto key_getter = createKeyGetter<KeyGetter, jf.is_asof_join>(added_columns.key_columns[d], added_columns.key_sizes[d]);
         key_getter_vector.push_back(std::move(key_getter));
     }
 
@@ -1158,7 +1163,7 @@ NO_INLINE IColumn::Filter joinRightColumns(
                 {
                     setUsed<need_filter>(filter, i);
                     used_flags.template setUsed<jf.need_flags>(find_result.getOffset());
-                    addFoundRowAll<Map, jf.add_missing>(mapped, added_columns, current_offset);
+                    addFoundRowAll<Map, jf.add_missing>(mapped, added_columns, current_offset, known_rows);
                 }
                 else if constexpr ((jf.is_any_join || jf.is_semi_join) && jf.right)
                 {
