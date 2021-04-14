@@ -1,5 +1,6 @@
 #include <any>
 #include <limits>
+#include <numeric>
 
 #include <common/logger_useful.h>
 
@@ -797,6 +798,32 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
     size_t total_rows = 0;
     size_t total_bytes = 0;
 
+
+
+    Names all_key_names_right = key_names_right[0];
+    std::vector<std::vector<size_t>> key_names_right_indexes(key_names_right.size());
+    key_names_right_indexes[0].resize(all_key_names_right.size());
+    std::iota(std::begin(key_names_right_indexes[0]), std::end(key_names_right_indexes[0]), 0);
+
+    for (size_t d = 1; d < key_names_right.size(); ++d)
+    {
+        for (size_t i = 0; i < key_names_right[d].size(); ++i)
+        {
+            auto it = std::find(std::begin(all_key_names_right), std::end(all_key_names_right), key_names_right[d][i]);
+            if (it == std::end(all_key_names_right))
+            {
+                key_names_right_indexes[d].push_back(all_key_names_right.size());
+                all_key_names_right.push_back(key_names_right[d][i]);
+            }
+            else
+            {
+                key_names_right_indexes[d].push_back(std::distance(std::begin(all_key_names_right), it));
+            }
+        }
+    }
+
+    ColumnRawPtrs all_key_columns = JoinCommon::materializeColumnsInplace(block, all_key_names_right);
+
     Block structured_block = structureRightBlock(block);  /*  !!! */
 
     data->blocks.emplace_back(std::move(structured_block));
@@ -807,7 +834,8 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
 
     for (size_t d = 0; d < key_names_right.size(); ++d)
     {
-        ColumnRawPtrs key_columns = JoinCommon::materializeColumnsInplace(block, key_names_right[d]);
+        ColumnRawPtrs key_columns(key_names_right_indexes[d].size());
+        std::transform(std::cbegin(key_names_right_indexes[d]), std::cend(key_names_right_indexes[d]), std::begin(key_columns), [&](size_t ind){return all_key_columns[ind];});
 
         /// We will insert to the map only keys, where all components are not NULL.
         ConstNullMapPtr null_map{};
@@ -821,12 +849,19 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
                 save_nullmap |= (*null_map)[i];
         }
 
+        // Block structured_block = structureRightBlock(block);  /*  !!! */
 
         {
             if (storage_join_lock.mutex())
                 throw DB::Exception("addJoinedBlock called when HashJoin locked to prevent updates",
                     ErrorCodes::LOGICAL_ERROR);
 
+
+            // data->blocks.emplace_back(std::move(structured_block));
+            // Block * stored_block = &data->blocks.back();
+
+            // if (rows)
+            //     data->empty = false;
 
             if (kind != ASTTableJoin::Kind::Cross)
             {
@@ -1019,25 +1054,115 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
     }
 };
 
-template <typename Map, bool add_missing>
-void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset, std::unordered_set<const void*> & known_rows)
+template <bool multiple_disjuncts>
+class KnownRowsHolder;
+
+template<>
+class KnownRowsHolder<true>
+{
+    static const size_t MAX_LINEAR = 16;
+    using LinearHolder = std::array<const void*, MAX_LINEAR>;
+    using LogHolder = std::set<const void*>;
+    using LogHolderPtr = std::unique_ptr<LogHolder>;
+
+    LinearHolder linh;
+    LogHolderPtr logh_ptr;
+
+    size_t items = 0;
+
+public:
+    // void add(const void* ptr)
+    // {
+    //     if (items < MAX_LINEAR)
+    //     {
+    //         linh[items] = ptr;
+    //     }
+    //     else
+    //     {
+    //         if (items == MAX_LINEAR)
+    //         {
+    //             logh_ptr = std::make_unique<LogHolder>();
+    //             logh_ptr->insert(std::cbegin(linh), std::cend(linh));
+    //         }
+    //         logh_ptr->insert(ptr);
+    //     }
+    //     ++items;
+    // }
+
+    template<class InputIt>
+    void add(InputIt from, InputIt to)
+    {
+        size_t new_items = std::distance(from, to);
+
+        if (items + new_items < MAX_LINEAR)
+        {
+            std::copy(from, to, &linh[items]);
+        }
+        else
+        {
+            if (items + new_items == MAX_LINEAR)
+            {
+                logh_ptr = std::make_unique<LogHolder>();
+                logh_ptr->insert(std::cbegin(linh), std::cend(linh));
+            }
+            logh_ptr->insert(from, to);
+        }
+        items += new_items;
+    }
+
+    bool isKnown(const void *ptr)
+    {
+        return items <= MAX_LINEAR
+            ? std::find(std::cbegin(linh), std::cend(linh), ptr) != std::cend(linh)
+            : logh_ptr->find(ptr) != logh_ptr->end();
+    }
+};
+
+template<>
+class KnownRowsHolder<false>
+{
+public:
+    // void add(const void*)
+    // {
+    // }
+
+    template<class InputIt>
+    void add(InputIt, InputIt)
+    {
+    }
+
+    bool isKnown(const void*)
+    {
+        return false;
+    }
+};
+
+template <typename Map, bool add_missing, bool multiple_disjuncts>
+void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset, KnownRowsHolder<multiple_disjuncts> & known_rows)
 {
     LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: add_missing {}", add_missing);
     if constexpr (add_missing)
         added.applyLazyDefaults();
 
-    std::vector<const void*> new_known_rows;
+    std::unique_ptr<std::vector<const void*>> new_known_rows_ptr;
 
     for (auto it = mapped.begin(); it.ok(); ++it)
     {
         LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, current_offset {}, addr {}, {}", it->row_num, current_offset, static_cast<const void *>(it->block), it->block->dumpStructure());
 
-        if (!known_rows.contains(it->block /*&mapped*//*it->row_num*/))
+        if (!known_rows.isKnown(it->block /*&mapped*//*it->row_num*/))
         {
             added.appendFromBlock<false>(*it->block, it->row_num);
             ++current_offset;
             // known_rows.insert(it->block /*it->row_num*/);
-            new_known_rows.push_back(it->block);
+            if constexpr (multiple_disjuncts)
+            {
+                if (!new_known_rows_ptr)
+                {
+                    new_known_rows_ptr = std::make_unique<std::vector<const void*>>();
+                    new_known_rows_ptr->push_back(it->block);
+                }
+            }
         }
         else
         {
@@ -1045,9 +1170,12 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
         }
     }
 
-    if (!new_known_rows.empty())
+    if constexpr (multiple_disjuncts)
     {
-        known_rows.insert(std::cbegin(new_known_rows), std::cend(new_known_rows));
+        if (new_known_rows_ptr)
+        {
+            known_rows.add(std::cbegin(*new_known_rows_ptr), std::cend(*new_known_rows_ptr));
+        }
     }
 };
 
@@ -1072,7 +1200,7 @@ void setUsed(IColumn::Filter & filter [[maybe_unused]], size_t pos [[maybe_unuse
 
 /// Joins right table columns which indexes are present in right_indexes using specified map.
 /// Makes filter (1 if row presented in right table) and returns offsets to replicate (for ALL JOINS).
-template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename KeyGetter, typename Map, bool need_filter, bool has_null_map>
+template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename KeyGetter, typename Map, bool need_filter, bool has_null_map, bool multiple_disjuncts>
 NO_INLINE IColumn::Filter joinRightColumns(
     const std::vector<const Map*> & mapv,
     AddedColumns & added_columns,
@@ -1116,8 +1244,10 @@ NO_INLINE IColumn::Filter joinRightColumns(
     {
         bool found_right_row = false;
 
-        std::unordered_set<const void*> known_rows;
-        for (size_t d = 0; d < disjunct_num; ++d)
+        KnownRowsHolder<multiple_disjuncts> known_rows;
+        size_t d = 0;
+        do
+        // for (size_t d = 0; d < disjunct_num; ++d)
         {
             if constexpr (has_null_map)
             {
@@ -1212,7 +1342,8 @@ NO_INLINE IColumn::Filter joinRightColumns(
                 }
 
             }
-        }
+        } while(multiple_disjuncts && ++d < disjunct_num);
+
         if (!found_right_row)
         {
             if constexpr (jf.is_anti_join && jf.left)
@@ -1234,25 +1365,40 @@ NO_INLINE IColumn::Filter joinRightColumns(
     return filter;
 }
 
+template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename KeyGetter, typename Map, bool need_filter, bool has_null_map>
+IColumn::Filter joinRightColumnsSwitchMultipleDisjuncts(
+    const std::vector<const Map*> & mapv,
+    AddedColumns & added_columns,
+    const std::vector<ConstNullMapPtr> & null_map [[maybe_unused]],
+    JoinStuff::JoinUsedFlags & used_flags [[maybe_unused]])
+{
+    return mapv.size() > 1
+        ? joinRightColumns<KIND, STRICTNESS, KeyGetter, Map, true, true, true>(mapv, added_columns, null_map, used_flags)
+        : joinRightColumns<KIND, STRICTNESS, KeyGetter, Map, true, true, false>(mapv, added_columns, null_map, used_flags);
+}
+
 template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename KeyGetter, typename Map>
 IColumn::Filter joinRightColumnsSwitchNullability(
-    const std::vector<const Map*>/***/ & mapv, AddedColumns & added_columns, const std::vector</*const !!!*/ConstNullMapPtr> & null_map, JoinStuff::JoinUsedFlags & used_flags)
+    const std::vector<const Map*>/***/ & mapv,
+    AddedColumns & added_columns,
+    const std::vector</*const !!!*/ConstNullMapPtr> & null_map,
+    JoinStuff::JoinUsedFlags & used_flags)
 {
     // bool null_map_empty = std::all_of(std::begin(null_map), std::end(null_map), [](const auto& v){ return v->empty(); });
 
     if (added_columns.need_filter)
     {
         if (!null_map.empty())
-            return joinRightColumns<KIND, STRICTNESS, KeyGetter, Map, true, true>(mapv, added_columns, null_map, used_flags);
+            return joinRightColumnsSwitchMultipleDisjuncts<KIND, STRICTNESS, KeyGetter, Map, true, true>(mapv, added_columns, null_map, used_flags);
         else
-            return joinRightColumns<KIND, STRICTNESS, KeyGetter, Map, true, false>(mapv, added_columns, null_map /*nullptr*/, used_flags);
+            return joinRightColumnsSwitchMultipleDisjuncts<KIND, STRICTNESS, KeyGetter, Map, true, false>(mapv, added_columns, null_map /*nullptr*/, used_flags);
     }
     else
     {
         if (!null_map.empty())
-            return joinRightColumns<KIND, STRICTNESS, KeyGetter, Map, false, true>(mapv, added_columns, null_map, used_flags);
+            return joinRightColumnsSwitchMultipleDisjuncts<KIND, STRICTNESS, KeyGetter, Map, false, true>(mapv, added_columns, null_map, used_flags);
         else
-            return joinRightColumns<KIND, STRICTNESS, KeyGetter, Map, false, false>(mapv, added_columns, null_map /*nullptr*/, used_flags);
+            return joinRightColumnsSwitchMultipleDisjuncts<KIND, STRICTNESS, KeyGetter, Map, false, false>(mapv, added_columns, null_map /*nullptr*/, used_flags);
     }
 }
 
