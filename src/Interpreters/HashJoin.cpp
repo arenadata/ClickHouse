@@ -238,12 +238,17 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
         data->maps.resize(key_names_right.size());
     }
 
+    if (nullable_right_side)
+    {
+        LOG_TRACE(&Poco::Logger::get("HashJoin"), "ctor: before sample_block_with_columns_to_add convertColumnsToNullable {}", sample_block_with_columns_to_add.dumpStructure());
+        JoinCommon::convertColumnsToNullable(sample_block_with_columns_to_add);
+        LOG_TRACE(&Poco::Logger::get("HashJoin"), "ctor: after sample_block_with_columns_to_add convertColumnsToNullable {}", sample_block_with_columns_to_add.dumpStructure());
+    }
+
     for (size_t i = 0; i < key_names_right.size(); ++i)
     {
         ColumnRawPtrs key_columns = JoinCommon::extractKeysForJoin(right_table_keys, key_names_right[i]);
 
-        if (nullable_right_side)
-            JoinCommon::convertColumnsToNullable(sample_block_with_columns_to_add);
 
         if (table_join->dictionary_reader)
         {
@@ -681,7 +686,12 @@ void HashJoin::initRightBlockStructure(Block & saved_block_sample)
 
 
     if (nullable_right_side)
+    {
+        LOG_TRACE(&Poco::Logger::get("HashJoin"), "initRightBlockStructure: before sample_block_sample convertColumnsToNullable {} {}", saved_block_sample.dumpStructure(), right_table_keys.columns());
         JoinCommon::convertColumnsToNullable(saved_block_sample, (isFull(kind) ? right_table_keys.columns() : 0));
+        LOG_TRACE(&Poco::Logger::get("HashJoin"), "initRightBlockStructure: after sample_block_sample convertColumnsToNullable {}", saved_block_sample.dumpStructure());
+    }
+
 }
 
 Block HashJoin::structureRightBlock(const Block & block) const
@@ -763,7 +773,7 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
             });
         }
 
-        if (save_nullmap)
+        if (save_nullmap && !null_map_added)
             data->blocks_nullmaps.emplace_back(stored_block, null_map_holder);
 
         if (!check_limits)
@@ -809,15 +819,15 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
     {
         for (size_t i = 0; i < key_names_right[d].size(); ++i)
         {
-            auto it = std::find(std::begin(all_key_names_right), std::end(all_key_names_right), key_names_right[d][i]);
-            if (it == std::end(all_key_names_right))
+            auto it = std::find(std::cbegin(all_key_names_right), std::cend(all_key_names_right), key_names_right[d][i]);
+            if (it == std::cend(all_key_names_right))
             {
                 key_names_right_indexes[d].push_back(all_key_names_right.size());
                 all_key_names_right.push_back(key_names_right[d][i]);
             }
             else
             {
-                key_names_right_indexes[d].push_back(std::distance(std::begin(all_key_names_right), it));
+                key_names_right_indexes[d].push_back(std::distance(std::cbegin(all_key_names_right), it));
             }
         }
     }
@@ -825,12 +835,25 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
     ColumnRawPtrs all_key_columns = JoinCommon::materializeColumnsInplace(block, all_key_names_right);
 
     Block structured_block = structureRightBlock(block);  /*  !!! */
+    if (nullable_right_side)
+    {
+        bool multiple_disjuncts = key_names_right.size() > 1;
+        if (multiple_disjuncts)
+        {
+            JoinCommon::convertColumnsToNullable(structured_block);
+        }
+    }
+
+
+    LOG_TRACE(&Poco::Logger::get("HashJoin"), "addJoinedBlock: structured_block {}", structured_block.dumpStructure());
 
     data->blocks.emplace_back(std::move(structured_block));
     Block * stored_block = &data->blocks.back();
 
     if (rows)
         data->empty = false;
+
+    bool save_a_nullmap = false;
 
     for (size_t d = 0; d < key_names_right.size(); ++d)
     {
@@ -848,6 +871,7 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
             for (size_t i = 0; !save_nullmap && i < null_map->size(); ++i)
                 save_nullmap |= (*null_map)[i];
         }
+        save_a_nullmap |= save_nullmap;
 
         // Block structured_block = structureRightBlock(block);  /*  !!! */
 
@@ -871,16 +895,20 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
                         LOG_TRACE(&Poco::Logger::get("addJoinedBlock"),  " a_key_column  {}, stored_block {}", a_key_column->dumpStructure(), stored_block->dumpStructure());
                     size_t size = insertFromBlockImpl<strictness_>(*this, data->type, map, rows, key_columns, key_sizes[d], stored_block, null_map, data->pool);
                     /// Number of buckets + 1 value from zero storage
+
+
                     used_flags.reinit<kind_, strictness_>(size + 1);
+
+
                 });
             }
 
-            if (save_nullmap)
-            {
-                LOG_TRACE(&Poco::Logger::get("addJoinedBlock"),  " save_nullmap");
+            // if (save_nullmap)
+            // {
+            //     LOG_TRACE(&Poco::Logger::get("addJoinedBlock"),  " save_nullmap");
 
-                data->blocks_nullmaps.emplace_back(stored_block, null_map_holder);
-            }
+            //     data->blocks_nullmaps.emplace_back(stored_block, null_map_holder);
+            // }
 
 
             if (!check_limits)
@@ -892,6 +920,15 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
         }
     }
 
+    if (save_a_nullmap)
+    {
+        LOG_TRACE(&Poco::Logger::get("addJoinedBlock"),  " save_nullmap");
+
+        ConstNullMapPtr null_map{};
+        ColumnPtr null_map_holder = extractNestedColumnsAndNullMap(all_key_columns, null_map);
+
+        data->blocks_nullmaps.emplace_back(stored_block, null_map_holder);
+    }
 
     return table_join->sizeLimits().check(total_rows, total_bytes, "JOIN", ErrorCodes::SET_SIZE_LIMIT_EXCEEDED);
 }
@@ -1068,7 +1105,7 @@ class KnownRowsHolder<true>
     LinearHolder linh;
     LogHolderPtr logh_ptr;
 
-    size_t items = 0;
+    size_t items;
 
 public:
     // void add(const void* ptr)
@@ -1089,21 +1126,29 @@ public:
     //     ++items;
     // }
 
+    KnownRowsHolder()
+        : items(0)
+    {
+        LOG_TRACE(&Poco::Logger::get("KnownRowsHolder"), "ctor");
+    }
+
+
     template<class InputIt>
     void add(InputIt from, InputIt to)
     {
         size_t new_items = std::distance(from, to);
+        LOG_TRACE(&Poco::Logger::get("KnownRowsHolder"), "{} new items to add", new_items);
 
-        if (items + new_items < MAX_LINEAR)
+        if (items + new_items <= MAX_LINEAR)
         {
             std::copy(from, to, &linh[items]);
         }
         else
         {
-            if (items + new_items == MAX_LINEAR)
+            if (items <= MAX_LINEAR)
             {
                 logh_ptr = std::make_unique<LogHolder>();
-                logh_ptr->insert(std::cbegin(linh), std::cend(linh));
+                logh_ptr->insert(std::cbegin(linh), std::cbegin(linh) + items);
             }
             logh_ptr->insert(from, to);
         }
@@ -1112,8 +1157,9 @@ public:
 
     bool isKnown(const void *ptr)
     {
+        LOG_TRACE(&Poco::Logger::get("KnownRowsHolder"), "isKnown {}", ptr);
         return items <= MAX_LINEAR
-            ? std::find(std::cbegin(linh), std::cend(linh), ptr) != std::cend(linh)
+            ? std::find(std::cbegin(linh), std::cbegin(linh) + items, ptr) != std::cbegin(linh) + items
             : logh_ptr->find(ptr) != logh_ptr->end();
     }
 };
@@ -1242,7 +1288,10 @@ NO_INLINE IColumn::Filter joinRightColumns(
 
     for (size_t i = 0; i < rows; ++i)
     {
-        bool found_right_row = false;
+        LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: row {}, current_offset {}", i, current_offset);
+
+        bool right_row_found = false;
+        bool null_element_found = false;
 
         KnownRowsHolder<multiple_disjuncts> known_rows;
         size_t d = 0;
@@ -1254,15 +1303,16 @@ NO_INLINE IColumn::Filter joinRightColumns(
                 if (null_map[d] && (*null_map[d])[i])
                 {
                     LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow 1");
-                    addNotFoundRow<jf.add_missing, jf.need_replication>(added_columns, current_offset);
+                    // addNotFoundRow<jf.add_missing, jf.need_replication>(added_columns, current_offset);
 
-                    if constexpr (jf.need_replication)
-                    {
-                        LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (1) [{}] {}", i, current_offset);
-                        (*added_columns.offsets_to_replicate)[i] = current_offset;
-                    }
+                    // if constexpr (jf.need_replication)
+                    // {
+                    //     LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (1) [{}] {}", i, current_offset);
+                    //     (*added_columns.offsets_to_replicate)[i] = current_offset;
+                    // }
 
-                    found_right_row = true;
+                    // found_right_row = true;
+                    null_element_found = true;
 
                     continue;
                 }
@@ -1272,7 +1322,7 @@ NO_INLINE IColumn::Filter joinRightColumns(
 
             if (find_result.isFound())
             {
-                found_right_row = true;
+                right_row_found = true;
                 auto & mapped = find_result.getMapped();
                 if constexpr (jf.is_asof_join)
                 {
@@ -1344,7 +1394,26 @@ NO_INLINE IColumn::Filter joinRightColumns(
             }
         } while(multiple_disjuncts && ++d < disjunct_num);
 
-        if (!found_right_row)
+        if constexpr (has_null_map)
+        {
+            if (!right_row_found && null_element_found)
+            {
+                LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow null_element_found");
+                addNotFoundRow<jf.add_missing, jf.need_replication>(added_columns, current_offset);
+
+                if constexpr (jf.need_replication)
+                {
+                    LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (1) [{}] {}", i, current_offset);
+                    (*added_columns.offsets_to_replicate)[i] = current_offset;
+                }
+
+                // right_row_found = true;
+
+                continue;
+            }
+        }
+
+        if (!right_row_found)
         {
             if constexpr (jf.is_anti_join && jf.left)
                 setUsed<need_filter>(filter, i);
@@ -1352,13 +1421,11 @@ NO_INLINE IColumn::Filter joinRightColumns(
             addNotFoundRow<jf.add_missing, jf.need_replication>(added_columns, current_offset);
         }
 
-
         if constexpr (jf.need_replication)
         {
             LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (2) [{}] {}", i, current_offset);
             (*added_columns.offsets_to_replicate)[i] = current_offset;
         }
-
     }
 
     added_columns.applyLazyDefaults();
@@ -2225,6 +2292,7 @@ private:
 
     void fillNullsFromBlocks(MutableColumns & columns_keys_and_right, size_t & rows_added)
     {
+        LOG_TRACE(&Poco::Logger::get("NonJoinedBlockInputStream"), "top - rows_added {}", rows_added);
         if (!nulls_position.has_value())
             nulls_position = parent.data->blocks_nullmaps.begin();
 
@@ -2245,6 +2313,7 @@ private:
                 }
             }
         }
+        LOG_TRACE(&Poco::Logger::get("NonJoinedBlockInputStream"), "end - rows_added {}", rows_added);
     }
 };
 
