@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include <Core/Names.h>
@@ -105,8 +104,13 @@ private:
         const ColumnsWithTypeAndName & cols_src, const NameToTypeMap & type_mapping, NamesVector & names_list_to_rename) const;
 
 public:
-    TableJoin() = default;
-    TableJoin(const Settings &, VolumePtr tmp_volume);
+    TableJoin()
+        : key_names_left(1)
+        , key_names_right(1)
+    {
+    }
+
+    TableJoin(const Settings & settings, VolumePtr tmp_volume_);
 
     /// for StorageJoin
     TableJoin(SizeLimits limits, bool use_nulls, ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness,
@@ -115,6 +119,7 @@ public:
         , default_max_bytes(0)
         , join_use_nulls(use_nulls)
         , join_algorithm(JoinAlgorithm::HASH)
+        , key_names_left(1)
         , key_names_right(key_names_right_)
     {
         table_join.kind = kind;
@@ -201,7 +206,7 @@ public:
     }
 
     /// StorageJoin overrides key names (cause of different names qualification)
-    void setRightKeys(const Names & keys) { key_names_right.clear(); key_names_right.push_back(keys); } // !!!!
+    void setRightKeys(const Names & keys) { key_names_right.clear(); key_names_right.push_back(keys); }
 
     /// Split key and other columns by keys name list
     void splitAdditionalColumns(const Block & sample_block, Block & block_keys, Block & block_others) const;

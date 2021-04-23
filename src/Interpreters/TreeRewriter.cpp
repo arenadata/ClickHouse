@@ -572,109 +572,103 @@ ASTPtr distribute(ASTPtr node)
 {
     auto *function = node->as<ASTFunction>();
 
-    assert(function);
-
-    if (function && function->name == "and" && function->children.size() == 1)
+    if (function && function->children.size() == 1)
     {
-        auto expression_list = function->children[0]->as<ASTExpressionList>();
-        assert(expression_list);
-
-        if (expression_list)
+        if (function->name == "and")
         {
+            auto expression_list = function->children[0]->as<ASTExpressionList>();
+            assert(expression_list);
 
-
-            auto or_child = std::find_if(expression_list->children.begin(), expression_list->children.end(), [](ASTPtr arg)
-                {
-                    auto * f = arg->as<ASTFunction>();
-                    return f && f->name == "or" && f->children.size() == 1;
-                });
-            if (or_child == expression_list->children.end())
+            if (expression_list)
             {
-                return node;
-            }
-
-
-            ASTs rest_children;
-
-            for (auto & arg : expression_list->children)
-            {
-                // LOG_DEBUG(&Poco::Logger::get("toDNF"), "IDs {} vs. {}", arg->getTreeHash(), (*or_child)->getTreeHash());
-
-                if (arg->getTreeHash() != (*or_child)->getTreeHash())
-                {
-                    rest_children.push_back(arg);
-                }
-            }
-            auto rest = rest_children.size() > 1 ?
-                makeASTFunction("and", rest_children):
-                rest_children[0];
-
-
-            auto * or_child_function = (*or_child)->as<ASTFunction>();
-            assert(or_child_function);
-
-            if (or_child_function)
-            {
-                const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
-                assert(or_child_expression_list);
-
-                if (or_child_expression_list)
-                {
-
-                    ASTs lst;
-                    for (auto & arg : or_child_expression_list->children)
+                auto or_child = std::find_if(expression_list->children.begin(), expression_list->children.end(), [](ASTPtr arg)
                     {
-                        ASTs arg_rest_lst;
-                        arg_rest_lst.push_back(arg);
-                        arg_rest_lst.push_back(rest);
+                        auto * f = arg->as<ASTFunction>();
+                        return f && f->name == "or" && f->children.size() == 1;
+                    });
+                if (or_child == expression_list->children.end())
+                {
+                    return node;
+                }
 
-                        auto and_node = makeASTFunction("and", arg_rest_lst);
-                        lst.push_back(distribute(and_node));
+                ASTs rest_children;
+
+                for (auto & arg : expression_list->children)
+                {
+                    // LOG_DEBUG(&Poco::Logger::get("toDNF"), "IDs {} vs. {}", arg->getTreeHash(), (*or_child)->getTreeHash());
+
+                    if (arg->getTreeHash() != (*or_child)->getTreeHash())
+                    {
+                        rest_children.push_back(arg);
                     }
-                    LOG_DEBUG(&Poco::Logger::get("toDNF"), "lst has {} elements", lst.size());
+                }
+                auto rest = rest_children.size() > 1 ?
+                    makeASTFunction("and", rest_children):
+                    rest_children[0];
 
-                    auto ret = lst.size()>1 ?
-                        makeASTFunction("or", lst) :
-                        lst[0];
-                    return ret;
+
+                auto * or_child_function = (*or_child)->as<ASTFunction>();
+                assert(or_child_function);
+
+                if (or_child_function)
+                {
+                    const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
+                    assert(or_child_expression_list);
+
+                    if (or_child_expression_list)
+                    {
+
+                        ASTs lst;
+                        for (auto & arg : or_child_expression_list->children)
+                        {
+                            ASTs arg_rest_lst;
+                            arg_rest_lst.push_back(arg);
+                            arg_rest_lst.push_back(rest);
+
+                            auto and_node = makeASTFunction("and", arg_rest_lst);
+                            lst.push_back(distribute(and_node));
+                        }
+                        LOG_DEBUG(&Poco::Logger::get("toDNF"), "lst has {} elements", lst.size());
+
+                        auto ret = lst.size()>1 ?
+                            makeASTFunction("or", lst) :
+                            lst[0];
+                        return ret;
+                    }
                 }
             }
-
         }
-
-    }
-    else if (function && function->name == "or" && function->children.size() == 1)
-    {
-        const auto * expression_list = function->children[0]->as<ASTExpressionList>();
-        assert(expression_list);
-
-        if (expression_list)
+        else if (function->name == "or")
         {
-            ASTs lst;
-            for (auto & arg : expression_list->children)
-            {
-                lst.push_back(distribute(arg));
-            }
+            const auto * expression_list = function->children[0]->as<ASTExpressionList>();
+            assert(expression_list);
 
-            auto ret = lst.size()>1 ?
-                makeASTFunction("or", lst) :
-                lst[0];
-            return ret;
+            if (expression_list)
+            {
+                ASTs lst;
+                for (auto & arg : expression_list->children)
+                {
+                    lst.push_back(distribute(arg));
+                }
+
+                auto ret = lst.size()>1 ?
+                    makeASTFunction("or", lst) :
+                    lst[0];
+                return ret;
+            }
         }
     }
+
     return node;
 }
 
 ASTPtr toDNF(ASTPtr on_expression)
 {
     normTree(on_expression);
-    std::stringstream ss01;
 
     auto distributed_expression = distribute(on_expression);
 
     normTree(distributed_expression);
-
-
 
     return distributed_expression;
 

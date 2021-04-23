@@ -32,10 +32,10 @@ TableJoin::TableJoin(const Settings & settings, VolumePtr tmp_volume_)
     , partial_merge_join_left_table_buffer_bytes(settings.partial_merge_join_left_table_buffer_bytes)
     , max_files_to_merge(settings.join_on_disk_max_files_to_merge)
     , temporary_files_codec(settings.temporary_files_codec)
+    , key_names_left(1)
+    , key_names_right(1)
     , tmp_volume(tmp_volume_)
 {
-    key_names_left.resize(1);
-    key_names_right.resize(1);
 }
 
 void TableJoin::resetCollected()
@@ -221,7 +221,7 @@ void TableJoin::splitAdditionalColumns(const Block & sample_block, Block & block
             {
                 auto & col = block_others.getByName(column_name);
                 block_keys.insert(col);
-                block_others.erase(column_name);  // !!!!
+                block_others.erase(column_name);
             }
         }
     }
@@ -373,7 +373,7 @@ bool TableJoin::allowDictJoin(const String & dict_key, const Block & sample_bloc
     if (!isLeft(kind()) && !(isInner(kind()) && strictness() == ASTTableJoin::Strictness::All))
         return false;
 
-    const Names & right_keys = keyNamesRight()[0];  // !!!
+    const Names & right_keys = keyNamesRight()[0];
     if (right_keys.size() != 1)
         return false;
 
@@ -387,7 +387,7 @@ bool TableJoin::allowDictJoin(const String & dict_key, const Block & sample_bloc
 
     for (const auto & col : sample_block)
     {
-        if (col.name == right_keys[0]) /* !!!!! */
+        if (col.name == right_keys[0])
             continue; /// do not extract key column
 
         auto it = original_names.find(col.name);

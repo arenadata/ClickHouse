@@ -381,9 +381,9 @@ private:
     /// Block with columns from the right-side table.
     Block right_sample_block;
     /// Block with columns from the right-side table except key columns.
-    Block sample_block_with_columns_to_add;  /* !!!! */
+    Block sample_block_with_columns_to_add;
     /// Block with key columns in the same order they appear in the right-side table (duplicates appear once).
-    Block right_table_keys;  /* !!!! */
+    Block right_table_keys;
 
     /// Block with key columns right-side table keys that are needed in result (would be attached after joined columns).
     Block required_right_keys;
@@ -521,7 +521,6 @@ public:
         return ret;
     }
 
-    // !!!!!!!!!!!!!!!!!
     BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & result_sample_block, UInt64 max_block_size) const override
     {
         return implv[0]->createStreamWithNonJoinedRows(result_sample_block, max_block_size);
