@@ -602,60 +602,73 @@ ASTPtr distribute(ASTPtr node)
                         rest_children.push_back(arg);
                     }
                 }
+                // assert(!rest_children.empty());
+                if (rest_children.empty())
+                {
+                    return node;
+                }
+
                 auto rest = rest_children.size() > 1 ?
                     makeASTFunction("and", rest_children):
                     rest_children[0];
 
 
                 auto * or_child_function = (*or_child)->as<ASTFunction>();
-                assert(or_child_function);
-
-                if (or_child_function)
+                // assert(or_child_function);
+                if (!or_child_function)
                 {
-                    const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
-                    assert(or_child_expression_list);
+                    return node;
+                }
 
-                    if (or_child_expression_list)
+                const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
+                assert(or_child_expression_list);
+
+                if (or_child_expression_list)
+                {
+
+                    ASTs lst;
+                    for (auto & arg : or_child_expression_list->children)
                     {
+                        ASTs arg_rest_lst;
+                        arg_rest_lst.push_back(arg);
+                        arg_rest_lst.push_back(rest);
 
-                        ASTs lst;
-                        for (auto & arg : or_child_expression_list->children)
-                        {
-                            ASTs arg_rest_lst;
-                            arg_rest_lst.push_back(arg);
-                            arg_rest_lst.push_back(rest);
-
-                            auto and_node = makeASTFunction("and", arg_rest_lst);
-                            lst.push_back(distribute(and_node));
-                        }
-                        LOG_DEBUG(&Poco::Logger::get("toDNF"), "lst has {} elements", lst.size());
-
-                        auto ret = lst.size()>1 ?
-                            makeASTFunction("or", lst) :
-                            lst[0];
-                        return ret;
+                        auto and_node = makeASTFunction("and", arg_rest_lst);
+                        lst.push_back(distribute(and_node));
                     }
+                    LOG_DEBUG(&Poco::Logger::get("toDNF"), "lst has {} elements", lst.size());
+                    if (lst.empty())
+                    {
+                        return node;
+                    }
+
+                    auto ret = lst.size()>1 ?
+                        makeASTFunction("or", lst) :
+                        lst[0];
+                    return ret;
                 }
             }
         }
         else if (function->name == "or")
         {
             const auto * expression_list = function->children[0]->as<ASTExpressionList>();
-            assert(expression_list);
+            // assert(expression_list);
 
-            if (expression_list)
+            if (!expression_list)
             {
-                ASTs lst;
-                for (auto & arg : expression_list->children)
-                {
-                    lst.push_back(distribute(arg));
-                }
-
-                auto ret = lst.size()>1 ?
-                    makeASTFunction("or", lst) :
-                    lst[0];
-                return ret;
+                return node;
             }
+
+            ASTs lst;
+            for (auto & arg : expression_list->children)
+            {
+                lst.push_back(distribute(arg));
+            }
+
+            auto ret = lst.size()>1 ?
+                makeASTFunction("or", lst) :
+                lst[0];
+            return ret;
         }
     }
 

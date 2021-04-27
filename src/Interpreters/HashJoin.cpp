@@ -1155,12 +1155,12 @@ NO_INLINE IColumn::Filter joinRightColumns(
 
     for (size_t d = 0; d < disjunct_num; ++d)
     {
-        LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter {}, {}", added_columns.key_columns[d].size(), added_columns.key_sizes[d].size());
+        // LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter {}, {}", added_columns.key_columns[d].size(), added_columns.key_sizes[d].size());
 
-        if (!added_columns.key_columns[d].empty())
-        {
-            LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter column name {}", added_columns.key_columns[d][0]->getName());
-        }
+        // if (!added_columns.key_columns[d].empty())
+        // {
+        //     LOG_TRACE(&Poco::Logger::get("joinRightColumns"), "creating key_getter column name {}", added_columns.key_columns[d][0]->getName());
+        // }
 
         auto key_getter = createKeyGetter<KeyGetter, jf.is_asof_join>(added_columns.key_columns[d], added_columns.key_sizes[d]);
         key_getter_vector.push_back(std::move(key_getter));
@@ -1172,7 +1172,7 @@ NO_INLINE IColumn::Filter joinRightColumns(
 
     for (size_t i = 0; i < rows; ++i)
     {
-        LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: row {}, current_offset {}", i, current_offset);
+        // LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: row {}, current_offset {}", i, current_offset);
 
         bool right_row_found = false;
         bool null_element_found = false;
@@ -1186,7 +1186,7 @@ NO_INLINE IColumn::Filter joinRightColumns(
             {
                 if (null_map[d] && (*null_map[d])[i])
                 {
-                    LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow 1");
+                    // LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow 1");
 
                     null_element_found = true;
 
@@ -1241,7 +1241,7 @@ NO_INLINE IColumn::Filter joinRightColumns(
                     if (used_once)
                     {
                         setUsed<need_filter>(filter, i);
-                        LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: mapped.block {}", mapped.block->dumpStructure());
+                        // LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: mapped.block {}", mapped.block->dumpStructure());
                         added_columns.appendFromBlock<jf.add_missing>(*mapped.block, mapped.row_num);
                     }
 
@@ -1273,12 +1273,12 @@ NO_INLINE IColumn::Filter joinRightColumns(
         {
             if (!right_row_found && null_element_found)
             {
-                LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow null_element_found");
+                // LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow null_element_found");
                 addNotFoundRow<jf.add_missing, jf.need_replication>(added_columns, current_offset);
 
                 if constexpr (jf.need_replication)
                 {
-                    LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (1) [{}] {}", i, current_offset);
+                    // LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (1) [{}] {}", i, current_offset);
                     (*added_columns.offsets_to_replicate)[i] = current_offset;
                 }
 
@@ -1292,13 +1292,13 @@ NO_INLINE IColumn::Filter joinRightColumns(
         {
             if constexpr (jf.is_anti_join && jf.left)
                 setUsed<need_filter>(filter, i);
-            LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow 2");
+            // LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: addNotFoundRow 2");
             addNotFoundRow<jf.add_missing, jf.need_replication>(added_columns, current_offset);
         }
 
         if constexpr (jf.need_replication)
         {
-            LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (2) [{}] {}", i, current_offset);
+            // LOG_TRACE(&Poco::Logger::get("HashJoin"), "joinRightColumns: offsets_to_replicate (2) [{}] {}", i, current_offset);
             (*added_columns.offsets_to_replicate)[i] = current_offset;
         }
     }
