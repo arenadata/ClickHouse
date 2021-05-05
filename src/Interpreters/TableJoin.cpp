@@ -288,12 +288,13 @@ void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
     }
 
 
+    LOG_TRACE(&Poco::Logger::get("TableJoin"), " addJoinedColumns {}", joined_column.name);
     columns_added_by_join.emplace_back(joined_column.name, type);
 }
 
 void TableJoin::addJoinedColumnsAndCorrectTypes(NamesAndTypesList & names_and_types, bool correct_nullability) const
 {
-    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"), " addJoinedColumnsAndCorrectTypes 1");
+    LOG_TRACE(&Poco::Logger::get("TableJoin"), " addJoinedColumnsAndCorrectTypes 1");
     ColumnsWithTypeAndName columns;
     for (auto & pair : names_and_types)
         columns.emplace_back(nullptr, std::move(pair.type), std::move(pair.name));
@@ -326,7 +327,12 @@ void TableJoin::addJoinedColumnsAndCorrectTypes(ColumnsWithTypeAndName & columns
 
     /// Types in columns_added_by_join already converted and set nullable if needed
     for (const auto & col : columns_added_by_join)
+    {
+        LOG_TRACE(&Poco::Logger::get("TableJoin"), "addJoinedColumnsAndCorrectTypes 2 {}", col.name);
+
         columns.emplace_back(nullptr, col.type, col.name);
+    }
+
 }
 
 bool TableJoin::sameStrictnessAndKind(ASTTableJoin::Strictness strictness_, ASTTableJoin::Kind kind_) const

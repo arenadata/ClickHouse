@@ -1239,6 +1239,7 @@ ActionsDAGPtr SelectQueryExpressionAnalyzer::appendProjectResult(ExpressionActio
         if (required_result_columns.empty() || required_result_columns.count(result_name))
         {
             std::string source_name = ast->getColumnName();
+            LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "SelectQueryExpressionAnalyzer::appendProjectResult source_name  {}", source_name);
 
             /*
              * For temporary columns created by ExpressionAnalyzer for literals,
@@ -1266,6 +1267,7 @@ ActionsDAGPtr SelectQueryExpressionAnalyzer::appendProjectResult(ExpressionActio
             }
 
             result_columns.emplace_back(source_name, result_name);
+            LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "SelectQueryExpressionAnalyzer::appendProjectResult source_name  {}, result_name {}", source_name, result_name);
             step.addRequiredOutput(result_columns.back().second);
         }
     }
