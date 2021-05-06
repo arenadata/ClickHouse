@@ -259,16 +259,12 @@ Block TableJoin::getRequiredRightKeys(const Block & right_table_keys, std::vecto
 
 bool TableJoin::leftBecomeNullable(const DataTypePtr & column_type) const
 {
-    bool ret = forceNullableLeft() && column_type->canBeInsideNullable();
-    LOG_TRACE(&Poco::Logger::get("leftBecomeNullable"), ret?" true":" false");
-    return ret;
+    return forceNullableLeft() && JoinCommon::canBecomeNullable(column_type);
 }
 
 bool TableJoin::rightBecomeNullable(const DataTypePtr & column_type) const
 {
-    bool ret = forceNullableRight() && column_type->canBeInsideNullable();
-    LOG_TRACE(&Poco::Logger::get("rightBecomeNullable"), ret?" true":" false");
-    return ret;
+    return forceNullableRight() && JoinCommon::canBecomeNullable(column_type);
 }
 
 void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
@@ -282,11 +278,7 @@ void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
     }
 
     if (rightBecomeNullable(type))
-    {
-        LOG_TRACE(&Poco::Logger::get("addJoinedColumn"), " rightBecomeNullable");
-        type = makeNullable(type);
-    }
-
+        type = JoinCommon::convertTypeToNullable(type);
 
     LOG_TRACE(&Poco::Logger::get("TableJoin"), " addJoinedColumns {}", joined_column.name);
     columns_added_by_join.emplace_back(joined_column.name, type);
@@ -321,7 +313,7 @@ void TableJoin::addJoinedColumnsAndCorrectTypes(ColumnsWithTypeAndName & columns
             /// No need to nullify constants
             bool is_column_const = col.column && isColumnConst(*col.column);
             if (!is_column_const)
-                col.type = makeNullable(col.type);
+                col.type = JoinCommon::convertTypeToNullable(col.type);
         }
     }
 

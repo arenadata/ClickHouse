@@ -2040,6 +2040,7 @@ BlockInputStreamPtr HashJoin::createStreamWithNonJoinedRows(const Block & result
 void HashJoin::reuseJoinedData(const HashJoin & join)
 {
     data = join.data;
+    from_storage_join = true;
     for (auto & map : data->maps)
     {
         joinDispatch(kind, strictness, map, [this](auto kind_, auto strictness_, auto & map_)
