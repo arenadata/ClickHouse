@@ -871,8 +871,7 @@ void TreeRewriterResult::collectUsedColumns(const ASTPtr & query, bool is_select
             if (required.count(name))
             {
                 /// Optimisation: do not add columns needed only in JOIN ON section.
-
-                if (columns_context.converted_to_dnf || columns_context.nameInclusion(name) > analyzed_join->rightKeyInclusion(name))  // !!!
+                if (columns_context.converted_to_dnf || columns_context.nameInclusion(name) > analyzed_join->rightKeyInclusion(name))
                     analyzed_join->addJoinedColumn(joined_column);
 
                 required.erase(name);
