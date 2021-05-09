@@ -587,7 +587,7 @@ class DNF
 
                         if (arg->getTreeHash() != (*or_child)->getTreeHash())
                         {
-                            rest_children.push_back(arg->clone());
+                            rest_children.push_back(arg);
                         }
                     }
                     if (rest_children.empty())
@@ -603,7 +603,7 @@ class DNF
 
                     auto rest = rest_children.size() > 1 ?
                         makeASTFunction("and", rest_children):
-                        rest_children[0]->clone();
+                        rest_children[0];
 
                     const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
                     assert(or_child_expression_list);
@@ -615,8 +615,8 @@ class DNF
                         for (auto & arg : or_child_expression_list->children)
                         {
                             ASTs arg_rest_lst;
-                            arg_rest_lst.push_back(arg->clone());
-                            arg_rest_lst.push_back(rest->clone());
+                            arg_rest_lst.push_back(arg);
+                            arg_rest_lst.push_back(rest);
 
                             auto and_node = makeASTFunction("and", arg_rest_lst);
                             lst.push_back(distribute(and_node));
@@ -1098,9 +1098,9 @@ TreeRewriterResultPtr TreeRewriter::analyzeSelect(
     {
         for (const auto & [name, _] : table_join->columns_from_joined_table)
             all_source_columns_set.insert(name);
+        DNF().process(*select_query, tables_with_columns);
     }
 
-    DNF().process(*select_query, tables_with_columns);
     normalize(query, result.aliases, all_source_columns_set, settings);
 
 

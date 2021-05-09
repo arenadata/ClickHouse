@@ -968,13 +968,13 @@ struct JoinFeatures
 template <typename Map, bool add_missing>
 void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset)
 {
-    LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: add_missing {}", add_missing);
+    // LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: add_missing {}", add_missing);
     if constexpr (add_missing)
         added.applyLazyDefaults();
 
     for (auto it = mapped.begin(); it.ok(); ++it)
     {
-        LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, {}", it->row_num, it->block->dumpStructure());
+        // LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, {}", it->row_num, it->block->dumpStructure());
 
         added.appendFromBlock<false>(*it->block, it->row_num);
         ++current_offset;

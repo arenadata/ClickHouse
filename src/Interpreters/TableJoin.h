@@ -64,7 +64,6 @@ private:
     const size_t max_files_to_merge = 0;
     const String temporary_files_codec = "LZ4";
 
-public:  // make it private again
     NamesVector key_names_left;
     NamesVector key_names_right; /// Duplicating names are qualified.
 private:
