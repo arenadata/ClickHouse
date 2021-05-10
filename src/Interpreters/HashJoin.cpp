@@ -911,7 +911,6 @@ public:
     ASOF::Inequality asofInequality() const { return asof_inequality; }
     const IColumn & leftAsofKey() const { return *left_asof_key; }
 
-public:
     const ColumnRawPtrsVector key_columns;
     const SizesVector key_sizes;
 
@@ -965,22 +964,6 @@ struct JoinFeatures
 
 };
 
-template <typename Map, bool add_missing>
-void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset)
-{
-    // LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: add_missing {}", add_missing);
-    if constexpr (add_missing)
-        added.applyLazyDefaults();
-
-    for (auto it = mapped.begin(); it.ok(); ++it)
-    {
-        // LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, {}", it->row_num, it->block->dumpStructure());
-
-        added.appendFromBlock<false>(*it->block, it->row_num);
-        ++current_offset;
-    }
-};
-
 template <bool multiple_disjuncts>
 class KnownRowsHolder;
 
@@ -998,24 +981,6 @@ class KnownRowsHolder<true>
     size_t items;
 
 public:
-    // void add(const void* ptr)
-    // {
-    //     if (items < MAX_LINEAR)
-    //     {
-    //         linh[items] = ptr;
-    //     }
-    //     else
-    //     {
-    //         if (items == MAX_LINEAR)
-    //         {
-    //             logh_ptr = std::make_unique<LogHolder>();
-    //             logh_ptr->insert(std::cbegin(linh), std::cend(linh));
-    //         }
-    //         logh_ptr->insert(ptr);
-    //     }
-    //     ++items;
-    // }
-
     KnownRowsHolder()
         : items(0)
     {
@@ -1063,7 +1028,7 @@ public:
     {
     }
 
-    bool isKnown(const void*)
+    static bool isKnown(const void*)
     {
         return false;
     }
@@ -1072,7 +1037,7 @@ public:
 template <typename Map, bool add_missing, bool multiple_disjuncts>
 void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset, KnownRowsHolder<multiple_disjuncts> & known_rows)
 {
-    LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: add_missing {}", add_missing);
+    // LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: add_missing {}", add_missing);
     if constexpr (add_missing)
         added.applyLazyDefaults();
 
@@ -1080,13 +1045,12 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
 
     for (auto it = mapped.begin(); it.ok(); ++it)
     {
-        LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, current_offset {}, addr {}, {}", it->row_num, current_offset, static_cast<const void *>(it->block), it->block->dumpStructure());
+        // LOG_TRACE(&Poco::Logger::get("HashJoin"), "addFoundRowAll: it->row_num {}, current_offset {}, addr {}, {}", it->row_num, current_offset, static_cast<const void *>(it->block), it->block->dumpStructure());
 
-        if (!known_rows.isKnown(it->block /*&mapped*//*it->row_num*/))
+        if (!known_rows.isKnown(it->block))
         {
             added.appendFromBlock<false>(*it->block, it->row_num);
             ++current_offset;
-            // known_rows.insert(it->block /*it->row_num*/);
             if constexpr (multiple_disjuncts)
             {
                 if (!new_known_rows_ptr)
@@ -1358,10 +1322,11 @@ IColumn::Filter switchJoinRightColumns(const std::vector<const Maps*> & mapv, Ad
         case HashJoin::Type::TYPE: \
             {                                                           \
             using AMapTypeVal = const typename std::remove_reference_t<decltype(Maps::TYPE)>::element_type; \
-            std::vector<const AMapTypeVal*> a_map_type_vector;          \
+            std::vector<const AMapTypeVal*> a_map_type_vector(mapv.size()); \
+            size_t i = 0;                                               \
             for (const auto el : mapv)                                  \
             {                                                           \
-                a_map_type_vector.push_back(el->TYPE.get());            \
+                a_map_type_vector[i++] = el->TYPE.get();                \
             }                                                           \
             return joinRightColumnsSwitchNullability<KIND, STRICTNESS,  \
                           typename KeyGetterForType<HashJoin::Type::TYPE, AMapTypeVal>::Type>( \
@@ -1415,9 +1380,9 @@ std::unique_ptr<AddedColumns> HashJoin::makeAddedColumns(
     std::vector<ColumnPtr> null_map_holder_vector;
     std::vector<Columns> materialized_keys_vector;
 
-    for (const auto & key_names_left_ : key_names_left_vector)
+    for (const auto & key_names_left_part : key_names_left_vector)
     {
-        materialized_keys_vector.emplace_back(JoinCommon::materializeColumns(block, key_names_left_));
+        materialized_keys_vector.emplace_back(JoinCommon::materializeColumns(block, key_names_left_part));
         ColumnRawPtrs left_key_columns = JoinCommon::getRawPointers(materialized_keys_vector.back());
         // emplace_back ?
         left_key_columns_vector.push_back(std::move(left_key_columns));
