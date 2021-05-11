@@ -752,77 +752,73 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
 
     LOG_TRACE(&Poco::Logger::get("HashJoin"), "addJoinedBlock: structured_block {}", structured_block.dumpStructure());
 
-    data->blocks.emplace_back(std::move(structured_block));
-    Block * stored_block = &data->blocks.back();
-
-    if (rows)
-        data->empty = false;
-
-    bool save_a_nullmap = false;
-
-    for (size_t d = 0; d < key_names_right.size(); ++d)
     {
-        ColumnRawPtrs key_columns(key_names_right_indexes[d].size());
-        std::transform(std::cbegin(key_names_right_indexes[d]), std::cend(key_names_right_indexes[d]), std::begin(key_columns), [&](size_t ind){return all_key_columns[ind];});
+        if (storage_join_lock.mutex())
+            throw DB::Exception("addJoinedBlock called when HashJoin locked to prevent updates",
+                ErrorCodes::LOGICAL_ERROR);
 
-        /// We will insert to the map only keys, where all components are not NULL.
-        ConstNullMapPtr null_map{};
-        ColumnPtr null_map_holder = extractNestedColumnsAndNullMap(key_columns, null_map);
+        data->blocks.emplace_back(std::move(structured_block));
+        Block * stored_block = &data->blocks.back();
 
-        /// If RIGHT or FULL save blocks with nulls for NonJoinedBlockInputStream
-        UInt8 save_nullmap = 0;
-        if (isRightOrFull(kind) && null_map)
+        if (rows)
+            data->empty = false;
+
+        bool save_a_nullmap = false;
+
+        for (size_t d = 0; d < key_names_right.size(); ++d)
         {
-            for (size_t i = 0; !save_nullmap && i < null_map->size(); ++i)
-                save_nullmap |= (*null_map)[i];
-        }
-        save_a_nullmap |= save_nullmap;
+            ColumnRawPtrs key_columns(key_names_right_indexes[d].size());
+            std::transform(std::cbegin(key_names_right_indexes[d]), std::cend(key_names_right_indexes[d]), std::begin(key_columns), [&](size_t ind){return all_key_columns[ind];});
 
-        {
-            if (storage_join_lock.mutex())
-                throw DB::Exception("addJoinedBlock called when HashJoin locked to prevent updates",
-                    ErrorCodes::LOGICAL_ERROR);
+            /// We will insert to the map only keys, where all components are not NULL.
+            ConstNullMapPtr null_map{};
+            ColumnPtr null_map_holder = extractNestedColumnsAndNullMap(key_columns, null_map);
 
-
-            // data->blocks.emplace_back(std::move(structured_block));
-            // Block * stored_block = &data->blocks.back();
-
-            // if (rows)
-            //     data->empty = false;
-
-            if (kind != ASTTableJoin::Kind::Cross)
+            /// If RIGHT or FULL save blocks with nulls for NonJoinedBlockInputStream
+            UInt8 save_nullmap = 0;
+            if (isRightOrFull(kind) && null_map)
             {
-                joinDispatch(kind, strictness, data->maps[d], [&](auto kind_, auto strictness_, auto & map)
-                {
-                    for (const auto & a_key_column : key_columns)
-                        LOG_TRACE(&Poco::Logger::get("addJoinedBlock"), " a_key_column {}, stored_block {}", a_key_column->dumpStructure(), stored_block->dumpStructure());
-                    size_t size = insertFromBlockImpl<strictness_>(*this, data->type, map, rows, key_columns, key_sizes[d], stored_block, null_map, data->pool);
-                    /// Number of buckets + 1 value from zero storage
-
-
-                    used_flags.reinit<kind_, strictness_>(size + 1);
-
-
-                });
+                for (size_t i = 0; !save_nullmap && i < null_map->size(); ++i)
+                    save_nullmap |= (*null_map)[i];
             }
+            save_a_nullmap |= save_nullmap;
 
-            if (!check_limits)
-                return true;
+            {
+                if (kind != ASTTableJoin::Kind::Cross)
+                {
+                    joinDispatch(kind, strictness, data->maps[d], [&](auto kind_, auto strictness_, auto & map)
+                        {
+                            for (const auto & a_key_column : key_columns)
+                                LOG_TRACE(&Poco::Logger::get("addJoinedBlock"), " a_key_column {}, stored_block {}", a_key_column->dumpStructure(), stored_block->dumpStructure());
+                            size_t size = insertFromBlockImpl<strictness_>(*this, data->type, map, rows, key_columns, key_sizes[d], stored_block, null_map, data->pool);
+                            /// Number of buckets + 1 value from zero storage
 
-            /// TODO: Do not calculate them every time
-            total_rows = getTotalRowCount();
-            total_bytes = getTotalByteCount();
+
+                            used_flags.reinit<kind_, strictness_>(size + 1);
+
+
+                        });
+                }
+
+                if (!check_limits)
+                    return true;
+
+                /// TODO: Do not calculate them every time
+                total_rows = getTotalRowCount();
+                total_bytes = getTotalByteCount();
+            }
         }
-    }
 
-    if (save_a_nullmap)
-    {
-        LOG_TRACE(&Poco::Logger::get("addJoinedBlock"), " save_nullmap");
 
-        ConstNullMapPtr null_map{};
-        ColumnPtr null_map_holder = extractNestedColumnsAndNullMap(all_key_columns, null_map);
+        if (save_a_nullmap)
+        {
+            LOG_TRACE(&Poco::Logger::get("addJoinedBlock"), " save_nullmap");
 
-        data->blocks_nullmaps.emplace_back(stored_block, null_map_holder);
+            ConstNullMapPtr null_map{};
+            ColumnPtr null_map_holder = extractNestedColumnsAndNullMap(all_key_columns, null_map);
+
+            data->blocks_nullmaps.emplace_back(stored_block, null_map_holder);
+        }
     }
 
     return table_join->sizeLimits().check(total_rows, total_bytes, "JOIN", ErrorCodes::SET_SIZE_LIMIT_EXCEEDED);

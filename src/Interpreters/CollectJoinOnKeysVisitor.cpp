@@ -20,7 +20,7 @@ namespace ErrorCodes
 
 void CollectJoinOnKeysMatcher::Data::setDisjuncts(const ASTFunction & func)
 {
-    auto expression_list = func.children[0]->as<ASTExpressionList>();
+    const auto * expression_list = func.children[0]->as<ASTExpressionList>();
     std::vector<const IAST*> v;
     for (const auto & child : expression_list->children)
     {

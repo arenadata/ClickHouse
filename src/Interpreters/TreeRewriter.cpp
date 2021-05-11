@@ -527,8 +527,7 @@ class DNF
                 touched = false;
 
                 ASTs new_children;
-
-                auto expression_list = function->children[0]->as<ASTExpressionList>();
+                const auto * expression_list = function->children[0]->as<ASTExpressionList>();
                 for (const auto & child : expression_list->children)
                 {
                     auto *f = child->as<ASTFunction>();
@@ -558,82 +557,82 @@ class DNF
 
     ASTPtr distribute(ASTPtr node)
     {
-        auto *function = node->as<ASTFunction>();
+        const auto * function = node->as<ASTFunction>();
 
         if (function && function->children.size() == 1)
         {
             if (function->name == "and")
             {
-                auto expression_list = function->children[0]->as<ASTExpressionList>();
-                assert(expression_list);
-
-                if (expression_list)
+                const auto * expression_list = function->children[0]->as<ASTExpressionList>();
+                if (!expression_list)
                 {
-                    auto or_child = std::find_if(expression_list->children.begin(), expression_list->children.end(), [](ASTPtr arg)
-                        {
-                            auto * f = arg->as<ASTFunction>();
-                            return f && f->name == "or" && f->children.size() == 1;
-                        });
-                    if (or_child == expression_list->children.end())
+                    return node;
+                }
+
+                auto or_child = std::find_if(expression_list->children.begin(), expression_list->children.end(), [](ASTPtr arg)
+                    {
+                        const auto * f = arg->as<ASTFunction>();
+                        return f && f->name == "or" && f->children.size() == 1;
+                    });
+                if (or_child == expression_list->children.end())
+                {
+                    return node;
+                }
+
+                ASTs rest_children;
+
+                for (const auto & arg : expression_list->children)
+                {
+                    // LOG_DEBUG(&Poco::Logger::get("toDNF"), "IDs {} vs. {}", arg->getTreeHash(), (*or_child)->getTreeHash());
+
+                    if (arg->getTreeHash() != (*or_child)->getTreeHash())
+                    {
+                        rest_children.push_back(arg);
+                    }
+                }
+                if (rest_children.empty())
+                {
+                    return node;
+                }
+
+                const auto * or_child_function = (*or_child)->as<ASTFunction>();
+                if (!or_child_function)
+                {
+                    return node;
+                }
+
+                auto rest = rest_children.size() > 1 ?
+                    makeASTFunction("and", rest_children):
+                    rest_children[0];
+
+                const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
+                assert(or_child_expression_list);
+
+                if (or_child_expression_list)
+                {
+
+                    ASTs lst;
+                    for (const auto & arg : or_child_expression_list->children)
+                    {
+                        ASTs arg_rest_lst;
+                        arg_rest_lst.push_back(arg);
+                        arg_rest_lst.push_back(rest);
+
+                        auto and_node = makeASTFunction("and", arg_rest_lst);
+                        lst.push_back(distribute(and_node));
+                    }
+                    if (lst.empty())
                     {
                         return node;
                     }
 
-                    ASTs rest_children;
+                    auto ret = lst.size()>1 ?
+                        makeASTFunction("or", lst) :
+                        lst[0];
 
-                    for (auto & arg : expression_list->children)
-                    {
-                        // LOG_DEBUG(&Poco::Logger::get("toDNF"), "IDs {} vs. {}", arg->getTreeHash(), (*or_child)->getTreeHash());
+                    node_added = true;
 
-                        if (arg->getTreeHash() != (*or_child)->getTreeHash())
-                        {
-                            rest_children.push_back(arg);
-                        }
-                    }
-                    if (rest_children.empty())
-                    {
-                        return node;
-                    }
-
-                    auto * or_child_function = (*or_child)->as<ASTFunction>();
-                    if (!or_child_function)
-                    {
-                        return node;
-                    }
-
-                    auto rest = rest_children.size() > 1 ?
-                        makeASTFunction("and", rest_children):
-                        rest_children[0];
-
-                    const auto * or_child_expression_list = or_child_function->children[0]->as<ASTExpressionList>();
-                    assert(or_child_expression_list);
-
-                    if (or_child_expression_list)
-                    {
-
-                        ASTs lst;
-                        for (auto & arg : or_child_expression_list->children)
-                        {
-                            ASTs arg_rest_lst;
-                            arg_rest_lst.push_back(arg);
-                            arg_rest_lst.push_back(rest);
-
-                            auto and_node = makeASTFunction("and", arg_rest_lst);
-                            lst.push_back(distribute(and_node));
-                        }
-                        if (lst.empty())
-                        {
-                            return node;
-                        }
-
-                        auto ret = lst.size()>1 ?
-                            makeASTFunction("or", lst) :
-                            lst[0];
-
-                        node_added = true;
-
-                        return ret;
-                    }
+                    return ret;
                 }
             }
             else if (function->name == "or")
@@ -645,7 +644,7 @@ class DNF
                 }
 
                 ASTs lst;
-                for (auto & arg : expression_list->children)
+                for (const auto & arg : expression_list->children)
                 {
                     lst.push_back(distribute(arg));
                 }
