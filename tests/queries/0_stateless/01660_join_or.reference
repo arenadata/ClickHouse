@@ -39,20 +39,14 @@ join on OR chain (any right)
 2	3
 6	4
 6	4
-0	0
-0	0
 ==
 2	3
-5	4
-100	4
 5	4
 100	4
 ==
 2	3	2	3
 6	4	5	4
 6	4	100	4
-0	0	5	4
-0	0	100	4
 ==
 1
 0
@@ -69,20 +63,14 @@ join on OR chain (all right)
 2	3
 6	4
 6	4
-0	0
-0	0
 ==
 2	3
-5	4
-100	4
 5	4
 100	4
 ==
 2	3	2	3
 6	4	5	4
 6	4	100	4
-0	0	5	4
-0	0	100	4
 ==
 1
 0
@@ -99,20 +87,14 @@ join on OR chain (full)
 2	3
 6	4
 6	4
-0	0
-0	0
 ==
 2	3
-5	4
-100	4
 5	4
 100	4
 ==
 2	3	2	3
 6	4	5	4
 6	4	100	4
-0	0	5	4
-0	0	100	4
 ==
 1
 0
@@ -125,16 +107,3 @@ join on OR chain (full)
 ==
 2	4
 6	5
-subqueries with OR
-1
-==
-1
-==
-1	2
-subquery column alias with OR
-1	2	2	3
-==
-1	2	2	3
-join on OR/AND chain
-2	3	2	3
-6	4	0	0

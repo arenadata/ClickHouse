@@ -94,20 +94,6 @@ select a1, b1, a2, b2 from tab1 full join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2
 select '==';
 select a2, b2 + 1 from tab1 full join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
 
-select 'subqueries with OR';
-select a1 from tab1 any left join (select * from tab2) on b1 = a2 or b2 = a1;
-select '==';
-select a1 from tab1 any left join (select a2, b2 from tab2) on b1 = a2 or b2 = a1;
-select '==';
-select a1, b1 from tab1 any left join (select * from tab2) on b1 = a2 or b2 = a1;
-
-select 'subquery column alias with OR';
-select a1, b1, a2, b2 from tab1 any left join (select *, a2 as z from tab2) on b1 + 1 = z + 1 or b1 = z * 2;
-select '==';
-select a1, b1, a2, b2 from tab1 any left join (select *, a2 + 1 as z from tab2) on b1 + 1 = z or b1 = z * 2;
-
-select 'join on OR/AND chain';
-select a2, b2, a3, b3 from tab2 any left join tab3 on (a2=a3  or b2=b3) and a2 +1 = b3 + 0;
 
 drop table tab1;
 drop table tab2;
