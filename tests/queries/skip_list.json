@@ -264,6 +264,10 @@
         "00116_storage_set",
         "00083_create_merge_tree_zookeeper",
         "00062_replicated_merge_tree_alter_zookeeper",
+        /// Does not support renaming of multiple tables in single query
+        "00634_rename_view",
+        "00140_rename",
+        "01783_http_chunk_size",
         "01720_constraints_complex_types",
         "01747_alter_partition_key_enum_zookeeper"
     ],
@@ -580,6 +584,7 @@
         "00980_zookeeper_merge_tree_alter_settings",
         "00988_constraints_replication_zookeeper",
         "00989_parallel_parts_loading",
+        "00992_system_parts_race_condition_zookeeper_long",
         "00993_system_parts_race_condition_drop_zookeeper",
         "01012_show_tables_limit",
         "01013_sync_replica_timeout_zookeeper",
@@ -754,6 +759,8 @@
         "01715_background_checker_blather_zookeeper",
         "01747_alter_partition_key_enum_zookeeper",
         "01761_alter_decimal_zookeeper",
+        "01360_materialized_view_with_join_on_query_log", // creates and drops MVs on query_log, which may interrupt flushes.
+        "01509_parallel_quorum_insert_no_replicas", // It's ok to execute in parallel with oter tests but not several instances of the same test.
         "attach",
         "ddl_dictionaries",
         "dictionary",
@@ -764,6 +771,10 @@
         "polygon_dicts", // they use an explicitly specified database
         "01658_read_file_to_stringcolumn",
         "01721_engine_file_truncate_on_insert", // It's ok to execute in parallel but not several instances of the same test.
-        "01748_dictionary_table_dot" // creates database
+        "01748_dictionary_table_dot", // creates database
+        "01702_system_query_log", // It's ok to execute in parallel with oter tests but not several instances of the same test.
+        "01748_dictionary_table_dot", // creates database
+        "00950_dict_get",
+        "01850_dist_INSERT_preserve_error" // uses cluster with different static databases shard_0/shard_1
     ]
 }

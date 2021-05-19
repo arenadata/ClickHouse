@@ -471,7 +471,9 @@ void DistributedBlockOutputStream::writeSuffix()
         LOG_DEBUG(log, "It took {} sec. to insert {} blocks, {} rows per second. {}", elapsed, inserted_blocks, inserted_rows / elapsed, getCurrentStateDescription());
     };
 
-    if (insert_sync && pool)
+    /// Pool finished means that some exception had been thrown before,
+    /// and scheduling new jobs will return "Cannot schedule a task" error.
+    if (insert_sync && pool && !pool->finished())
     {
         finished_jobs_count = 0;
         try
@@ -679,7 +681,13 @@ void DistributedBlockOutputStream::writeToShard(const Block & block, const std::
             context.getClientInfo().write(header_buf, DBMS_TCP_PROTOCOL_VERSION);
             writeVarUInt(block.rows(), header_buf);
             writeVarUInt(block.bytes(), header_buf);
-            writeStringBinary(block.cloneEmpty().dumpStructure(), header_buf);
+            writeStringBinary(block.cloneEmpty().dumpStructure(), header_buf); /// obsolete
+            /// Write block header separately in the batch header.
+            /// It is required for checking does conversion is required or not.
+            {
+                NativeBlockOutputStream header_stream{header_buf, DBMS_TCP_PROTOCOL_VERSION, block.cloneEmpty()};
+                header_stream.write(block.cloneEmpty());
+            }
 
             /// Add new fields here, for example:
             /// writeVarUInt(my_new_data, header_buf);
