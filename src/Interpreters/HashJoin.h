@@ -39,13 +39,8 @@ class JoinUsedFlags
 {
     std::vector<std::atomic_bool> flags;
     bool need_flags;
-    [[maybe_unused]] const HashJoin* parent;
 
 public:
-
-    JoinUsedFlags(const HashJoin * parent_)
-        : parent(parent_)
-    {}
 
 
     /// Update size for vector with flags.

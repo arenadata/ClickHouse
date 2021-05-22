@@ -205,7 +205,7 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
     , nullable_left_side(table_join->forceNullableLeft())
     , any_take_last_row(any_take_last_row_)
     , asof_inequality(table_join->getAsofInequality())
-    , used_flags(this)
+//    , used_flags(this)
 //    , data(std::make_shared<RightTableData>())
     , right_sample_block(right_sample_block_)
     , log(&Poco::Logger::get("HashJoin"))
@@ -762,9 +762,9 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
     ColumnRawPtrs all_key_columns = JoinCommon::materializeColumnsInplace(block, all_key_names_right);
 
     BlockWithFlags structured_block = structureRightBlock(block);
+    bool multiple_disjuncts = key_names_right.size() > 1;
     if (nullable_right_side)
     {
-        bool multiple_disjuncts = key_names_right.size() > 1;
         if (multiple_disjuncts)
         {
             JoinCommon::convertColumnsToNullable(structured_block.block);
@@ -843,14 +843,11 @@ bool HashJoin::addJoinedBlock(const Block & source_block, bool check_limits)
         }
 
 
-        if (save_a_nullmap)
+        if (save_a_nullmap && !multiple_disjuncts)
         {
             LOG_TRACE(&Poco::Logger::get("addJoinedBlock"), " save_nullmap");
 
-            ConstNullMapPtr null_map{};
-            ColumnPtr null_map_holder = joinNullMaps(null_map_holder_vector, null_map_vector, null_map);
-
-            data->blocks_nullmaps.emplace_back(stored_block, null_map_holder);
+            data->blocks_nullmaps.emplace_back(stored_block, null_map_holder_vector[0]);
         }
     }
 
@@ -1409,7 +1406,7 @@ IColumn::Filter dictionaryJoinRightColumns(const TableJoin & table_join, AddedCo
         std::vector<ConstNullMapPtr> null_maps_vector;
         null_maps_vector.push_back(null_map);
 
-        JoinStuff::JoinUsedFlags flags(nullptr);
+        JoinStuff::JoinUsedFlags flags;
         return joinRightColumnsSwitchNullability<KIND, STRICTNESS, KeyGetterForDict>(maps_vector, added_columns, null_maps_vector, flags);
     }
 
