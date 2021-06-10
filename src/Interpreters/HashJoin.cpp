@@ -29,6 +29,15 @@
 #include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
 
+#include <type_traits>
+#include <typeinfo>
+#include <typeindex>
+#include <string>
+
+#include <Common/Exception.h>
+#include <common/demangle.h>
+#pragma clang diagnostic ignored "-Wpotentially-evaluated-expression"
+
 namespace DB
 {
 
@@ -915,7 +924,12 @@ public:
             applyLazyDefaults();
 
         for (size_t j = 0, size = right_indexes.size(); j < size; ++j)
-            columns[j]->insertFrom(*block.getByPosition(right_indexes[j]).column, row_num);
+        {
+            const auto clmn = block.getByPosition(right_indexes[j]).column;
+            // const auto * const typeid_name = typeid(*clmn).name();
+            // LOG_TRACE(&Poco::Logger::get("AddedColumns"), "appendFromBlock calls insertFrom with {} from block {}", typeid_name, reinterpret_cast<const void*>(&block));
+            columns[j]->insertFrom(*clmn, row_num);
+        }
     }
 
     void appendDefaultRow()
@@ -1937,6 +1951,12 @@ private:
     Block createBlock()
     {
         MutableColumns columns_right = saved_block_sample.cloneEmptyColumns();
+        ////
+        if (multiple_disjuncts && parent.nullable_right_side)
+        {
+            JoinCommon::convertColumnsToNullable(columns_right);
+        }
+
         for (const auto & a_column_right : columns_right)
         {
             LOG_TRACE(&Poco::Logger::get("NonJoinedBlockInputStream"), "createBlock: columns_right {}", a_column_right->dumpStructure());
@@ -1954,6 +1974,8 @@ private:
         if (!joinDispatch(parent.kind, parent.strictness, parent.data->maps[0], fill_callback))
             throw Exception("Logical error: unknown JOIN strictness (must be on of: ANY, ALL, ASOF)", ErrorCodes::LOGICAL_ERROR);
 
+        // correctLowcardAndNullability(columns_right);
+
         if constexpr (!multiple_disjuncts)
         {
             fillNullsFromBlocks(columns_right, rows_added);
@@ -1962,7 +1984,11 @@ private:
         if (!rows_added)
             return {};
 
-        correctLowcardAndNullability(columns_right);
+        if (!(multiple_disjuncts && parent.nullable_right_side))  // changeLowCardinality ?
+        {
+            correctLowcardAndNullability(columns_right);
+        }
+
 
         Block res = result_sample_block.cloneEmpty();
         addLeftColumns(res, rows_added);
@@ -2009,8 +2035,21 @@ private:
                 {
                     if (!block_with_flags.flags[row])
                     {
-                        for (size_t col = 0; col < columns_keys_and_right.size(); ++col)
-                            columns_keys_and_right[col]->insertFrom(*block_with_flags.block.getByPosition(col).column, row);
+                        for (size_t colnum = 0; colnum < columns_keys_and_right.size(); ++colnum)
+                        {
+                            LOG_TRACE(&Poco::Logger::get("NonJoinedBlockInputStream"), "fillColumns - colnum {}, {} <=> {}, isNullable {}", colnum, columns_keys_and_right[colnum]->dumpStructure(), block_with_flags.block.getByPosition(colnum).dumpStructure(), block_with_flags.block.getByPosition(colnum).column->isNullable());
+
+
+                            // const auto & col = block_with_flags.block.getByPosition(colnum);
+
+                            // columns_keys_and_right[colnum]->insertFrom(*(correctNullability({col.column, col.type, col.name}, true).column), row);
+                            auto clmn = block_with_flags.block.getByPosition(colnum).column;
+                            // const auto * const typeid_name = typeid(*clmn).name();
+
+                            // LOG_TRACE(&Poco::Logger::get("NonJoinedBlockInputStream"), "fillColumns calls insertFrom with {} from block {}", typeid_name, reinterpret_cast<const void*>(&block_with_flags.block));
+                            columns_keys_and_right[colnum]->insertFrom(*clmn, row);
+                        }
+
                         ++rows_added;
                     }
                 }

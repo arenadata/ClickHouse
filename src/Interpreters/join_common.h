@@ -19,6 +19,7 @@ bool canBecomeNullable(const DataTypePtr & type);
 DataTypePtr convertTypeToNullable(const DataTypePtr & type);
 void convertColumnToNullable(ColumnWithTypeAndName & column, bool remove_low_card = false);
 void convertColumnsToNullable(Block & block, size_t starting_pos = 0);
+void convertColumnsToNullable(MutableColumns & mutable_columns, size_t starting_pos = 0);
 void removeColumnNullability(ColumnWithTypeAndName & column);
 void changeColumnRepresentation(const ColumnPtr & src_column, ColumnPtr & dst_column);
 ColumnPtr emptyNotNullableClone(const ColumnPtr & column);

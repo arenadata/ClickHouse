@@ -16,22 +16,6 @@ insert into tab3 values (2, 3);
 insert into tab3 values (5, 4);
 insert into tab3 values (100, 4);
 
-select 'join on OR chain (any left)';
-select a2, b2 from tab2 any left join tab3 on a2 = a3 or b2 = b3;
-select '==';
-select a3, b3 from tab2 any left join tab3 on a2 = a3 or b2 = b3;
-select '==';
-select a2, b2, a3, b3 from tab2 any left join tab3 on a2 = a3 or b2 = b3;
-select '==';
-select a1 from tab1 any left join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-select '==';
-select a1, b2 from tab1 any left join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-select '==';
-select a1, b1, a2, b2 from tab1 any left join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-select '==';
-select a2, b2 + 1 from tab1 any left join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-
-
 select 'join on OR chain (all left)';
 select a2, b2 from tab2 all left join tab3 on a2 = a3 or b2 = b3;
 select '==';
@@ -46,22 +30,6 @@ select '==';
 select a1, b1, a2, b2 from tab1 all left join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
 select '==';
 select a2, b2 + 1 from tab1 all left join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-
-select 'join on OR chain (any right)';
-select a2, b2 from tab2 any right join tab3 on a2 = a3 or b2 = b3;
-select '==';
-select a3, b3 from tab2 any right join tab3 on a2 = a3 or b2 = b3;
-select '==';
-select a2, b2, a3, b3 from tab2 any right join tab3 on a2 = a3 or b2 = b3;
-select '==';
-select a1 from tab1 any right join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-select '==';
-select a1, b2 from tab1 any right join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-select '==';
-select a1, b1, a2, b2 from tab1 any right join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-select '==';
-select a2, b2 + 1 from tab1 any right join tab2 on b1 + 1 = a2 + 1 or a1 + 4 = b2 + 2;
-
 
 select 'join on OR chain (all right)';
 select a2, b2 from tab2 all right join tab3 on a2 = a3 or b2 = b3;

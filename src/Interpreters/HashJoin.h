@@ -52,13 +52,13 @@ public:
     bool getUsedSafe(size_t i) const;
 
     template <bool use_flags, bool multiple_disjuncts, typename T>
-    void setUsed(const T & i);
+    void setUsed(const T & f);
 
     template <bool use_flags, bool multiple_disjuncts, typename T>
-    bool getUsed(const T & i);
+    bool getUsed(const T & f);
 
     template <bool use_flags, bool multiple_disjuncts, typename T>
-    bool setUsedOnce(const T & i);
+    bool setUsedOnce(const T & f);
 };
 
 }
