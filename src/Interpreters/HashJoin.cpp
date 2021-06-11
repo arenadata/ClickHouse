@@ -36,7 +36,7 @@
 
 #include <Common/Exception.h>
 #include <common/demangle.h>
-#pragma clang diagnostic ignored "-Wpotentially-evaluated-expression"
+// #pragma clang diagnostic ignored "-Wpotentially-evaluated-expression"
 
 namespace DB
 {
