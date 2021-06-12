@@ -745,7 +745,7 @@ void TCPHandler::processTablesStatusRequest()
             status.absolute_delay = replicated_table->getAbsoluteDelay();
         }
         else
-            status.is_replicated = false;
+            status.is_replicated = false; //-V1048
 
         response.table_states_by_id.emplace(table_name, std::move(status));
     }
@@ -1398,7 +1398,7 @@ void TCPHandler::initBlockOutput(const Block & block)
 
             if (state.compression == Protocol::Compression::Enable)
             {
-                CompressionCodecFactory::instance().validateCodec(method, level, !query_settings.allow_suspicious_codecs);
+                CompressionCodecFactory::instance().validateCodec(method, level, !query_settings.allow_suspicious_codecs, query_settings.allow_experimental_codecs);
 
                 state.maybe_compressed_out = std::make_shared<CompressedWriteBuffer>(
                     *out, CompressionCodecFactory::instance().get(method, level));

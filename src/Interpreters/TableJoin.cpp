@@ -183,11 +183,16 @@ Names TableJoin::requiredJoinedNames() const
 NameSet TableJoin::requiredRightKeys() const
 {
     NameSet required;
-    for (const auto& key_names_right_part : key_names_right)
+    for (const auto & key_names_right_part : key_names_right)
+    {
         for (const auto & name : key_names_right_part)
+        {
+            auto rename = renamedRightColumnName(name);
             for (const auto & column : columns_added_by_join)
-                if (name == column.name)
+                if (rename == column.name)
                     required.insert(name);
+        }
+    }
     return required;
 }
 
@@ -526,6 +531,13 @@ ActionsDAGPtr TableJoin::applyKeyConvertToTable(
     }
 
     return dag;
+}
+
+String TableJoin::renamedRightColumnName(const String & name) const
+{
+    if (const auto it = renames.find(name); it != renames.end())
+        return it->second;
+    return name;
 }
 
 }

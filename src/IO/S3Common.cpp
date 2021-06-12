@@ -410,7 +410,7 @@ public:
             }
             else if (Aws::Utils::StringUtils::ToLower(ec2_metadata_disabled.c_str()) != "true")
             {
-                DB::S3::PocoHTTPClientConfiguration aws_client_configuration = DB::S3::ClientFactory::instance().createClientConfiguration(configuration.remote_host_filter, configuration.s3_max_redirects);
+                DB::S3::PocoHTTPClientConfiguration aws_client_configuration = DB::S3::ClientFactory::instance().createClientConfiguration(configuration.region, configuration.remote_host_filter, configuration.s3_max_redirects);
 
                 /// See MakeDefaultHttpResourceClientConfiguration().
                 /// This is part of EC2 metadata client, but unfortunately it can't be accessed from outside
@@ -428,8 +428,6 @@ public:
                 /// EC2MetadataService throttles by delaying the response so the service client should set a large read timeout.
                 /// EC2MetadataService delay is in order of seconds so it only make sense to retry after a couple of seconds.
                 aws_client_configuration.connectTimeoutMs = 1000;
-
-                /// FIXME. Somehow this timeout does not work in docker without --net=host.
                 aws_client_configuration.requestTimeoutMs = 1000;
 
                 aws_client_configuration.retryStrategy = std::make_shared<Aws::Client::DefaultRetryStrategy>(1, 1000);
@@ -590,10 +588,11 @@ namespace S3
     }
 
     PocoHTTPClientConfiguration ClientFactory::createClientConfiguration( // NOLINT
+        const String & force_region,
         const RemoteHostFilter & remote_host_filter,
         unsigned int s3_max_redirects)
     {
-        return PocoHTTPClientConfiguration(remote_host_filter, s3_max_redirects);
+        return PocoHTTPClientConfiguration(force_region, remote_host_filter, s3_max_redirects);
     }
 
     URI::URI(const Poco::URI & uri_)
@@ -638,8 +637,6 @@ namespace S3
                 key = uri.getPath().substr(1);
             }
 
-            if (key.empty() || key == "/")
-                throw Exception("Key name is empty in virtual hosted style S3 URI: " + key + " (" + uri.toString() + ")", ErrorCodes::BAD_ARGUMENTS);
             boost::to_upper(name);
             if (name != S3 && name != COS)
             {
@@ -664,9 +661,6 @@ namespace S3
             if (bucket.length() < 3 || bucket.length() > 63)
                 throw Exception(
                     "Bucket name length is out of bounds in path style S3 URI: " + bucket + " (" + uri.toString() + ")", ErrorCodes::BAD_ARGUMENTS);
-
-            if (key.empty() || key == "/")
-                throw Exception("Key name is empty in path style S3 URI: " + key + " (" + uri.toString() + ")", ErrorCodes::BAD_ARGUMENTS);
         }
         else
             throw Exception("Bucket or key name are invalid in S3 URI: " + uri.toString(), ErrorCodes::BAD_ARGUMENTS);
