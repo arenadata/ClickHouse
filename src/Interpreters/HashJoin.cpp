@@ -1559,7 +1559,8 @@ void HashJoin::joinBlockImpl(
         for (size_t i = 0; i < required_right_keys.columns(); ++i)
         {
             const auto & right_key = required_right_keys.getByPosition(i);
-            if (!block.findByName(right_key.name))
+            auto right_col_name = getTableJoin().renamedRightColumnName(right_key.name);
+            if (!block.findByName(right_col_name /*right_key.name*/))
             {
                 const auto & left_name = required_right_keys_sources[i];
                 LOG_TRACE(log, "joinBlockImpl: adding {} for required right key {}", left_name, right_key.name);
@@ -1572,7 +1573,7 @@ void HashJoin::joinBlockImpl(
                 bool is_nullable = nullable_right_side || right_key.type->isNullable();
 
                 ColumnPtr thin_column = filterWithBlanks(col.column, filter);
-                auto right_col_name = getTableJoin().renamedRightColumnName(right_key.name);
+                // auto right_col_name = getTableJoin().renamedRightColumnName(right_key.name);
                 block.insert(correctNullability({thin_column, col.type, right_col_name}, is_nullable, null_map_filter));
 
                 if constexpr (jf.need_replication)

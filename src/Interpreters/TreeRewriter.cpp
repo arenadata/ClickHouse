@@ -699,7 +699,7 @@ void collectJoinedColumns(TableJoin & analyzed_join, const ASTSelectQuery & sele
     if (!node || tables.size() < 2)
         return;
 
-    auto & table_join = node->table_join->as<ASTTableJoin &>();
+    const auto & table_join = node->table_join->as<ASTTableJoin &>();
 
     if (table_join.using_expression_list)
     {
@@ -717,9 +717,6 @@ void collectJoinedColumns(TableJoin & analyzed_join, const ASTSelectQuery & sele
     else if (table_join.on_expression)
     {
         bool is_asof = (table_join.strictness == ASTTableJoin::Strictness::Asof);
-
-        // if (!is_asof)
-        //     table_join.on_expression = toDNF(table_join.on_expression);
 
         CollectJoinOnKeysVisitor::Data data{analyzed_join, tables[0], tables[1], aliases, is_asof};
         CollectJoinOnKeysVisitor(data).visit(table_join.on_expression);
@@ -861,7 +858,7 @@ void TreeRewriterResult::collectUsedColumns(const ASTPtr & query, bool is_select
         /// Add columns obtained by JOIN (if needed).
         for (const auto & joined_column : analyzed_join->columnsFromJoinedTable())
         {
-            LOG_TRACE(&Poco::Logger::get("TreeRewriterResult"), " collectUsedColumns");
+            LOG_TRACE(&Poco::Logger::get("TreeRewriterResult"), " collectUsedColumns from joined table {}", joined_column.name);
 
             const auto & name = joined_column.name;
             if (available_columns.count(name))
@@ -1041,6 +1038,11 @@ void TreeRewriterResult::collectUsedColumns(const ASTPtr & query, bool is_select
     }
 
     required_source_columns.swap(source_columns);
+    for (const auto & column : required_source_columns)
+    {
+        LOG_TRACE(&Poco::Logger::get("TreeRewriterResult"), " collectUsedColumns (before exit) required_source_column {}", column.name);
+        source_column_names.insert(column.name);
+    }
 }
 
 NameSet TreeRewriterResult::getArrayJoinSourceNameSet() const
