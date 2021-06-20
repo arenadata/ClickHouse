@@ -48,7 +48,7 @@ private:
       * You must remember both of these options.
       *
       * Query of the form `SELECT ... from t1 ANY LEFT JOIN (SELECT ... from t2) ON expr(t1 columns) = expr(t2 columns)`
-     *     to the subquery will be added expression `expr(t2 columns)`.
+      *     to the subquery will be added expression `expr(t2 columns)`.
       * It's possible to use name `expr(t2 columns)`.
       */
 
@@ -71,7 +71,7 @@ private:
     size_t disjunct_num = 0;
     std::vector<const IAST*> disjuncts;
 
-    ASTs key_asts_left;  // ??
+    ASTs key_asts_left;
     ASTs key_asts_right;
     ASTTableJoin table_join;
 

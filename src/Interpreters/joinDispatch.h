@@ -78,8 +78,7 @@ inline bool joinDispatchInit(ASTTableJoin::Kind kind, ASTTableJoin::Strictness s
     });
 }
 
-
-// Call function on specified join map
+/// Call function on specified join map
 template <typename MapsVariant, typename Func>
 inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness, MapsVariant & maps, Func && func)
 {
@@ -103,7 +102,7 @@ inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness stric
 
 /// Call function on specified join map
 template <typename MapsVariant, typename Func>
-inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness, std::vector<const MapsVariant*> & mapsv, Func && func)
+inline bool joinDispatch(ASTTableJoin::Kind kind, ASTTableJoin::Strictness strictness, std::vector<const MapsVariant *> & mapsv, Func && func)
 {
     return static_for<0, KINDS.size() * STRICTNESSES.size()>([&](auto ij)
     {

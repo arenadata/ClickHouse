@@ -13,6 +13,7 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <DataStreams/materializeBlock.h>
 
+
 namespace DB
 {
 
@@ -48,25 +49,23 @@ void TableJoin::resetCollected()
     columns_added_by_join.clear();
     original_names.clear();
     renames.clear();
-
     left_type_map.clear();
     right_type_map.clear();
     left_converting_actions = nullptr;
     right_converting_actions = nullptr;
-
     key_names_left.resize(1);
     key_names_right.resize(1);
 }
 
 void TableJoin::addUsingKey(const ASTPtr & ast)
 {
-    key_names_left[0].push_back(ast->getColumnName());
-    key_names_right[0].push_back(ast->getAliasOrColumnName());
+    key_names_left.front().push_back(ast->getColumnName());
+    key_names_right.front().push_back(ast->getAliasOrColumnName());
 
     key_asts_left.push_back(ast);
     key_asts_right.push_back(ast);
 
-    auto & right_key = key_names_right[0].back();
+    auto & right_key = key_names_right.front().back();
     if (renames.count(right_key))
         right_key = renames[right_key];
 }
@@ -198,13 +197,10 @@ NameSet TableJoin::requiredRightKeys() const
 
 NamesWithAliases TableJoin::getRequiredColumns(const Block & sample, const Names & action_required_columns) const
 {
-    LOG_TRACE(&Poco::Logger::get("TableJoin"), "sample {}", sample.dumpStructure());
     NameSet required_columns(action_required_columns.begin(), action_required_columns.end());
 
     for (auto & column : requiredJoinedNames())
     {
-        LOG_TRACE(&Poco::Logger::get("TableJoin"), "getRequiredColumns column {}", column);
-
         if (!sample.has(column))
             required_columns.insert(column);
     }
@@ -257,7 +253,6 @@ Block TableJoin::getRequiredRightKeys(const Block & right_table_keys, std::vecto
         }
     }
 
-
     return required_right_keys;
 }
 
@@ -285,13 +280,11 @@ void TableJoin::addJoinedColumn(const NameAndTypePair & joined_column)
     if (rightBecomeNullable(type))
         type = JoinCommon::convertTypeToNullable(type);
 
-    LOG_TRACE(&Poco::Logger::get("TableJoin"), " addJoinedColumns {}", joined_column.name);
     columns_added_by_join.emplace_back(joined_column.name, type);
 }
 
 void TableJoin::addJoinedColumnsAndCorrectTypes(NamesAndTypesList & names_and_types, bool correct_nullability) const
 {
-    LOG_TRACE(&Poco::Logger::get("TableJoin"), " addJoinedColumnsAndCorrectTypes 1");
     ColumnsWithTypeAndName columns;
     for (auto & pair : names_and_types)
         columns.emplace_back(nullptr, std::move(pair.type), std::move(pair.name));
@@ -305,7 +298,6 @@ void TableJoin::addJoinedColumnsAndCorrectTypes(NamesAndTypesList & names_and_ty
 
 void TableJoin::addJoinedColumnsAndCorrectTypes(ColumnsWithTypeAndName & columns, bool correct_nullability) const
 {
-    LOG_TRACE(&Poco::Logger::get("addJoinedColumn"), " addJoinedColumnsAndCorrectTypes 2");
     for (auto & col : columns)
     {
         if (hasUsing())
@@ -325,8 +317,6 @@ void TableJoin::addJoinedColumnsAndCorrectTypes(ColumnsWithTypeAndName & columns
     /// Types in columns_added_by_join already converted and set nullable if needed
     for (const auto & col : columns_added_by_join)
     {
-        LOG_TRACE(&Poco::Logger::get("TableJoin"), "addJoinedColumnsAndCorrectTypes 2 {}", col.name);
-
         columns.emplace_back(nullptr, col.type, col.name);
     }
 
@@ -376,7 +366,7 @@ bool TableJoin::allowDictJoin(const String & dict_key, const Block & sample_bloc
     if (!isLeft(kind()) && !(isInner(kind()) && strictness() == ASTTableJoin::Strictness::All))
         return false;
 
-    const Names & right_keys = keyNamesRight()[0];
+    const Names & right_keys = keyNamesRight().front();
     if (right_keys.size() != 1)
         return false;
 
@@ -481,7 +471,6 @@ bool TableJoin::inferJoinKeyCommonType(const NamesAndTypesList & left, const Nam
             left_type_map[key_names_left[d][i]] = right_type_map[key_names_right[d][i]] = supertype;
         }
     }
-
 
     if (!left_type_map.empty() || !right_type_map.empty())
     {

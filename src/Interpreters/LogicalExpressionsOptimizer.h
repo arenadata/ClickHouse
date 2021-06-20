@@ -92,10 +92,6 @@ private:
     /// Restore the original column order after optimization.
     void reorderColumns();
 
-    // void normTree(ASTPtr node);
-    // ASTPtr distribute(ASTPtr node);
-    // void joinOnToDNF();
-
 private:
     using ParentNodes = std::vector<IAST *>;
     using FunctionParentMap = std::unordered_map<const IAST *, ParentNodes>;

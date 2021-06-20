@@ -202,7 +202,7 @@ size_t tryPushDownFilter(QueryPlan::Node * parent_node, QueryPlan::Nodes & nodes
             const auto & left_header = join->getInputStreams().front().header;
             const auto & res_header = join->getOutputStream().header;
             Names allowed_keys;
-            for (const auto & name : table_join.keyNamesLeft()[0])
+            for (const auto & name : table_join.keyNamesLeft().front())
             {
                 /// Skip key if it is renamed.
                 /// I don't know if it is possible. Just in case.

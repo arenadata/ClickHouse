@@ -51,7 +51,6 @@ public:
     static bool needChildVisit(const ASTPtr & node, const ASTPtr &)
     {
         if (auto * func = node->as<ASTFunction>())
-            // return func->name == "and";
             return func->name == "and" || func->name == "or";
         return true;
     }

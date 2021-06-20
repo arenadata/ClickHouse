@@ -1,5 +1,3 @@
-// #include <Poco/Logger.h>
-
 #include <Parsers/queryToString.h>
 
 #include <Interpreters/CollectJoinOnKeysVisitor.h>
@@ -20,11 +18,10 @@ namespace ErrorCodes
 
 void CollectJoinOnKeysMatcher::Data::setDisjuncts(const ASTFunction & func)
 {
-    const auto * expression_list = func.children[0]->as<ASTExpressionList>();
+    const auto * expression_list = func.children.front()->as<ASTExpressionList>();
     std::vector<const IAST*> v;
     for (const auto & child : expression_list->children)
     {
-        LOG_DEBUG(&Poco::Logger::get("addDisjunct"), "child {}", static_cast<const void*>(static_cast<const IAST*>(child.get())));
         v.push_back(child.get());
     }
 
@@ -76,10 +73,8 @@ void CollectJoinOnKeysMatcher::Data::asofToJoinKeys()
     addJoinKeys(asof_left_key, asof_right_key, {1, 2});
 }
 
-void CollectJoinOnKeysMatcher::visit
-(const ASTFunction & func, const ASTPtr & ast, Data & data)
+void CollectJoinOnKeysMatcher::visit(const ASTFunction & func, const ASTPtr & ast, Data & data)
 {
-
     if (func.name == "or")
     {
         // throw Exception("JOIN ON does not support OR. Unexpected '" + queryToString(ast) + "'", ErrorCodes::NOT_IMPLEMENTED);
@@ -91,8 +86,6 @@ void CollectJoinOnKeysMatcher::visit
 
     if (func.name == "and")
         return; /// go into children
-
-    LOG_DEBUG(&Poco::Logger::get("addDisjunct"), "func: {}", static_cast<const void*>(static_cast<const IAST*>(&func)));
 
     ASOF::Inequality inequality = ASOF::getInequality(func.name);
     if (func.name == "equals" || inequality != ASOF::Inequality::None)

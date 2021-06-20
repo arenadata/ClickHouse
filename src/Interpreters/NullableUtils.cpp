@@ -51,28 +51,4 @@ ColumnPtr extractNestedColumnsAndNullMap(ColumnRawPtrs & key_columns, ConstNullM
     return null_map_holder;
 }
 
-ColumnPtr joinNullMaps(Columns & null_map_holder_vector, ConstNullMapPtrVector & null_map_vector, ConstNullMapPtr & null_map)
-{
-    ColumnPtr null_map_holder = null_map_holder_vector[0];
-    MutableColumnPtr mutable_null_map_holder = IColumn::mutate(std::move(null_map_holder));
-    PaddedPODArray<UInt8> & mutable_null_map = assert_cast<ColumnUInt8 &>(*mutable_null_map_holder).getData();
-
-    for (size_t i = 1, vsize = null_map_vector.size(); i < vsize; ++i)
-    {
-        ColumnPtr other_null_map_holder = null_map_holder_vector[i];
-        MutableColumnPtr other_mutable_null_map_holder = IColumn::mutate(std::move(other_null_map_holder));
-        PaddedPODArray<UInt8> & other_mutable_null_map = assert_cast<ColumnUInt8 &>(*other_mutable_null_map_holder).getData();
-
-        for (size_t j = 0, msize = mutable_null_map.size(); j < msize; ++j)
-            mutable_null_map[j] &= other_mutable_null_map[j];
-
-    }
-
-    null_map_holder = std::move(mutable_null_map_holder);
-    null_map = null_map_holder ? &assert_cast<const ColumnUInt8 &>(*null_map_holder).getData() : nullptr;
-
-    return null_map_holder;
-}
-
-
 }

@@ -411,12 +411,10 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
                 if (!required_right_keys.has(right_key_name))
                 {
                     left_to_right_key_remap[left_key_pos] = right_key_pos;
-                    LOG_TRACE(&Poco::Logger::get("NotJoined"), "ctor remap {} {}", right_key_name, left_key_name);
                 }
             }
         }
     }
-
 
     /// result_sample_block: left_sample_block + left expressions, right not key columns, required right keys
     size_t left_columns_count = result_sample_block.columns() -
@@ -428,7 +426,6 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
         if (left_to_right_key_remap.count(left_pos))
         {
             size_t right_key_pos = left_to_right_key_remap[left_pos];
-            LOG_TRACE(&Poco::Logger::get("NotJoined"), "ctor {} {}", right_key_pos, left_pos);
             setRightIndex(right_key_pos, left_pos);
         }
         else
@@ -447,7 +444,6 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
         if (result_position < left_columns_count)
             continue;
 
-        LOG_TRACE(&Poco::Logger::get("NotJoined"), "ctor {}, {} {}", name, right_pos, result_position);
         setRightIndex(right_pos, result_position);
     }
 

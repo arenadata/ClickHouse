@@ -113,7 +113,6 @@ DictionaryReader::DictionaryReader(const String & dictionary_name, const Names &
 void DictionaryReader::readKeys(const IColumn & keys, Block & out_block, ColumnVector<UInt8>::Container & found,
                                 std::vector<size_t> & positions) const
 {
-
     auto working_block = sample_block.getColumnsWithTypeAndName();
     size_t has_position = key_position + 1;
     size_t size = keys.size();
@@ -140,7 +139,6 @@ void DictionaryReader::readKeys(const IColumn & keys, Block & out_block, ColumnV
     /// set keys for dictGet(): remove not found keys
     key_column.column = key_column.column->filter(found, -1);
     size_t rows = key_column.column->size();
-
 
     /// calculate dictGet()
     for (const auto & func : functions_get)

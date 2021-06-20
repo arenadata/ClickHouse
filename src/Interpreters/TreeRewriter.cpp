@@ -2,8 +2,6 @@
 #include <Core/Defines.h>
 #include <Core/NamesAndTypes.h>
 
-#include <sstream>
-
 #include <Interpreters/TreeRewriter.h>
 #include <Interpreters/LogicalExpressionsOptimizer.h>
 #include <Interpreters/QueryAliasesVisitor.h>
@@ -858,8 +856,6 @@ void TreeRewriterResult::collectUsedColumns(const ASTPtr & query, bool is_select
         /// Add columns obtained by JOIN (if needed).
         for (const auto & joined_column : analyzed_join->columnsFromJoinedTable())
         {
-            LOG_TRACE(&Poco::Logger::get("TreeRewriterResult"), " collectUsedColumns from joined table {}", joined_column.name);
-
             const auto & name = joined_column.name;
             if (available_columns.count(name))
                 continue;
@@ -1040,7 +1036,6 @@ void TreeRewriterResult::collectUsedColumns(const ASTPtr & query, bool is_select
     required_source_columns.swap(source_columns);
     for (const auto & column : required_source_columns)
     {
-        LOG_TRACE(&Poco::Logger::get("TreeRewriterResult"), " collectUsedColumns (before exit) required_source_column {}", column.name);
         source_column_names.insert(column.name);
     }
 }
@@ -1104,7 +1099,6 @@ TreeRewriterResultPtr TreeRewriter::analyzeSelect(
     }
 
     normalize(query, result.aliases, all_source_columns_set, select_options.ignore_alias, settings, /* allow_self_aliases = */ true);
-
 
     /// Remove unneeded columns according to 'required_result_columns'.
     /// Leave all selected columns in case of DISTINCT; columns that contain arrayJoin function inside.

@@ -29,7 +29,6 @@ namespace DB
 
 class TableJoin;
 class DictionaryReader;
-class HashJoin;
 
 namespace JoinStuff
 {
@@ -41,7 +40,6 @@ class JoinUsedFlags
     bool need_flags;
 
 public:
-
 
     /// Update size for vector with flags.
     /// Calling this method invalidates existing flags.
@@ -140,11 +138,7 @@ class HashJoin : public IJoin
 public:
     HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block, bool any_take_last_row_ = false);
 
-
-    // bool empty() const { return data[0]->type == Type::EMPTY; }
-    // bool overDictionary() const { return data[0]->type == Type::DICT; }
     const TableJoin & getTableJoin() const override { return *table_join; }
-
 
     /** Add block of data from right hand of JOIN to the map.
       * Returns false, if some limit was exceeded and you should not insert more data.
@@ -183,7 +177,6 @@ public:
     /// Sum size in bytes of all buffers, used for JOIN maps and for all memory pools.
     size_t getTotalByteCount() const final;
 
-    // bool alwaysReturnsEmptySet() const final { return isInnerOrRight(getKind()) && data/*[0]*/->empty && !overDictionary(); }
     bool alwaysReturnsEmptySet() const final;
 
     ASTTableJoin::Kind getKind() const { return kind; }
@@ -195,7 +188,7 @@ public:
     const ColumnWithTypeAndName & rightAsofKeyColumn() const
     {
         /// It should be nullable if nullable_right_side is true
-        return savedBlockSample().getByName(key_names_right[0].back());
+        return savedBlockSample().getByName(key_names_right.front().back());
     }
 
     /// Different types of keys for maps.
@@ -278,7 +271,7 @@ public:
         }
 
         size_t getTotalByteCountImpl(Type which) const
-         {
+        {
             switch (which)
             {
                 case Type::EMPTY:            return 0;
@@ -317,11 +310,8 @@ public:
     using MapsAsof = MapsTemplate<AsofRowRefs>;
 
     using MapsVariant = std::variant<MapsOne, MapsAll, MapsAsof>;
-    // using MapsVariant = std::variant<MapsOne, MapsAll, MapsOneFlagged, MapsAllFlagged, MapsAsof>;
-    using MapsVariantPtrVector = std::vector<MapsVariant*>;
     using BlockNullmapList = std::deque<std::pair<const Block *, ColumnPtr>>;
     using BlockUsedmapList = std::deque<std::pair<const Block *, ColumnPtr>>;
-    using BlockUsedmapListPtr = std::unique_ptr<BlockUsedmapList>;
 
     struct BlockWithFlags : public ExtraBlock
     {
@@ -341,7 +331,6 @@ public:
         // BlocksList blocks; /// Blocks of "right" table.
         BlocksWithFlagsList blocks;
         BlockNullmapList blocks_nullmaps; /// Nullmaps for blocks of "right" table (if needed)
-        BlockUsedmapListPtr blocks_usedmaps_ptr; /// Usedmaps for blocks of "right" table (if needed)
 
         /// Additional data - strings for string keys and continuation elements of single-linked lists of references to rows.
         Arena pool;
@@ -402,7 +391,6 @@ private:
     Block sample_block_with_columns_to_add;
     /// Block with key columns in the same order they appear in the right-side table (duplicates appear once).
     Block right_table_keys;
-
     /// Block with key columns right-side table keys that are needed in result (would be attached after joined columns).
     Block required_right_keys;
     /// Left table column names that are sources for required_right_keys columns
@@ -426,12 +414,9 @@ private:
     BlockWithFlags structureRightBlock(const Block & stored_block) const;
     void initRightBlockStructure(Block & saved_block_sample);
 
-    template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
+    template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS>
     void joinBlockImpl(
         Block & block,
-        const Names & key_names_left,
-        const Block & block_with_columns_to_add,
-        const Maps & maps,
         std::unique_ptr<AddedColumns>,
         size_t existing_columns) const;
 
@@ -461,92 +446,6 @@ private:
     bool empty() const;
     bool overDictionary() const;
 };
-
-
-#if 0
-
-class HashJoin : public IJoin
-{
-private:
-    std::vector<std::unique_ptr<HashJoinImpl>> implv;
-    Poco::Logger * log;
-    Names keyNamesLeft;
-
-    Block mergeBlocks(Blocks && blocks, size_t total_rows) const;
-public:
-    HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block);
-
-
-    //        : impl(table_join_, right_sample_block)
-
-
-    bool addJoinedBlock(const Block & block, bool check_limits) override;
-
-    void joinBlock(Block & block, ExtraBlockPtr & not_processed) override;
-
-    void joinTotals(Block & block) const override
-    {
-        for (auto & impl : implv)
-        {
-            impl->joinTotals(block);
-        }
-    }
-
-    void setTotals(const Block & block) override
-    {
-        for (auto & impl : implv)
-        {
-            impl->setTotals(block);
-        }
-    }
-
-    bool hasTotals() const override
-    {
-        bool ret = false;
-
-        for (auto & impl : implv)
-        {
-            if (impl->hasTotals())
-            {
-                ret = true;
-            }
-        }
-
-        return ret;
-    }
-
-    size_t getTotalRowCount() const override
-    {
-        size_t ret = 0;
-
-        for (auto & impl : implv)
-        {
-            ret += impl->getTotalRowCount();
-        }
-
-        return ret;
-    }
-
-    size_t getTotalByteCount() const override
-    {
-        size_t ret = 0;
-
-        for (auto & impl : implv)
-        {
-            ret += impl->getTotalByteCount();
-        }
-
-        return ret;
-    }
-
-    BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & result_sample_block, UInt64 max_block_size) const override
-    {
-        return implv[0]->createStreamWithNonJoinedRows(result_sample_block, max_block_size);
-    }
-};
-
-
-#endif
 
 
 }

@@ -809,7 +809,6 @@ JoinPtr SelectQueryExpressionAnalyzer::appendJoin(ExpressionActionsChain & chain
     ExpressionActionsChain::Step & step = chain.lastStep(columns_after_array_join);
     chain.steps.push_back(std::make_unique<ExpressionActionsChain::JoinStep>(syntax->analyzed_join, table_join, step.getResultColumns()));
     chain.addStep();
-
     return table_join;
 }
 
@@ -1317,7 +1316,6 @@ ActionsDAGPtr SelectQueryExpressionAnalyzer::appendProjectResult(ExpressionActio
         if (required_result_columns.empty() || required_result_columns.count(result_name))
         {
             std::string source_name = ast->getColumnName();
-            LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "SelectQueryExpressionAnalyzer::appendProjectResult source_name  {}", source_name);
 
             /*
              * For temporary columns created by ExpressionAnalyzer for literals,
@@ -1345,7 +1343,6 @@ ActionsDAGPtr SelectQueryExpressionAnalyzer::appendProjectResult(ExpressionActio
             }
 
             result_columns.emplace_back(source_name, result_name);
-            LOG_TRACE(&Poco::Logger::get("ExpressionAnalyzer"), "SelectQueryExpressionAnalyzer::appendProjectResult source_name  {}, result_name {}", source_name, result_name);
             step.addRequiredOutput(result_columns.back().second);
         }
     }
@@ -1541,9 +1538,6 @@ ExpressionAnalysisResult::ExpressionAnalysisResult(
         {
             query_analyzer.appendJoinLeftKeys(chain, only_types || !first_stage);
             before_join = chain.getLastActions();
-
-            //   ActionsDAG::buildExpressions
-
             join = query_analyzer.appendJoin(chain);
             converting_join_columns = query_analyzer.analyzedJoin().leftConvertingActions();
             chain.addStep();

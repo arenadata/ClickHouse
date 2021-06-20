@@ -469,7 +469,6 @@ ScopeStack::ScopeStack(ActionsDAGPtr actions_dag, ContextPtr context_) : WithCon
 
 void ScopeStack::pushLevel(const NamesAndTypesList & input_columns)
 {
-    LOG_TRACE(&Poco::Logger::get("ActionsDAG"), "pushLevel");
     auto & level = stack.emplace_back();
     level.actions_dag = std::make_shared<ActionsDAG>();
     level.index = std::make_unique<ScopeStack::Index>(level.actions_dag->getIndex());
