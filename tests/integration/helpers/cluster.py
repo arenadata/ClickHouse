@@ -62,12 +62,14 @@ def run_and_check(args, env=None, shell=False, stdout=subprocess.PIPE, stderr=su
     err = res.stderr.decode('utf-8')
     if res.returncode != 0:
         # check_call(...) from subprocess does not print stderr, so we do it manually
+        logging.debug(f"Command:{args}")
         logging.debug(f"Stderr:{err}")
         logging.debug(f"Stdout:{out}")
         logging.debug(f"Env: {env}")
         if not nothrow:
             raise Exception(f"Command {args} return non-zero code {res.returncode}: {res.stderr.decode('utf-8')}")
     else:
+        logging.debug(f"Command:{args}")
         logging.debug(f"Stderr: {err}")
         logging.debug(f"Stdout: {out}")
         return out
@@ -249,7 +251,7 @@ class ClickHouseCluster:
 
         self.with_minio = False
         self.minio_dir = os.path.join(self.instances_dir, "minio")
-        self.minio_certs_dir = None # source for certificates 
+        self.minio_certs_dir = None # source for certificates
         self.minio_host = "minio1"
         self.minio_ip = None
         self.minio_bucket = "root"
@@ -263,15 +265,17 @@ class ClickHouseCluster:
         # available when with_hdfs == True
         self.hdfs_host = "hdfs1"
         self.hdfs_ip = None
-        self.hdfs_name_port = get_free_port()
-        self.hdfs_data_port = get_free_port()
+        self.hdfs_name_port = 50070
+        self.hdfs_data_port = 50075
         self.hdfs_dir = p.abspath(p.join(self.instances_dir, "hdfs"))
         self.hdfs_logs_dir = os.path.join(self.hdfs_dir, "logs")
+        self.hdfs_api = None # also for kerberized hdfs
 
         # available when with_kerberized_hdfs == True
         self.hdfs_kerberized_host = "kerberizedhdfs1"
-        self.hdfs_kerberized_name_port = get_free_port()
-        self.hdfs_kerberized_data_port = get_free_port()
+        self.hdfs_kerberized_ip = None
+        self.hdfs_kerberized_name_port = 50070
+        self.hdfs_kerberized_data_port = 1006
         self.hdfs_kerberized_dir = p.abspath(p.join(self.instances_dir, "kerberized_hdfs"))
         self.hdfs_kerberized_logs_dir = os.path.join(self.hdfs_kerberized_dir, "logs")
 
@@ -329,7 +333,7 @@ class ClickHouseCluster:
         # available when with_mysql_client == True
         self.mysql_client_host = "mysql_client"
         self.mysql_client_container = None
- 
+
         # available when with_mysql == True
         self.mysql_host = "mysql57"
         self.mysql_port = 3306
@@ -375,11 +379,11 @@ class ClickHouseCluster:
     def cleanup(self):
         # Just in case kill unstopped containers from previous launch
         try:
-            result = run_and_check(['docker', 'container', 'list', '-a', '-f name={self.project_name}', '|', 'wc', '-l'])
+            result = run_and_check(f'docker container list --all --filter name={self.project_name} | wc -l', shell=True)
             if int(result) > 1:
-                logging.debug("Trying to kill unstopped containers...")
-                run_and_check(['docker', 'kill', f'`docker container list -a -f name={self.project_name}`'])
-                run_and_check(['docker', 'rm', f'`docker container list -a -f name={self.project_name}`'])
+                logging.debug(f"Trying to kill unstopped containers for project{self.project_name}...")
+                run_and_check(f'docker kill $(docker container list --all --quiet --filter name={self.project_name})', shell=True)
+                run_and_check(f'docker rm $(docker container list --all  --quiet --filter name={self.project_name})', shell=True)
                 logging.debug("Unstopped containers killed")
                 run_and_check(['docker-compose', 'ps', '--services', '--all'])
             else:
@@ -409,8 +413,10 @@ class ClickHouseCluster:
         try:
             logging.debug("Trying to prune unused volumes...")
 
-            run_and_check(['docker', 'volume', 'prune', '-f'])
-            logging.debug("Volumes pruned")
+            result = run_and_check(['docker volume ls | wc -l'], shell=True)
+            if int(result>0):
+                run_and_check(['docker', 'volume', 'prune', '-f'])
+            logging.debug(f"Volumes pruned: {result}")
         except:
             pass
 
@@ -526,7 +532,7 @@ class ClickHouseCluster:
 
         return self.base_mysql8_cmd
 
-    def setup_mysql_cluster_cmd(self, instance, env_variables, docker_compose_yml_dir):      
+    def setup_mysql_cluster_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_mysql_cluster = True
         env_variables['MYSQL_CLUSTER_PORT'] = str(self.mysql_port)
         env_variables['MYSQL_CLUSTER_ROOT_HOST'] = '%'
@@ -550,7 +556,7 @@ class ClickHouseCluster:
                                       '--file', p.join(docker_compose_yml_dir, 'docker_compose_postgres.yml')]
         return self.base_postgres_cmd
 
-    def setup_postgres_cluster_cmd(self, instance, env_variables, docker_compose_yml_dir):      
+    def setup_postgres_cluster_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_postgres_cluster = True
         env_variables['POSTGRES_PORT'] = str(self.postgres_port)
         env_variables['POSTGRES2_DIR'] = self.postgres2_logs_dir
@@ -564,10 +570,8 @@ class ClickHouseCluster:
     def setup_hdfs_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_hdfs = True
         env_variables['HDFS_HOST'] = self.hdfs_host
-        env_variables['HDFS_NAME_EXTERNAL_PORT'] = str(self.hdfs_name_port)
-        env_variables['HDFS_NAME_INTERNAL_PORT'] = "50070"
-        env_variables['HDFS_DATA_EXTERNAL_PORT'] = str(self.hdfs_data_port)
-        env_variables['HDFS_DATA_INTERNAL_PORT'] = "50075"
+        env_variables['HDFS_NAME_PORT'] = str(self.hdfs_name_port)
+        env_variables['HDFS_DATA_PORT'] = str(self.hdfs_data_port)
         env_variables['HDFS_LOGS'] = self.hdfs_logs_dir
         env_variables['HDFS_FS'] = "bind"
         self.base_cmd.extend(['--file', p.join(docker_compose_yml_dir, 'docker_compose_hdfs.yml')])
@@ -579,10 +583,8 @@ class ClickHouseCluster:
     def setup_kerberized_hdfs_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_kerberized_hdfs = True
         env_variables['KERBERIZED_HDFS_HOST'] = self.hdfs_kerberized_host
-        env_variables['KERBERIZED_HDFS_NAME_EXTERNAL_PORT'] = str(self.hdfs_kerberized_name_port)
-        env_variables['KERBERIZED_HDFS_NAME_INTERNAL_PORT'] = "50070"
-        env_variables['KERBERIZED_HDFS_DATA_EXTERNAL_PORT'] = str(self.hdfs_kerberized_data_port)
-        env_variables['KERBERIZED_HDFS_DATA_INTERNAL_PORT'] = "1006"
+        env_variables['KERBERIZED_HDFS_NAME_PORT'] = str(self.hdfs_kerberized_name_port)
+        env_variables['KERBERIZED_HDFS_DATA_PORT'] = str(self.hdfs_kerberized_data_port)
         env_variables['KERBERIZED_HDFS_LOGS'] = self.hdfs_kerberized_logs_dir
         env_variables['KERBERIZED_HDFS_FS'] = "bind"
         env_variables['KERBERIZED_HDFS_DIR'] = instance.path + '/'
@@ -646,7 +648,7 @@ class ClickHouseCluster:
         return self.base_mongo_cmd
 
     def setup_minio_cmd(self, instance, env_variables, docker_compose_yml_dir):
-        self.with_minio = True        
+        self.with_minio = True
         cert_d = p.join(self.minio_dir, "certs")
         env_variables['MINIO_CERTS_DIR'] = cert_d
         env_variables['MINIO_PORT'] = str(self.minio_port)
@@ -674,7 +676,7 @@ class ClickHouseCluster:
 
     def add_instance(self, name, base_config_dir=None, main_configs=None, user_configs=None, dictionaries=None,
                      macros=None, with_zookeeper=False, with_zookeeper_secure=False,
-                     with_mysql_client=False, with_mysql=False, with_mysql8=False, with_mysql_cluster=False, 
+                     with_mysql_client=False, with_mysql=False, with_mysql8=False, with_mysql_cluster=False,
                      with_kafka=False, with_kerberized_kafka=False, with_rabbitmq=False, clickhouse_path_dir=None,
                      with_odbc_drivers=False, with_postgres=False, with_postgres_cluster=False, with_hdfs=False, with_kerberized_hdfs=False, with_mongo=False,
                      with_redis=False, with_minio=False, with_cassandra=False, with_jdbc_bridge=False,
@@ -831,7 +833,7 @@ class ClickHouseCluster:
             if self.minio_certs_dir is None:
                 self.minio_certs_dir = minio_certs_dir
             else:
-                raise Exception("Overwriting minio certs dir") 
+                raise Exception("Overwriting minio certs dir")
 
         if with_cassandra and not self.with_cassandra:
             cmds.append(self.setup_cassandra_cmd(instance, env_variables, docker_compose_yml_dir))
@@ -902,7 +904,10 @@ class ClickHouseCluster:
     def exec_in_container(self, container_id, cmd, detach=False, nothrow=False, use_cli=True, **kwargs):
         if use_cli:
             logging.debug(f"run container_id:{container_id} detach:{detach} nothrow:{nothrow} cmd: {cmd}")
-            result = subprocess_check_call(["docker", "exec", container_id] + cmd, detach=detach, nothrow=nothrow)
+            exec_cmd = ["docker", "exec"]
+            if 'user' in kwargs:
+                exec_cmd += ['-u', kwargs['user']]
+            result = subprocess_check_call(exec_cmd + [container_id] + cmd, detach=detach, nothrow=nothrow)
             return result
         else:
             exec_id = self.docker_client.api.exec_create(container_id, cmd, **kwargs)
@@ -1128,30 +1133,26 @@ class ClickHouseCluster:
         raise Exception("Cannot wait ZooKeeper container")
 
     def make_hdfs_api(self, timeout=180, kerberized=False):
-        hdfs_api = None
         if kerberized:
             keytab = p.abspath(p.join(self.instances['node1'].path, "secrets/clickhouse.keytab"))
             krb_conf = p.abspath(p.join(self.instances['node1'].path, "secrets/krb_long.conf"))
-            hdfs_ip = self.get_instance_ip('kerberizedhdfs1')
-            # logging.debug("kerberizedhdfs1 ip ", hdfs_ip)
+            self.hdfs_kerberized_ip = self.get_instance_ip(self.hdfs_kerberized_host)
             kdc_ip = self.get_instance_ip('hdfskerberos')
-            # logging.debug("kdc_ip ", kdc_ip)
-            hdfs_api = HDFSApi(user="root",
-                              timeout=timeout,
-                              kerberized=True,
-                              principal="root@TEST.CLICKHOUSE.TECH",
-                              keytab=keytab,
-                              krb_conf=krb_conf,
-                              host="localhost",
-                              protocol="http",
-                              proxy_port=self.hdfs_kerberized_name_port,
-                              data_port=self.hdfs_kerberized_data_port,
-                              hdfs_ip=hdfs_ip,
-                              kdc_ip=kdc_ip)                         
+            self.hdfs_api = HDFSApi(user="root",
+                                    timeout=timeout,
+                                    kerberized=True,
+                                    principal="root@TEST.CLICKHOUSE.TECH",
+                                    keytab=keytab,
+                                    krb_conf=krb_conf,
+                                    host=self.hdfs_kerberized_host,
+                                    protocol="http",
+                                    proxy_port=self.hdfs_kerberized_name_port,
+                                    data_port=self.hdfs_kerberized_data_port,
+                                    hdfs_ip=self.hdfs_kerberized_ip,
+                                    kdc_ip=kdc_ip)
         else:
-            logging.debug("Create HDFSApi host={}".format("localhost"))
-            hdfs_api = HDFSApi(user="root", host="localhost", data_port=self.hdfs_data_port, proxy_port=self.hdfs_name_port)
-        return hdfs_api
+            self.hdfs_ip = self.get_instance_ip(self.hdfs_host)
+            self.hdfs_api = HDFSApi(user="root", host=self.hdfs_host, data_port=self.hdfs_data_port, proxy_port=self.hdfs_name_port, hdfs_ip=self.hdfs_ip)
 
     def wait_kafka_is_available(self, kafka_docker_id, kafka_port, max_retries=50):
         retries = 0
@@ -1166,16 +1167,15 @@ class ClickHouseCluster:
                 time.sleep(1)
 
 
-    def wait_hdfs_to_start(self, hdfs_api, timeout=300):
-        self.hdfs_ip = self.get_instance_ip(self.hdfs_host)
+    def wait_hdfs_to_start(self, timeout=300):
         start = time.time()
         while time.time() - start < timeout:
             try:
-                hdfs_api.write_data("/somefilewithrandomname222", "1")
+                self.hdfs_api.write_data("/somefilewithrandomname222", "1")
                 logging.debug("Connected to HDFS and SafeMode disabled! ")
                 return
             except Exception as ex:
-                logging.debug("Can't connect to HDFS " + str(ex))
+                logging.exception("Can't connect to HDFS " + str(ex))
                 time.sleep(1)
 
         raise Exception("Can't wait HDFS to start")
@@ -1249,7 +1249,7 @@ class ClickHouseCluster:
 
         raise Exception("Can't wait Schema Registry to start")
 
-        
+
     def wait_cassandra_to_start(self, timeout=180):
         self.cassandra_ip = self.get_instance_ip(self.cassandra_host)
         cass_client = cassandra.cluster.Cluster([self.cassandra_ip], port=self.cassandra_port, load_balancing_policy=RoundRobinPolicy())
@@ -1324,7 +1324,7 @@ class ClickHouseCluster:
 
                 for dir in self.zookeeper_dirs_to_create:
                     os.makedirs(dir)
-                
+
                 if self.use_keeper: # TODO: remove hardcoded paths from here
                     for i in range(1,4):
                         shutil.copy(os.path.join(HELPERS_DIR, f'keeper_config{i}.xml'), os.path.join(self.keeper_instance_dir_prefix + f"{i}", "config" ))
@@ -1413,16 +1413,16 @@ class ClickHouseCluster:
                 os.makedirs(self.hdfs_logs_dir)
                 os.chmod(self.hdfs_logs_dir, stat.S_IRWXO)
                 subprocess_check_call(self.base_hdfs_cmd + common_opts)
-                hdfs_api = self.make_hdfs_api()
-                self.wait_hdfs_to_start(hdfs_api)
+                self.make_hdfs_api()
+                self.wait_hdfs_to_start()
 
             if self.with_kerberized_hdfs and self.base_kerberized_hdfs_cmd:
                 logging.debug('Setup kerberized HDFS')
                 os.makedirs(self.hdfs_kerberized_logs_dir)
                 os.chmod(self.hdfs_kerberized_logs_dir, stat.S_IRWXO)
                 run_and_check(self.base_kerberized_hdfs_cmd + common_opts)
-                hdfs_api = self.make_hdfs_api(kerberized=True)
-                self.wait_hdfs_to_start(hdfs_api)
+                self.make_hdfs_api(kerberized=True)
+                self.wait_hdfs_to_start()
 
             if self.with_mongo and self.base_mongo_cmd:
                 logging.debug('Setup Mongo')
@@ -1920,7 +1920,7 @@ class ClickHouseInstance:
                 return None
         return None
 
-    def restart_with_latest_version(self, stop_start_wait_sec=300, callback_onstop=None, signal=60):
+    def restart_with_latest_version(self, stop_start_wait_sec=300, callback_onstop=None, signal=15):
         if not self.stay_alive:
             raise Exception("Cannot restart not stay alive container")
         self.exec_in_container(["bash", "-c", "pkill -{} clickhouse".format(signal)], user='root')
@@ -2176,7 +2176,7 @@ class ClickHouseInstance:
             depends_on.append("postgres2")
             depends_on.append("postgres3")
             depends_on.append("postgres4")
-            
+
         if self.with_kafka:
             depends_on.append("kafka1")
             depends_on.append("schema-registry")

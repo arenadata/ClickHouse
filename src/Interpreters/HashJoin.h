@@ -425,7 +425,8 @@ private:
         Block & block,
         const NamesVector & key_names_left,
         const Block & block_with_columns_to_add,
-        const std::vector<const Maps*> & maps) const;
+        const std::vector<const Maps*> & maps,
+        bool is_join_get = false) const;
 
     template <ASTTableJoin::Kind KIND, ASTTableJoin::Strictness STRICTNESS, typename Maps>
     std::unique_ptr<AddedColumns> makeAddedColumnsV(
@@ -434,7 +435,8 @@ private:
         const Block & block_with_columns_to_add,
         const Maps & maps,
         const Sizes & key_sizes_,
-        HashJoin::Type) const;
+        HashJoin::Type,
+        bool is_join_get = false) const;
 
     void joinBlockImplCross(Block & block, ExtraBlockPtr & not_processed) const;
 

@@ -170,7 +170,7 @@ static ColumnWithTypeAndName correctNullability(ColumnWithTypeAndName && column,
 {
     if (nullable)
     {
-        JoinCommon::convertColumnToNullable(column, true);
+        JoinCommon::convertColumnToNullable(column);
         if (column.type->isNullable() && !negative_null_map.empty())
         {
             MutableColumnPtr mutable_column = IColumn::mutate(std::move(column.column));
@@ -807,7 +807,6 @@ using SizesVector = std::vector<Sizes>;
 class AddedColumns
 {
 public:
-
     struct TypeAndName
     {
         DataTypePtr type;
@@ -815,24 +814,26 @@ public:
         String qualified_name;
 
         TypeAndName(DataTypePtr type_, const String & name_, const String & qualified_name_)
-            : type(type_)
-            , name(name_)
-            , qualified_name(qualified_name_)
-        {}
+            : type(type_), name(name_), qualified_name(qualified_name_)
+        {
+        }
     };
 
-    AddedColumns(const Block & block_with_columns_to_add, // left block
-                 const Block & block, // AKA key_names_left
-                 const Block & saved_block_sample, // AKA saved_block_with_columns_to_add
-                 const HashJoin & join,
-                 const ColumnRawPtrsVector & key_columns_,
-                 const SizesVector & key_sizes_,
-                 bool is_asof_join)
+    AddedColumns(
+        const Block & block_with_columns_to_add,
+        const Block & block,
+        const Block & saved_block_sample,
+        const HashJoin & join,
+        const ColumnRawPtrsVector & key_columns_,
+        const SizesVector & key_sizes_,
+        bool is_asof_join,
+        bool is_join_get_)
         : key_columns(key_columns_)
         , key_sizes(key_sizes_)
         , rows_to_add(block.rows())
         , asof_type(join.getAsofType())
         , asof_inequality(join.getAsofInequality())
+        , is_join_get(is_join_get_)
     {
         size_t num_columns_to_add = block_with_columns_to_add.columns();
         if (is_asof_join)
@@ -876,10 +877,24 @@ public:
         if constexpr (has_defaults)
             applyLazyDefaults();
 
-        for (size_t j = 0, size = right_indexes.size(); j < size; ++j)
+        if (is_join_get)
         {
-            const auto clmn = block.getByPosition(right_indexes[j]).column;
-            columns[j]->insertFrom(*clmn, row_num);
+            /// If it's joinGetOrNull, we need to wrap not-nullable columns in StorageJoin.
+            for (size_t j = 0, size = right_indexes.size(); j < size; ++j)
+            {
+                const auto & column = *block.getByPosition(right_indexes[j]).column;
+                if (auto * nullable_col = typeid_cast<ColumnNullable *>(columns[j].get()); nullable_col && !column.isNullable())
+                    nullable_col->insertFromNotNullable(column, row_num);
+                else
+                    columns[j]->insertFrom(column, row_num);
+            }
+        }
+        else
+        {
+            for (size_t j = 0, size = right_indexes.size(); j < size; ++j)
+            {
+                columns[j]->insertFrom(*block.getByPosition(right_indexes[j]).column, row_num);
+            }
         }
     }
 
@@ -920,6 +935,7 @@ private:
     std::optional<TypeIndex> asof_type;
     ASOF::Inequality asof_inequality;
     const IColumn * left_asof_key = nullptr;
+    bool is_join_get;
 
     void addColumn(const ColumnWithTypeAndName & src_column, const std::string & qualified_name)
     {
@@ -1337,7 +1353,8 @@ std::unique_ptr<AddedColumns> HashJoin::makeAddedColumns(
     Block & block,
     const NamesVector & key_names_left_vector,
     const Block & block_with_columns_to_add,
-    const std::vector<const Maps*> & maps_) const
+    const std::vector<const Maps*> & maps_,
+    bool is_join_get) const
 {
     constexpr JoinFeatures<KIND, STRICTNESS> jf;
 
@@ -1375,7 +1392,7 @@ std::unique_ptr<AddedColumns> HashJoin::makeAddedColumns(
       *  but they will not be used at this stage of joining (and will be in `AdderNonJoined`), and they need to be skipped.
       * For ASOF, the last column is used as the ASOF column
       */
-    auto added_columns = std::make_unique<AddedColumns>(block_with_columns_to_add, block, savedBlockSample(), *this, left_key_columns_vector, key_sizes, jf.is_asof_join);
+    auto added_columns = std::make_unique<AddedColumns>(block_with_columns_to_add, block, savedBlockSample(), *this, left_key_columns_vector, key_sizes, jf.is_asof_join, is_join_get);
 
     bool has_required_right_keys = (required_right_keys.columns() != 0);
     added_columns->need_filter = jf.need_filter || has_required_right_keys;
@@ -1411,11 +1428,10 @@ void HashJoin::joinBlockImpl(
         for (size_t i = 0; i < required_right_keys.columns(); ++i)
         {
             const auto & right_key = required_right_keys.getByPosition(i);
+            // renamed ???
             if (!block.findByName(right_key.name))
             {
                 const auto & left_name = required_right_keys_sources[i];
-
-                // is it guaranteed that left_name in existing columns ?
 
                 /// asof column is already in block.
                 if (jf.is_asof_join && right_key.name == key_names_right[0].back())
@@ -1424,7 +1440,11 @@ void HashJoin::joinBlockImpl(
                 const auto & col = block.getByName(left_name);
                 bool is_nullable = nullable_right_side || right_key.type->isNullable();
                 auto right_col_name = getTableJoin().renamedRightColumnName(right_key.name);
-                block.insert(correctNullability({col.column, col.type, right_col_name}, is_nullable));
+                ColumnWithTypeAndName right_col(col.column, col.type, right_col_name);
+                if (right_col.type->lowCardinality() != right_key.type->lowCardinality())
+                    JoinCommon::changeLowCardinalityInplace(right_col);
+                right_col = correctNullability(std::move(right_col), is_nullable);
+                block.insert(right_col);
             }
         }
     }
@@ -1451,8 +1471,12 @@ void HashJoin::joinBlockImpl(
                 bool is_nullable = nullable_right_side || right_key.type->isNullable();
 
                 ColumnPtr thin_column = filterWithBlanks(col.column, filter);
-                // auto right_col_name = getTableJoin().renamedRightColumnName(right_key.name);
-                block.insert(correctNullability({thin_column, col.type, right_col_name}, is_nullable, null_map_filter));
+
+                ColumnWithTypeAndName right_col(thin_column, col.type, right_col_name);
+                if (right_col.type->lowCardinality() != right_key.type->lowCardinality())
+                    JoinCommon::changeLowCardinalityInplace(right_col);
+                right_col = correctNullability(std::move(right_col), is_nullable, null_map_filter);
+                block.insert(right_col);
 
                 if constexpr (jf.need_replication)
                     right_keys_to_replicate.push_back(block.getPositionByName(right_key.name));
@@ -1617,13 +1641,11 @@ ColumnWithTypeAndName HashJoin::joinGet(const Block & block, const Block & block
     maps_vector.push_back(&std::get<MapsOne>(data->maps[0]));
 
     auto added_columns = makeAddedColumns<ASTTableJoin::Kind::Left, ASTTableJoin::Strictness::Any>(
-        keys, key_names_right, block_with_columns_to_add, maps_vector);
+        keys, key_names_right, block_with_columns_to_add, maps_vector, /* is_join_get  */ true);
 
 
     joinBlockImpl<ASTTableJoin::Kind::Left, ASTTableJoin::Strictness::Any>(
         keys, std::move(added_columns), existing_columns);
-
-
     return keys.getByPosition(keys.columns() - 1);
 }
 
