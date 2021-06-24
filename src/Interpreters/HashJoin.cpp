@@ -198,7 +198,7 @@ HashJoin::HashJoin(std::shared_ptr<TableJoin> table_join_, const Block & right_s
     , right_sample_block(right_sample_block_)
     , log(&Poco::Logger::get("HashJoin"))
 {
-    LOG_TRACE(log, "Right sample block in ctor: {}", right_sample_block.dumpStructure());
+    LOG_TRACE(log, "Right sample block: {}", right_sample_block.dumpStructure());
     bool multiple_disjuncts = key_names_right.size() > 1;
 
     if (multiple_disjuncts)
@@ -919,8 +919,6 @@ public:
 
     const ColumnRawPtrsVector key_columns;
     const SizesVector key_sizes;
-
-
     size_t rows_to_add;
     std::unique_ptr<IColumn::Offsets> offsets_to_replicate;
     bool need_filter = false;
@@ -1045,7 +1043,7 @@ public:
 };
 
 template <typename Map, bool add_missing, bool multiple_disjuncts>
-void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset, KnownRowsHolder<multiple_disjuncts> & known_rows)
+void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & added, IColumn::Offset & current_offset, KnownRowsHolder<multiple_disjuncts> & known_rows [[maybe_unused]])
 {
     if constexpr (add_missing)
         added.applyLazyDefaults();
@@ -1054,7 +1052,7 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
 
     for (auto it = mapped.begin(); it.ok(); ++it)
     {
-        if (!known_rows.isKnown(std::make_pair(it->block, it->row_num)))
+        if (!multiple_disjuncts || !known_rows.isKnown(std::make_pair(it->block, it->row_num)))
         {
             added.appendFromBlock<false>(*it->block, it->row_num);
             ++current_offset;

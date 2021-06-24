@@ -11,5 +11,4 @@ namespace DB
   */
 ColumnPtr extractNestedColumnsAndNullMap(ColumnRawPtrs & key_columns, ConstNullMapPtr & null_map);
 
-
 }

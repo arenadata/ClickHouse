@@ -414,9 +414,6 @@ NotJoined::NotJoined(const TableJoin & table_join, const Block & saved_block_sam
     Block sample_block_with_columns_to_add;
     Block required_right_keys;
 
-    LOG_TRACE(&Poco::Logger::get("NotJoined"), "ctor saved_block_sample_ {} right_sample_block {} result_sample_block {}",
-        saved_block_sample_.dumpStructure(), right_sample_block.dumpStructure(), result_sample_block.dumpStructure());
-
     bool multiple_disjuncts = table_join.keyNamesRight().size() > 1;
     if (multiple_disjuncts)
     {

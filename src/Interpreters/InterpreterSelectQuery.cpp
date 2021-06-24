@@ -1006,9 +1006,6 @@ void InterpreterSelectQuery::executeImpl(QueryPlan & query_plan, const BlockInpu
             query_plan.addStep(std::move(prepared_source_step));
         }
 
-        // LOG_TRACE(&Poco::Logger::get("InterpreterSelectQuery"), "10 executeImpl header {}", query_plan.getCurrentDataStream().header.dumpStructure());
-
-
         if (from_stage == QueryProcessingStage::WithMergeableState &&
             options.to_stage == QueryProcessingStage::WithMergeableState)
             intermediate_stage = true;
@@ -1109,7 +1106,6 @@ void InterpreterSelectQuery::executeImpl(QueryPlan & query_plan, const BlockInpu
                 array_join_step->setStepDescription("ARRAY JOIN");
                 query_plan.addStep(std::move(array_join_step));
             }
-            LOG_TRACE(&Poco::Logger::get("InterpreterSelectQuery"), "95 executeImpl header {}", query_plan.getCurrentDataStream().header.dumpStructure());
 
             if (expressions.before_join)
             {
@@ -1117,9 +1113,7 @@ void InterpreterSelectQuery::executeImpl(QueryPlan & query_plan, const BlockInpu
                     query_plan.getCurrentDataStream(),
                     expressions.before_join);
                 before_join_step->setStepDescription("Before JOIN");
-                LOG_TRACE(&Poco::Logger::get("InterpreterSelectQuery"), "98 executeImpl header {}", before_join_step->getInputStreams().front().header.dumpStructure());
                 query_plan.addStep(std::move(before_join_step));
-                LOG_TRACE(&Poco::Logger::get("InterpreterSelectQuery"), "99 executeImpl header {}", query_plan.getCurrentDataStream().header.dumpStructure());
             }
 
             /// Optional step to convert key columns to common supertype.
