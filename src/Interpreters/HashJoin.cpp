@@ -1048,16 +1048,16 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
     if constexpr (add_missing)
         added.applyLazyDefaults();
 
-    [[maybe_unused]] std::unique_ptr<std::vector<KnownRowsHolder<true>::Type>> new_known_rows_ptr;
-
-    for (auto it = mapped.begin(); it.ok(); ++it)
+    if constexpr (multiple_disjuncts)
     {
-        if (!multiple_disjuncts || !known_rows.isKnown(std::make_pair(it->block, it->row_num)))
+        std::unique_ptr<std::vector<KnownRowsHolder<true>::Type>> new_known_rows_ptr;
+
+        for (auto it = mapped.begin(); it.ok(); ++it)
         {
-            added.appendFromBlock<false>(*it->block, it->row_num);
-            ++current_offset;
-            if constexpr (multiple_disjuncts)
+            if (!known_rows.isKnown(std::make_pair(it->block, it->row_num)))
             {
+                added.appendFromBlock<false>(*it->block, it->row_num);
+                ++current_offset;
                 if (!new_known_rows_ptr)
                 {
                     new_known_rows_ptr = std::make_unique<std::vector<KnownRowsHolder<true>::Type>>();
@@ -1068,13 +1068,18 @@ void addFoundRowAll(const typename Map::mapped_type & mapped, AddedColumns & add
                 block_with_flags->flags[it->row_num].store(true, std::memory_order_relaxed);
             }
         }
-    }
 
-    if constexpr (multiple_disjuncts)
-    {
         if (new_known_rows_ptr)
         {
             known_rows.add(std::cbegin(*new_known_rows_ptr), std::cend(*new_known_rows_ptr));
+        }
+    }
+    else
+    {
+        for (auto it = mapped.begin(); it.ok(); ++it)
+        {
+            added.appendFromBlock<false>(*it->block, it->row_num);
+            ++current_offset;
         }
     }
 };
