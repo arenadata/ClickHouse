@@ -1,90 +1,112 @@
 #include <Storages/MergeTree/IMergedBlockOutputStream.h>
-#include <IO/createWriteBufferFromFileBase.h>
 #include <Storages/MergeTree/MergeTreeIOSettings.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/IMergeTreeDataPartWriter.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
-IMergedBlockOutputStream::IMergedBlockOutputStream(
-    const MergeTreeDataPartPtr & data_part,
-    const StorageMetadataPtr & metadata_snapshot_)
-    : storage(data_part->storage)
-    , metadata_snapshot(metadata_snapshot_)
-    , volume(data_part->volume)
-    , part_path(data_part->isStoredOnDisk() ? data_part->getFullRelativePath() : "")
+
+namespace MergeTreeSetting
 {
+    extern const MergeTreeSettingsFloat ratio_of_defaults_for_sparse_serialization;
+    extern const MergeTreeSettingsMergeTreeSerializationInfoVersion serialization_info_version;
+    extern const MergeTreeSettingsMergeTreeStringSerializationVersion string_serialization_version;
+    extern const MergeTreeSettingsMergeTreeNullableSerializationVersion nullable_serialization_version;
+    extern const MergeTreeSettingsBool propagate_types_serialization_versions_to_nested_types;
+    extern const MergeTreeSettingsMergeTreeMapSerializationVersion map_serialization_version;
 }
 
-Block IMergedBlockOutputStream::getBlockAndPermute(const Block & block, const Names & names, const IColumn::Permutation * permutation)
-{
-    Block result;
-    for (size_t i = 0, size = names.size(); i < size; ++i)
+IMergedBlockOutputStream::IMergedBlockOutputStream(
+    MergeTreeSettingsPtr storage_settings_,
+    MutableDataPartStoragePtr data_part_storage_,
+    const StorageMetadataPtr & metadata_snapshot_,
+    const NamesAndTypesList & columns_list,
+    bool reset_columns_)
+    : storage_settings(std::move(storage_settings_))
+    , metadata_snapshot(metadata_snapshot_)
+    , data_part_storage(std::move(data_part_storage_))
+    , reset_columns(reset_columns_)
+    , info_settings
     {
-        const auto & name = names[i];
-        result.insert(i, block.getByName(name));
-
-        /// Reorder primary key columns in advance and add them to `primary_key_columns`.
-        if (permutation)
-        {
-            auto & column = result.getByPosition(i);
-            column.column = column.column->permute(*permutation, 0);
-        }
+        (*storage_settings)[MergeTreeSetting::ratio_of_defaults_for_sparse_serialization],
+        false,
+        (*storage_settings)[MergeTreeSetting::serialization_info_version],
+        (*storage_settings)[MergeTreeSetting::string_serialization_version],
+        (*storage_settings)[MergeTreeSetting::nullable_serialization_version],
+        (*storage_settings)[MergeTreeSetting::map_serialization_version],
+        (*storage_settings)[MergeTreeSetting::propagate_types_serialization_versions_to_nested_types],
     }
-
-    return result;
+    , new_serialization_infos(info_settings)
+{
+    if (reset_columns)
+        new_serialization_infos = SerializationInfoByName(columns_list, info_settings);
 }
 
 NameSet IMergedBlockOutputStream::removeEmptyColumnsFromPart(
     const MergeTreeDataPartPtr & data_part,
     NamesAndTypesList & columns,
+    const NameSet & empty_columns,
+    SerializationInfoByName & serialization_infos,
     MergeTreeData::DataPart::Checksums & checksums)
 {
-    const NameSet & empty_columns = data_part->expired_columns;
-
     /// For compact part we have to override whole file with data, it's not
     /// worth it
     if (empty_columns.empty() || isCompactPart(data_part))
         return {};
 
+    for (const auto & column : empty_columns)
+        LOG_TRACE(data_part->storage.log, "Skipping expired/empty column {} for part {}", column, data_part->name);
+
     /// Collect counts for shared streams of different columns. As an example, Nested columns have shared stream with array sizes.
     std::map<String, size_t> stream_counts;
-    for (const NameAndTypePair & column : columns)
+    for (const auto & column : columns)
     {
-        column.type->enumerateStreams(
-            [&](const IDataType::SubstreamPath & substream_path)
+        data_part->getSerialization(column.name)->enumerateStreams(
+            [&](const ISerialization::SubstreamPath & substream_path)
             {
-                ++stream_counts[IDataType::getFileNameForStream(column.name, substream_path)];
-            },
-            {});
+                auto stream_name = IMergeTreeDataPart::getStreamNameForColumn(column, substream_path, ".bin", checksums, data_part->storage.getSettings());
+                if (stream_name)
+                    ++stream_counts[*stream_name];
+            });
     }
 
     NameSet remove_files;
     const String mrk_extension = data_part->getMarksFileExtension();
     for (const auto & column_name : empty_columns)
     {
-        IDataType::StreamCallback callback = [&](const IDataType::SubstreamPath & substream_path)
+        auto serialization = data_part->tryGetSerialization(column_name);
+        if (!serialization)
+            continue;
+
+        ISerialization::StreamCallback callback = [&](const ISerialization::SubstreamPath & substream_path)
         {
-            String stream_name = IDataType::getFileNameForStream(column_name, substream_path);
+            auto stream_name = IMergeTreeDataPart::getStreamNameForColumn(column_name, substream_path, ".bin", checksums, data_part->storage.getSettings());
+
             /// Delete files if they are no longer shared with another column.
-            if (--stream_counts[stream_name] == 0)
+            if (stream_name && --stream_counts[*stream_name] == 0)
             {
-                remove_files.emplace(stream_name + ".bin");
-                remove_files.emplace(stream_name + mrk_extension);
+                remove_files.emplace(*stream_name + ".bin");
+                remove_files.emplace(*stream_name + mrk_extension);
             }
         };
-        IDataType::SubstreamPath stream_path;
-        auto column_with_type = columns.tryGetByName(column_name);
-        if (column_with_type)
-            column_with_type->type->enumerateStreams(callback, stream_path);
+
+        serialization->enumerateStreams(callback);
+        serialization_infos.erase(column_name);
     }
 
     /// Remove files on disk and checksums
-    for (const String & removed_file : remove_files)
+    for (auto itr = remove_files.begin(); itr != remove_files.end();)
     {
-        if (checksums.files.count(removed_file))
+        if (checksums.files.contains(*itr))
         {
-            data_part->volume->getDisk()->remove(data_part->getFullRelativePath() + removed_file);
-            checksums.files.erase(removed_file);
+            checksums.files.erase(*itr);
+            ++itr;
+        }
+        else /// If we have no file in checksums it doesn't exist on disk
+        {
+            LOG_TRACE(data_part->storage.log, "Files {} doesn't exist in checksums so it doesn't exist on disk, will not try to remove it", *itr);
+            itr = remove_files.erase(itr);
         }
     }
 
@@ -101,6 +123,7 @@ NameSet IMergedBlockOutputStream::removeEmptyColumnsFromPart(
         if (remove_it != columns.end())
             columns.erase(remove_it);
     }
+
     return remove_files;
 }
 

@@ -1,40 +1,50 @@
 #pragma once
 
-#include <Core/Block.h>
-#include <IO/WriteBuffer.h>
-#include <Processors/Formats/IRowOutputFormat.h>
+#include <Processors/Formats/OutputFormatWithUTF8ValidationAdaptor.h>
+#include <Processors/Formats/RowOutputFormatWithExceptionHandlerAdaptor.h>
 #include <Formats/FormatSettings.h>
 
 
 namespace DB
 {
 
+class Block;
+class WriteBuffer;
+
 /** The stream for outputting data in JSON format, by object per line.
-  * Does not validate UTF-8.
   */
-class JSONEachRowRowOutputFormat : public IRowOutputFormat
+class JSONEachRowRowOutputFormat : public RowOutputFormatWithExceptionHandlerAdaptor<RowOutputFormatWithUTF8ValidationAdaptor, bool>
 {
 public:
-    JSONEachRowRowOutputFormat(WriteBuffer & out_, const Block & header_, FormatFactory::WriteCallback callback, const FormatSettings & settings_);
+    JSONEachRowRowOutputFormat(
+        WriteBuffer & out_,
+        SharedHeader header_,
+        const FormatSettings & settings_,
+        bool pretty_json_ = false);
 
     String getName() const override { return "JSONEachRowRowOutputFormat"; }
 
-    void writeField(const IColumn & column, const IDataType & type, size_t row_num) override;
+    bool supportsSpecialSerializationKinds() const override { return settings.allow_special_serialization_kinds; }
+
+protected:
+    void writeField(const IColumn & column, const ISerialization & serialization, size_t row_num) override;
     void writeFieldDelimiter() override;
     void writeRowStartDelimiter() override;
     void writeRowEndDelimiter() override;
+    void writeRowBetweenDelimiter() override;
+    void writePrefix() override;
+    void writeSuffix() override;
 
-protected:
-    /// No totals and extremes.
-    void consumeTotals(Chunk) override {}
-    void consumeExtremes(Chunk) override {}
+    void resetFormatterImpl() override;
 
     size_t field_number = 0;
+    bool pretty_json;
+
+    FormatSettings settings;
+    WriteBuffer * ostr;
 
 private:
     Names fields;
-
-    FormatSettings settings;
 };
 
 }

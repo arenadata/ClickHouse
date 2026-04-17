@@ -49,6 +49,8 @@
     #include <cxxabi.h>
 #endif
 
+// NOLINTBEGIN(readability-identifier-naming, modernize-use-using, bugprone-macro-parentheses, google-explicit-constructor)
+
 /*
  * Abstractions for compiler-specific directives
  */
@@ -90,7 +92,6 @@
     #define PCG_EMULATED_128BIT_MATH 1
 #endif
 
-
 namespace pcg_extras {
 
 /*
@@ -110,7 +111,7 @@ namespace pcg_extras {
 /*
  * C++ requires us to be able to serialize RNG state by printing or reading
  * it from a stream.  Because we use 128-bit ints, we also need to be able
- * ot print them, so here is code to do so.
+ * or print them, so here is code to do so.
  *
  * This code provides enough functionality to print 128-bit ints in decimal
  * and zero-padded in hex.  It's not a full-featured implementation.
@@ -253,7 +254,7 @@ inline std::istream& operator>>(std::istream& in, uint8_t& value)
  */
 
 /*
- * XorShifts are invertable, but they are someting of a pain to invert.
+ * XorShifts are invertable, but they are something of a pain to invert.
  * This function backs them out.  It's used by the whacky "inside out"
  * generator defined later.
  */
@@ -447,69 +448,6 @@ inline SrcIter uneven_copy(SrcIter src_first,
                             std::integral_constant<bool, DEST_IS_SMALLER>{});
 }
 
-/* generate_to, fill in a fixed-size array of integral type using a SeedSeq
- * (actually works for any random-access iterator)
- */
-
-template <size_t size, typename SeedSeq, typename DestIter>
-inline void generate_to_impl(SeedSeq&& generator, DestIter dest,
-                             std::true_type)
-{
-    generator.generate(dest, dest+size);
-}
-
-template <size_t size, typename SeedSeq, typename DestIter>
-void generate_to_impl(SeedSeq&& generator, DestIter dest,
-                      std::false_type)
-{
-    typedef typename std::iterator_traits<DestIter>::value_type dest_t;
-    constexpr auto DEST_SIZE = sizeof(dest_t);
-    constexpr auto GEN_SIZE  = sizeof(uint32_t);
-
-    constexpr bool GEN_IS_SMALLER = GEN_SIZE < DEST_SIZE;
-    constexpr size_t FROM_ELEMS =
-        GEN_IS_SMALLER
-            ? size * ((DEST_SIZE+GEN_SIZE-1) / GEN_SIZE)
-            : (size + (GEN_SIZE / DEST_SIZE) - 1)
-                / ((GEN_SIZE / DEST_SIZE) + GEN_IS_SMALLER);
-                        //  this odd code ^^^^^^^^^^^^^^^^^ is work-around for
-                        //  a bug: http://llvm.org/bugs/show_bug.cgi?id=21287
-
-    if (FROM_ELEMS <= 1024) {
-        uint32_t buffer[FROM_ELEMS];
-        generator.generate(buffer, buffer+FROM_ELEMS);
-        uneven_copy(buffer, dest, dest+size);
-    } else {
-        uint32_t* buffer = static_cast<uint32_t*>(malloc(GEN_SIZE * FROM_ELEMS));
-        generator.generate(buffer, buffer+FROM_ELEMS);
-        uneven_copy(buffer, dest, dest+size);
-        free(static_cast<void*>(buffer));
-    }
-}
-
-template <size_t size, typename SeedSeq, typename DestIter>
-inline void generate_to(SeedSeq&& generator, DestIter dest)
-{
-    typedef typename std::iterator_traits<DestIter>::value_type dest_t;
-    constexpr bool IS_32BIT = sizeof(dest_t) == sizeof(uint32_t);
-
-    generate_to_impl<size>(std::forward<SeedSeq>(generator), dest,
-                           std::integral_constant<bool, IS_32BIT>{});
-}
-
-/* generate_one, produce a value of integral type using a SeedSeq
- * (optionally, we can have it produce more than one and pick which one
- * we want)
- */
-
-template <typename UInt, size_t i = 0UL, size_t N = i+1UL, typename SeedSeq>
-inline UInt generate_one(SeedSeq&& generator)
-{
-    UInt result[N];
-    generate_to<N>(std::forward<SeedSeq>(generator), result);
-    return result[i];
-}
-
 template <typename RngType>
 auto bounded_rand(RngType& rng, typename RngType::result_type upper_bound)
         -> typename RngType::result_type
@@ -525,7 +463,7 @@ auto bounded_rand(RngType& rng, typename RngType::result_type upper_bound)
 }
 
 template <typename Iter, typename RandType>
-void shuffle(Iter from, Iter to, RandType&& rng)
+void shuffle(Iter from, Iter to, RandType&& rng) // NOLINT(cppcoreguidelines-missing-std-forward)
 {
     typedef typename std::iterator_traits<Iter>::difference_type delta_t;
     typedef typename std::remove_reference<RandType>::type::result_type result_t;
@@ -614,5 +552,7 @@ std::ostream& operator<<(std::ostream& out, printable_typename<T>) {
 #endif  // __cpp_rtti || __GXX_RTTI
 
 } // namespace pcg_extras
+
+// NOLINTEND(readability-identifier-naming, modernize-use-using, bugprone-macro-parentheses, google-explicit-constructor)
 
 #endif // PCG_EXTRAS_HPP_INCLUDED

@@ -11,17 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import http.client
 import os
 import sys
-import httplib
 
 CURDIR = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, CURDIR)
 
+from queue import Empty, Queue
+from threading import Event, Thread
+
 import uexpect
 
-from threading import Thread, Event
-from Queue import Queue, Empty
 
 class IO(uexpect.IO):
     def __init__(self, connection, response, queue, reader):
@@ -33,10 +34,10 @@ class IO(uexpect.IO):
         raise NotImplementedError
 
     def close(self, force=True):
-        self.reader['kill_event'].set()
+        self.reader["kill_event"].set()
         self.connection.close()
         if self._logger:
-            self._logger.write('\n')
+            self._logger.write("\n")
             self._logger.flush()
 
 
@@ -45,15 +46,16 @@ def reader(response, queue, kill_event):
         try:
             if kill_event.is_set():
                 break
-            data = response.read(1)
+            data = response.read(1).decode()
             queue.put(data)
-        except Exception, e:
+        except Exception as e:
             if kill_event.is_set():
                 break
             raise
 
+
 def spawn(connection, request):
-    connection = httplib.HTTPConnection(**connection)
+    connection = http.client.HTTPConnection(**connection)
     connection.request(**request)
     response = connection.getresponse()
 
@@ -63,11 +65,20 @@ def spawn(connection, request):
     thread.daemon = True
     thread.start()
 
-    return IO(connection, response, queue, reader={'thread':thread, 'kill_event':reader_kill_event})
+    return IO(
+        connection,
+        response,
+        queue,
+        reader={"thread": thread, "kill_event": reader_kill_event},
+    )
 
-if __name__ == '__main__':
-    with http({'host':'localhost','port':8123},{'method':'GET', 'url':'?query=SELECT%201'}) as client:
+
+if __name__ == "__main__":
+    with spawn(
+        {"host": "localhost", "port": 8123},
+        {"method": "GET", "url": "?query=SELECT%201"},
+    ) as client:
         client.logger(sys.stdout)
         client.timeout(2)
-        print client.response.status, client.response.reason
-        client.expect('1\n')
+        print(client.response.status, client.response.reason)
+        client.expect("1\n")

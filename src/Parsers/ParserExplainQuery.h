@@ -8,18 +8,24 @@ namespace DB
 
 class ParserExplainQuery : public IParserBase
 {
-public:
-    explicit ParserExplainQuery(bool enable_debug_queries_ = false)
-        : enable_debug_queries(enable_debug_queries_)
-    {
-    }
-
 protected:
+    const char * end;
+    bool allow_settings_after_format_in_insert;
+    bool select_only;
+
     const char * getName() const override { return "EXPLAIN"; }
     bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+public:
+    explicit ParserExplainQuery(const char* end_, bool allow_settings_after_format_in_insert_)
+        : end(end_)
+        , allow_settings_after_format_in_insert(allow_settings_after_format_in_insert_)
+        , select_only(false)
+    {}
 
-private:
-    bool enable_debug_queries;
+    explicit ParserExplainQuery()
+        : end(nullptr) , allow_settings_after_format_in_insert(false) , select_only(true)
+    {}
+
 };
 
 }

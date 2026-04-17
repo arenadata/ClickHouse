@@ -1,117 +1,98 @@
 #pragma once
 
-#include <mutex>
-#include <memory>
-#include <Common/Stopwatch.h>
-#include <Common/Exception.h>
+#include <Common/IThrottler.h>
 #include <Common/ProfileEvents.h>
-#include <common/sleep.h>
-#include <IO/WriteHelpers.h>
 
-
-namespace ProfileEvents
-{
-    extern const Event ThrottlerSleepMicroseconds;
-}
-
+#include <mutex>
+#include <base/sleep.h>
+#include <base/types.h>
+#include <atomic>
 
 namespace DB
 {
 
-namespace ErrorCodes
-{
-    extern const int LIMIT_EXCEEDED;
-}
-
-
-/** Allows you to limit the speed of something (in entities per second) using sleep.
-  * Specifics of work:
-  * - only the average speed is considered, from the moment of the first call of `add` function;
-  *   if there were periods with low speed, then during some time after them, the speed will be higher;
-  *
-  * Also allows you to set a limit on the maximum number of entities. If exceeded, an exception will be thrown.
+/** Allows you to limit the speed of something (in tokens per second) using sleep.
+  * Implemented using Token Bucket Throttling algorithm.
+  * Also allows you to set a limit on the maximum number of tokens. If exceeded, an exception will be thrown.
   */
-class Throttler
+class Throttler : public IThrottler
 {
 public:
-    Throttler(size_t max_speed_, const std::shared_ptr<Throttler> & parent_ = nullptr)
-            : max_speed(max_speed_), limit_exceeded_exception_message(""), parent(parent_) {}
+    static const size_t default_burst_seconds = 1;
+
+    Throttler(size_t max_speed_, size_t max_burst_, const ThrottlerPtr & parent_ = nullptr,
+            ProfileEvents::Event event_amount_ = ProfileEvents::end(),
+            ProfileEvents::Event event_sleep_us_ = ProfileEvents::end())
+        : max_speed(max_speed_), max_burst(max_burst_), limit_exceeded_exception_message(""), tokens(static_cast<double>(max_burst)), parent(parent_)
+        , event_amount(event_amount_), event_sleep_us(event_sleep_us_)
+    {}
+
+    Throttler(size_t max_speed_, size_t max_burst_,
+            ProfileEvents::Event event_amount_ = ProfileEvents::end(),
+            ProfileEvents::Event event_sleep_us_ = ProfileEvents::end())
+        : max_speed(max_speed_), max_burst(max_burst_), limit_exceeded_exception_message(""), tokens(static_cast<double>(max_burst))
+        , event_amount(event_amount_), event_sleep_us(event_sleep_us_)
+    {}
+
+    explicit Throttler(size_t max_speed_, const ThrottlerPtr & parent_ = nullptr,
+        ProfileEvents::Event event_amount_ = ProfileEvents::end(),
+        ProfileEvents::Event event_sleep_us_ = ProfileEvents::end());
+
+    Throttler(size_t max_speed_,
+        ProfileEvents::Event event_amount_,
+        ProfileEvents::Event event_sleep_us_);
+
+    Throttler(size_t max_speed_, size_t max_burst_, size_t limit_, const char * limit_exceeded_exception_message_,
+              const ThrottlerPtr & parent_ = nullptr)
+        : max_speed(max_speed_), max_burst(max_burst_), limit(limit_), limit_exceeded_exception_message(limit_exceeded_exception_message_), tokens(static_cast<double>(max_burst)), parent(parent_) {}
 
     Throttler(size_t max_speed_, size_t limit_, const char * limit_exceeded_exception_message_,
-              const std::shared_ptr<Throttler> & parent_ = nullptr)
-        : max_speed(max_speed_), limit(limit_), limit_exceeded_exception_message(limit_exceeded_exception_message_), parent(parent_) {}
+              const ThrottlerPtr & parent_ = nullptr);
 
-    void add(const size_t amount)
-    {
-        size_t new_count;
-        UInt64 elapsed_ns = 0;
-
-        {
-            std::lock_guard lock(mutex);
-
-            if (max_speed)
-            {
-                if (0 == count)
-                {
-                    watch.start();
-                    elapsed_ns = 0;
-                }
-                else
-                    elapsed_ns = watch.elapsed();
-            }
-
-            count += amount;
-            new_count = count;
-        }
-
-        if (limit && new_count > limit)
-            throw Exception(limit_exceeded_exception_message + std::string(" Maximum: ") + toString(limit), ErrorCodes::LIMIT_EXCEEDED);
-
-        if (max_speed)
-        {
-            /// How much time to wait for the average speed to become `max_speed`.
-            UInt64 desired_ns = new_count * 1000000000 / max_speed;
-
-            if (desired_ns > elapsed_ns)
-            {
-                UInt64 sleep_ns = desired_ns - elapsed_ns;
-                sleepForNanoseconds(sleep_ns);
-
-                ProfileEvents::increment(ProfileEvents::ThrottlerSleepMicroseconds, sleep_ns / 1000UL);
-            }
-        }
-
-        if (parent)
-            parent->add(amount);
-    }
+    /// Use `amount` tokens, sleeps if required or throws exception on limit overflow.
+    /// Returns true if blocking was applied, false if no blocking was needed.
+    bool throttle(size_t amount, size_t max_block_ns) override;
 
     /// Not thread safe
-    void setParent(const std::shared_ptr<Throttler> & parent_)
+    void setParent(const ThrottlerPtr & parent_)
     {
         parent = parent_;
     }
 
-    void reset()
-    {
-        std::lock_guard lock(mutex);
+    /// Reset all throttlers internal stats
+    void reset();
 
-        count = 0;
-        watch.reset();
-    }
+    /// Is throttler already accumulated some sleep time and throttling.
+    bool isThrottling() const override;
+
+    Int64 getAvailable() override;
+    UInt64 getMaxSpeed() const override;
+    UInt64 getMaxBurst() const override;
+
+    void setMaxSpeed(size_t max_speed_);
 
 private:
-    size_t count = 0;
-    const size_t max_speed = 0;
-    const UInt64 limit = 0;        /// 0 - not limited.
+    void throttleImpl(size_t amount, size_t & count_value, double & tokens_value);
+    void throttleImpl(size_t amount, size_t & count_value, double & tokens_value, size_t & max_speed_value);
+
+    size_t count{0};
+    size_t max_speed TSA_GUARDED_BY(mutex){0}; /// in tokens per second.
+    size_t max_burst TSA_GUARDED_BY(mutex){0}; /// in tokens.
+    const UInt64 limit{0}; /// 0 - not limited.
     const char * limit_exceeded_exception_message = nullptr;
-    Stopwatch watch {CLOCK_MONOTONIC_COARSE};
-    std::mutex mutex;
+    mutable std::mutex mutex;
+    std::atomic<UInt64> block_count{0}; // Number of threads currently under throttling
+    double tokens{0}; /// Amount of tokens available in token bucket. Updated in `throttle` method.
+    UInt64 prev_ns{0}; /// Previous `throttle` call time (in nanoseconds).
 
     /// Used to implement a hierarchy of throttlers
-    std::shared_ptr<Throttler> parent;
+    ThrottlerPtr parent;
+
+    /// Event to increment when throttler uses tokens
+    ProfileEvents::Event event_amount{ProfileEvents::end()};
+
+    /// Event to increment when throttler sleeps
+    ProfileEvents::Event event_sleep_us{ProfileEvents::end()};
 };
-
-
-using ThrottlerPtr = std::shared_ptr<Throttler>;
 
 }

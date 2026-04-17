@@ -1,44 +1,111 @@
+#include <type_traits>
+#include <Interpreters/ExpressionActions.h>
 #include <Processors/QueryPlan/UnionStep.h>
-#include <Processors/QueryPipeline.h>
+#include <Processors/QueryPlan/QueryPlanStepRegistry.h>
+#include <Processors/QueryPlan/Serialization.h>
 #include <Processors/Sources/NullSource.h>
-#include <Interpreters/Context.h>
+#include <Processors/Transforms/ExpressionTransform.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
+#include <base/defines.h>
 
 namespace DB
 {
 
-UnionStep::UnionStep(DataStreams input_streams_, Block result_header, size_t max_threads_)
-    : header(std::move(result_header))
-    , max_threads(max_threads_)
+namespace ErrorCodes
 {
-    input_streams = std::move(input_streams_);
-
-    if (input_streams.size() == 1)
-        output_stream = input_streams.front();
-    else
-        output_stream = DataStream{.header = header};
+    extern const int LOGICAL_ERROR;
 }
 
-QueryPipelinePtr UnionStep::updatePipeline(QueryPipelines pipelines)
+static SharedHeader checkHeaders(const SharedHeaders & input_headers)
 {
-    auto pipeline = std::make_unique<QueryPipeline>();
-    QueryPipelineProcessorsCollector collector(*pipeline, this);
+    if (input_headers.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot unite an empty set of query plan steps");
+
+    auto res = input_headers.front();
+    for (const auto & header : input_headers)
+        assertBlocksHaveEqualStructure(*header, *res, "UnionStep");
+
+    return res;
+}
+
+UnionStep::UnionStep(SharedHeaders input_headers_, size_t max_threads_)
+    : max_threads(max_threads_)
+{
+    updateInputHeaders(std::move(input_headers_));
+}
+
+void UnionStep::updateOutputHeader()
+{
+    output_header = checkHeaders(input_headers);
+}
+
+QueryPipelineBuilderPtr UnionStep::updatePipeline(QueryPipelineBuilders pipelines, const BuildQueryPipelineSettings & settings)
+{
+    auto pipeline = std::make_unique<QueryPipelineBuilder>();
 
     if (pipelines.empty())
     {
-        pipeline->init(Pipe(std::make_shared<NullSource>(output_stream->header)));
+        QueryPipelineProcessorsCollector collector(*pipeline, this);
+        pipeline->init(Pipe(std::make_shared<NullSource>(output_header)));
         processors = collector.detachProcessors();
         return pipeline;
     }
 
-    pipeline->unitePipelines(std::move(pipelines), output_stream->header ,max_threads);
+    size_t new_max_threads = max_threads ? max_threads : settings.max_threads;
 
-    processors = collector.detachProcessors();
+    for (auto & cur_pipeline : pipelines)
+    {
+        /// Headers for union must be equal.
+        /// But, just in case, convert it to the same header if not.
+        /// This can happen when PREWHERE optimization adds extra pass-through columns
+        /// to ReadFromMergeTree output that are not consumed by the expression DAG above,
+        /// causing plan headers and pipeline headers to diverge.
+        if (!blocksHaveEqualStructure(cur_pipeline->getHeader(), *getOutputHeader()))
+        {
+            QueryPipelineProcessorsCollector collector(*cur_pipeline, this);
+            auto converting_dag = ActionsDAG::makeConvertingActions(
+                cur_pipeline->getHeader().getColumnsWithTypeAndName(),
+                getOutputHeader()->getColumnsWithTypeAndName(),
+                ActionsDAG::MatchColumnsMode::Name,
+                nullptr);
+
+            auto converting_actions = std::make_shared<ExpressionActions>(std::move(converting_dag));
+            cur_pipeline->addSimpleTransform([&](const SharedHeader & cur_header)
+            {
+                return std::make_shared<ExpressionTransform>(cur_header, converting_actions);
+            });
+
+            auto added_processors = collector.detachProcessors();
+            processors.insert(processors.end(), added_processors.begin(), added_processors.end());
+        }
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+        assertCompatibleHeader(cur_pipeline->getHeader(), *getOutputHeader(), "UnionStep");
+#endif
+    }
+
+    *pipeline = QueryPipelineBuilder::unitePipelines(std::move(pipelines), new_max_threads, &processors);
     return pipeline;
 }
 
 void UnionStep::describePipeline(FormatSettings & settings) const
 {
     IQueryPlanStep::describePipeline(processors, settings);
+}
+
+void UnionStep::serialize(Serialization & ctx) const
+{
+    (void)ctx;
+}
+
+QueryPlanStepPtr UnionStep::deserialize(Deserialization & ctx)
+{
+    return std::make_unique<UnionStep>(ctx.input_headers);
+}
+
+void registerUnionStep(QueryPlanStepRegistry & registry)
+{
+    registry.registerStep("Union", &UnionStep::deserialize);
 }
 
 }

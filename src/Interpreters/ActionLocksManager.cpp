@@ -1,5 +1,6 @@
-#include "ActionLocksManager.h"
+#include <Interpreters/ActionLocksManager.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
 #include <Databases/IDatabase.h>
 #include <Storages/IStorage.h>
 
@@ -16,32 +17,21 @@ namespace ActionLocks
     extern const StorageActionBlockType DistributedSend = 5;
     extern const StorageActionBlockType PartsTTLMerge = 6;
     extern const StorageActionBlockType PartsMove = 7;
+    extern const StorageActionBlockType PullReplicationLog = 8;
+    extern const StorageActionBlockType Cleanup = 9;
+    extern const StorageActionBlockType ViewRefresh = 10;
+    extern const StorageActionBlockType VirtualPartsUpdate = 11;
+    extern const StorageActionBlockType ReduceBlockingParts = 12;
 }
 
 
-ActionLocksManager::ActionLocksManager(const Context & context)
-        : global_context(context.getGlobalContext())
+ActionLocksManager::ActionLocksManager(ContextPtr context_) : WithContext(context_->getGlobalContext())
 {
-}
-
-template <typename F>
-inline void forEachTable(F && f, const Context & context)
-{
-    for (auto & elem : DatabaseCatalog::instance().getDatabases())
-        for (auto iterator = elem.second->getTablesIterator(context); iterator->isValid(); iterator->next())
-            if (auto table = iterator->table())
-                f(table);
-
-}
-
-void ActionLocksManager::add(StorageActionBlockType action_type, const Context & context)
-{
-    forEachTable([&](const StoragePtr & table) { add(table, action_type); }, context);
 }
 
 void ActionLocksManager::add(const StorageID & table_id, StorageActionBlockType action_type)
 {
-    if (auto table = DatabaseCatalog::instance().tryGetTable(table_id, global_context))
+    if (auto table = DatabaseCatalog::instance().tryGetTable(table_id, getContext()))
         add(table, action_type);
 }
 
@@ -56,17 +46,9 @@ void ActionLocksManager::add(const StoragePtr & table, StorageActionBlockType ac
     }
 }
 
-void ActionLocksManager::remove(StorageActionBlockType action_type)
-{
-    std::lock_guard lock(mutex);
-
-    for (auto & storage_elem : storage_locks)
-        storage_elem.second.erase(action_type);
-}
-
 void ActionLocksManager::remove(const StorageID & table_id, StorageActionBlockType action_type)
 {
-    if (auto table = DatabaseCatalog::instance().tryGetTable(table_id, global_context))
+    if (auto table = DatabaseCatalog::instance().tryGetTable(table_id, getContext()))
         remove(table, action_type);
 }
 
@@ -74,7 +56,7 @@ void ActionLocksManager::remove(const StoragePtr & table, StorageActionBlockType
 {
     std::lock_guard lock(mutex);
 
-    if (storage_locks.count(table.get()))
+    if (storage_locks.contains(table.get()))
         storage_locks[table.get()].erase(action_type);
 }
 

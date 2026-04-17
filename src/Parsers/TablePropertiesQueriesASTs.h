@@ -7,12 +7,28 @@
 namespace DB
 {
 
+struct ASTExistsDatabaseQueryIDAndQueryNames
+{
+    static constexpr auto ID = "ExistsDatabaseQuery";
+    static constexpr auto Query = "EXISTS DATABASE";
+    /// No temporary databases are supported, just for parsing
+    static constexpr auto QueryTemporary = "";
+};
+
 struct ASTExistsTableQueryIDAndQueryNames
 {
     static constexpr auto ID = "ExistsTableQuery";
     static constexpr auto Query = "EXISTS TABLE";
     static constexpr auto QueryTemporary = "EXISTS TEMPORARY TABLE";
 };
+
+struct ASTExistsViewQueryIDAndQueryNames
+{
+    static constexpr auto ID = "ExistsViewQuery";
+    static constexpr auto Query = "EXISTS VIEW";
+    static constexpr auto QueryTemporary = "EXISTS TEMPORARY VIEW";
+};
+
 
 struct ASTExistsDictionaryQueryIDAndQueryNames
 {
@@ -27,6 +43,13 @@ struct ASTShowCreateTableQueryIDAndQueryNames
     static constexpr auto ID = "ShowCreateTableQuery";
     static constexpr auto Query = "SHOW CREATE TABLE";
     static constexpr auto QueryTemporary = "SHOW CREATE TEMPORARY TABLE";
+};
+
+struct ASTShowCreateViewQueryIDAndQueryNames
+{
+    static constexpr auto ID = "ShowCreateViewQuery";
+    static constexpr auto Query = "SHOW CREATE VIEW";
+    static constexpr auto QueryTemporary = "SHOW CREATE TEMPORARY VIEW";
 };
 
 struct ASTShowCreateDatabaseQueryIDAndQueryNames
@@ -52,17 +75,51 @@ struct ASTDescribeQueryExistsQueryIDAndQueryNames
 };
 
 using ASTExistsTableQuery = ASTQueryWithTableAndOutputImpl<ASTExistsTableQueryIDAndQueryNames>;
+using ASTExistsViewQuery = ASTQueryWithTableAndOutputImpl<ASTExistsViewQueryIDAndQueryNames>;
 using ASTExistsDictionaryQuery = ASTQueryWithTableAndOutputImpl<ASTExistsDictionaryQueryIDAndQueryNames>;
 using ASTShowCreateTableQuery = ASTQueryWithTableAndOutputImpl<ASTShowCreateTableQueryIDAndQueryNames>;
+using ASTShowCreateViewQuery = ASTQueryWithTableAndOutputImpl<ASTShowCreateViewQueryIDAndQueryNames>;
 using ASTShowCreateDictionaryQuery = ASTQueryWithTableAndOutputImpl<ASTShowCreateDictionaryQueryIDAndQueryNames>;
+
+class ASTExistsDatabaseQuery : public ASTQueryWithTableAndOutputImpl<ASTExistsDatabaseQueryIDAndQueryNames>
+{
+public:
+    ASTPtr clone() const override
+    {
+        auto res = make_intrusive<ASTExistsDatabaseQuery>(*this);
+        res->children.clear();
+        cloneTableOptions(*res);
+        return res;
+    }
+
+protected:
+    void formatQueryImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    {
+        ostr << ASTExistsDatabaseQueryIDAndQueryNames::Query
+                    << " ";
+        database->format(ostr, settings, state, frame);
+    }
+
+    QueryKind getQueryKind() const override { return QueryKind::Exists; }
+};
 
 class ASTShowCreateDatabaseQuery : public ASTQueryWithTableAndOutputImpl<ASTShowCreateDatabaseQueryIDAndQueryNames>
 {
-protected:
-    void formatQueryImpl(const FormatSettings & settings, FormatState &, FormatStateStacked) const override
+public:
+    ASTPtr clone() const override
     {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << ASTShowCreateDatabaseQueryIDAndQueryNames::Query
-                      << " " << (settings.hilite ? hilite_none : "") << backQuoteIfNeed(database);
+        auto res = make_intrusive<ASTShowCreateDatabaseQuery>(*this);
+        res->children.clear();
+        cloneTableOptions(*res);
+        return res;
+    }
+
+protected:
+    void formatQueryImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    {
+        ostr << ASTShowCreateDatabaseQueryIDAndQueryNames::Query
+                      << " ";
+        database->format(ostr, settings, state, frame);
     }
 };
 
@@ -75,7 +132,7 @@ public:
 
     ASTPtr clone() const override
     {
-        auto res = std::make_shared<ASTDescribeQuery>(*this);
+        auto res = make_intrusive<ASTDescribeQuery>(*this);
         res->children.clear();
         if (table_expression)
         {
@@ -86,12 +143,14 @@ public:
         return res;
     }
 
+    QueryKind getQueryKind() const override { return QueryKind::Describe; }
+
 protected:
-    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    void formatQueryImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
     {
-        settings.ostr << (settings.hilite ? hilite_keyword : "")
-                      << "DESCRIBE TABLE " << (settings.hilite ? hilite_none : "");
-        table_expression->formatImpl(settings, state, frame);
+        ostr
+                      << "DESCRIBE TABLE";
+        table_expression->format(ostr, settings, state, frame);
     }
 
 };

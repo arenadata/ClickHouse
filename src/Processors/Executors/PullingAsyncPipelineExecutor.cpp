@@ -2,22 +2,28 @@
 #include <Processors/Executors/PipelineExecutor.h>
 #include <Processors/Formats/LazyOutputFormat.h>
 #include <Processors/Transforms/AggregatingTransform.h>
-#include <Processors/QueryPipeline.h>
-
+#include <Processors/Sources/NullSource.h>
+#include <QueryPipeline/QueryPipeline.h>
+#include <QueryPipeline/ReadProgressCallback.h>
+#include <Common/CurrentThread.h>
 #include <Common/setThreadName.h>
-#include <ext/scope_guard.h>
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
 
 struct PullingAsyncPipelineExecutor::Data
 {
     PipelineExecutorPtr executor;
     std::exception_ptr exception;
+    LazyOutputFormat * lazy_format = nullptr;
     std::atomic_bool is_finished = false;
     std::atomic_bool has_exception = false;
     ThreadFromGlobalPool thread;
-    Poco::Event finish_event;
 
     ~Data()
     {
@@ -30,18 +36,18 @@ struct PullingAsyncPipelineExecutor::Data
         if (has_exception)
         {
             has_exception = false;
-            std::rethrow_exception(std::move(exception));
+            std::rethrow_exception(exception);
         }
     }
 };
 
 PullingAsyncPipelineExecutor::PullingAsyncPipelineExecutor(QueryPipeline & pipeline_) : pipeline(pipeline_)
 {
-    if (!pipeline.isCompleted())
-    {
-        lazy_format = std::make_shared<LazyOutputFormat>(pipeline.getHeader());
-        pipeline.setOutputFormat(lazy_format);
-    }
+    if (!pipeline.pulling())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline for PullingAsyncPipelineExecutor must be pulling");
+
+    lazy_format = std::make_shared<LazyOutputFormat>(pipeline.output->getSharedHeader());
+    pipeline.complete(lazy_format);
 }
 
 PullingAsyncPipelineExecutor::~PullingAsyncPipelineExecutor()
@@ -58,82 +64,80 @@ PullingAsyncPipelineExecutor::~PullingAsyncPipelineExecutor()
 
 const Block & PullingAsyncPipelineExecutor::getHeader() const
 {
-    return lazy_format ? lazy_format->getPort(IOutputFormat::PortKind::Main).getHeader()
-                       : pipeline.getHeader(); /// Empty.
+    return lazy_format->getPort(IOutputFormat::PortKind::Main).getHeader();
 }
 
-static void threadFunction(PullingAsyncPipelineExecutor::Data & data, ThreadGroupStatusPtr thread_group, size_t num_threads)
+static void threadFunction(
+    PullingAsyncPipelineExecutor::Data & data, ThreadGroupPtr thread_group, size_t num_threads, bool concurrency_control)
 {
-    if (thread_group)
-        CurrentThread::attachTo(thread_group);
-
-    SCOPE_EXIT(
-        if (thread_group)
-            CurrentThread::detachQueryIfNotDetached();
-    );
-
-    setThreadName("QueryPipelineEx");
-
     try
     {
-        data.executor->execute(num_threads);
+        ThreadGroupSwitcher switcher(thread_group, ThreadName::PULLING_ASYNC_EXECUTOR);
+
+        data.executor->execute(num_threads, concurrency_control);
     }
     catch (...)
     {
         data.exception = std::current_exception();
         data.has_exception = true;
+
+        /// Finish lazy format in case of exception. Otherwise thread.join() may hung.
+        data.lazy_format->finalize();
     }
 
     data.is_finished = true;
-    data.finish_event.set();
 }
 
+
+void PullingAsyncPipelineExecutor::setCancelCallback(std::function<bool()> callback, uint64_t interactive_timeout_ms_)
+{
+    cancel_callback = std::move(callback);
+    interactive_timeout_ms = interactive_timeout_ms_;
+}
 
 bool PullingAsyncPipelineExecutor::pull(Chunk & chunk, uint64_t milliseconds)
 {
     if (!data)
     {
         data = std::make_unique<Data>();
-        data->executor = pipeline.execute();
+        data->executor = std::make_shared<PipelineExecutor>(pipeline.processors, pipeline.process_list_element);
+        data->executor->setReadProgressCallback(pipeline.getReadProgressCallback());
+        data->lazy_format = lazy_format.get();
 
         auto func = [&, thread_group = CurrentThread::getGroup()]()
         {
-            threadFunction(*data, thread_group, pipeline.getNumThreads());
+            threadFunction(*data, thread_group, pipeline.getNumThreads(), pipeline.getConcurrencyControl());
         };
 
         data->thread = ThreadFromGlobalPool(std::move(func));
     }
 
-    if (data->has_exception)
-    {
-        /// Finish lazy format in case of exception. Otherwise thread.join() may hung.
-        if (lazy_format)
-            lazy_format->finish();
+    data->rethrowExceptionIfHas();
 
-        data->has_exception = false;
-        std::rethrow_exception(std::move(data->exception));
-    }
-
-    bool is_execution_finished = lazy_format ? lazy_format->isFinished()
-                                             : data->is_finished.load();
+    bool is_execution_finished
+        = !data->executor->checkTimeLimitSoft() || (lazy_format ? lazy_format->isFinished() : data->is_finished.load());
 
     if (is_execution_finished)
     {
         /// If lazy format is finished, we don't cancel pipeline but wait for main thread to be finished.
         data->is_finished = true;
-        /// Wait thread ant rethrow exception if any.
+        /// Wait thread and rethrow exception if any.
         cancel();
         return false;
     }
 
-    if (lazy_format)
-    {
-        chunk = lazy_format->getChunk(milliseconds);
-        return true;
-    }
+    /// When a cancel callback is set and no explicit timeout was requested, use the interactive timeout
+    /// to periodically poll the callback (e.g. to check for Cancel packets during scalar subquery execution).
+    uint64_t effective_timeout = milliseconds;
+    if (cancel_callback && milliseconds == 0)
+        effective_timeout = interactive_timeout_ms;
 
-    chunk.clear();
-    data->finish_event.tryWait(milliseconds);
+    chunk = lazy_format->getChunk(effective_timeout);
+
+    if (cancel_callback)
+        cancel_callback();
+
+    data->rethrowExceptionIfHas();
     return true;
 }
 
@@ -153,13 +157,11 @@ bool PullingAsyncPipelineExecutor::pull(Block & block, uint64_t milliseconds)
 
     block = lazy_format->getPort(IOutputFormat::PortKind::Main).getHeader().cloneWithColumns(chunk.detachColumns());
 
-    if (auto chunk_info = chunk.getChunkInfo())
+    if (auto agg_info = chunk.getChunkInfos().get<AggregatedChunkInfo>())
     {
-        if (const auto * agg_info = typeid_cast<const AggregatedChunkInfo *>(chunk_info.get()))
-        {
-            block.info.bucket_num = agg_info->bucket_num;
-            block.info.is_overflows = agg_info->is_overflows;
-        }
+         block.info.bucket_num = agg_info->bucket_num;
+         block.info.is_overflows = agg_info->is_overflows;
+         block.info.out_of_order_buckets = agg_info->out_of_order_buckets;
     }
 
     return true;
@@ -167,33 +169,66 @@ bool PullingAsyncPipelineExecutor::pull(Block & block, uint64_t milliseconds)
 
 void PullingAsyncPipelineExecutor::cancel()
 {
-    /// Cancel execution if it wasn't finished.
-    if (data && !data->is_finished && data->executor)
-        data->executor->cancel();
+    if (!data)
+        return;
 
-    /// Finish lazy format. Otherwise thread.join() may hung.
-    if (lazy_format && !lazy_format->isFinished())
-        lazy_format->finish();
+    /// Cancel execution if it wasn't finished.
+    cancelWithExceptionHandling([&]()
+    {
+        if (!data->is_finished && data->executor)
+            data->executor->cancel();
+    });
+
+    /// The following code is needed to rethrow exception from PipelineExecutor.
+    /// It could have been thrown from pull(), but we will not likely call it again.
 
     /// Join thread here to wait for possible exception.
-    if (data && data->thread.joinable())
+    if (data->thread.joinable())
         data->thread.join();
 
     /// Rethrow exception to not swallow it in destructor.
-    if (data)
-        data->rethrowExceptionIfHas();
+    data->rethrowExceptionIfHas();
+}
+
+void PullingAsyncPipelineExecutor::cancelReading()
+{
+    if (!data)
+        return;
+
+    /// Stop reading from source if pipeline wasn't finished.
+    cancelWithExceptionHandling([&]()
+    {
+        if (!data->is_finished && data->executor)
+            data->executor->cancelReading();
+    });
+}
+
+void PullingAsyncPipelineExecutor::cancelWithExceptionHandling(CancelFunc && cancel_func)
+{
+    try
+    {
+        cancel_func();
+    }
+    catch (...)
+    {
+        /// Store exception only of during query execution there was no
+        /// exception, since only one exception can be re-thrown.
+        if (!data->has_exception)
+        {
+            data->exception = std::current_exception();
+            data->has_exception = true;
+        }
+    }
 }
 
 Chunk PullingAsyncPipelineExecutor::getTotals()
 {
-    return lazy_format ? lazy_format->getTotals()
-                       : Chunk();
+    return lazy_format->getTotals();
 }
 
 Chunk PullingAsyncPipelineExecutor::getExtremes()
 {
-    return lazy_format ? lazy_format->getExtremes()
-                       : Chunk();
+    return lazy_format->getExtremes();
 }
 
 Block PullingAsyncPipelineExecutor::getTotalsBlock()
@@ -218,11 +253,9 @@ Block PullingAsyncPipelineExecutor::getExtremesBlock()
     return header.cloneWithColumns(extremes.detachColumns());
 }
 
-BlockStreamProfileInfo & PullingAsyncPipelineExecutor::getProfileInfo()
+ProfileInfo & PullingAsyncPipelineExecutor::getProfileInfo()
 {
-    static BlockStreamProfileInfo profile_info;
-    return lazy_format ? lazy_format->getProfileInfo()
-                       : profile_info;
+    return lazy_format->getProfileInfo();
 }
 
 }

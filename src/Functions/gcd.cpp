@@ -1,38 +1,54 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionBinaryArithmetic.h>
-#include <numeric>
+#include <Functions/GCDLCMImpl.h>
+
+#include <boost/integer/common_factor.hpp>
 
 
 namespace DB
 {
 
-template <typename A, typename B>
-struct GCDImpl
+namespace
 {
-    using ResultType = typename NumberTraits::ResultOfAdditionMultiplication<A, B>::Type;
-    static const constexpr bool allow_fixed_string = false;
-
-    template <typename Result = ResultType>
-    static inline Result apply(A a, B b)
-    {
-        throwIfDivisionLeadsToFPE(typename NumberTraits::ToInteger<A>::Type(a), typename NumberTraits::ToInteger<B>::Type(b));
-        throwIfDivisionLeadsToFPE(typename NumberTraits::ToInteger<B>::Type(b), typename NumberTraits::ToInteger<A>::Type(a));
-        return std::gcd(
-            typename NumberTraits::ToInteger<Result>::Type(a),
-            typename NumberTraits::ToInteger<Result>::Type(b));
-    }
-
-#if USE_EMBEDDED_COMPILER
-    static constexpr bool compilable = false; /// exceptions (and a non-trivial algorithm)
-#endif
-};
 
 struct NameGCD { static constexpr auto name = "gcd"; };
-using FunctionGCD = FunctionBinaryArithmetic<GCDImpl, NameGCD, false>;
 
-void registerFunctionGCD(FunctionFactory & factory)
+template <typename A, typename B>
+struct GCDImpl : public GCDLCMImpl<A, B, GCDImpl<A, B>, NameGCD>
 {
-    factory.registerFunction<FunctionGCD>();
+    using ResultType = typename GCDLCMImpl<A, B, GCDImpl, NameGCD>::ResultType;
+
+    static ResultType applyImpl(A a, B b)
+    {
+        using Int = typename NumberTraits::ToInteger<ResultType>::Type;
+        return boost::integer::gcd(Int(a), Int(b)); // NOLINT(clang-analyzer-core.UndefinedBinaryOperatorResult)
+    }
+};
+
+using FunctionGCD = BinaryArithmeticOverloadResolver<GCDImpl, NameGCD, false, false>;
+
+}
+
+REGISTER_FUNCTION(GCD)
+{
+    FunctionDocumentation::Description description = R"(
+    Returns the greatest common divisor of two values a and b.
+
+    An exception is thrown when dividing by zero or when dividing a minimal
+    negative number by minus one.
+    )";
+    FunctionDocumentation::Syntax syntax = "gcd(x, y)";
+    FunctionDocumentation::Argument argument1 = {"x", "First integer"};
+    FunctionDocumentation::Argument argument2 = {"y", "Second integer"};
+    FunctionDocumentation::Arguments arguments = {argument1, argument2};
+    FunctionDocumentation::ReturnedValue returned_value = {"The greatest common divisor of `x` and `y`."};
+    FunctionDocumentation::Example example1 = {"Usage example", "SELECT gcd(12, 18)", "6"};
+    FunctionDocumentation::Examples examples = {example1};
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Arithmetic;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionGCD>(documentation);
 }
 
 }

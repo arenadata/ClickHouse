@@ -5,21 +5,29 @@
 struct ContextHolder
 {
     DB::SharedContextHolder shared_context;
-    DB::Context context;
+    DB::ContextMutablePtr context;
 
-    ContextHolder()
-        : shared_context(DB::Context::createShared())
-        , context(DB::Context::createGlobal(shared_context.get()))
-    {
-        context.makeGlobalContext();
-        context.setPath("./");
-    }
+    ContextHolder();
 
     ContextHolder(ContextHolder &&) = default;
+
+    void destroy()
+    {
+        context->shutdown();
+        context.reset();
+        shared_context.reset();
+    }
 };
 
-inline const ContextHolder & getContext()
+struct TestCommandLineOptions
 {
-    static ContextHolder holder;
-    return holder;
-}
+    int argc = 0;
+    const char * const * argv = nullptr;
+};
+
+const ContextHolder & getContext();
+
+ContextHolder & getMutableContext();
+
+// Command line with gtest's flags removed.
+TestCommandLineOptions & getTestCommandLineOptions();

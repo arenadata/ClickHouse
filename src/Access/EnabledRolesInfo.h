@@ -10,7 +10,7 @@
 namespace DB
 {
 
-/// Information about a role.
+/// Information about roles enabled for a user at some specific time.
 struct EnabledRolesInfo
 {
     boost::container::flat_set<UUID> current_roles;
@@ -19,6 +19,9 @@ struct EnabledRolesInfo
     std::unordered_map<UUID, String> names_of_roles;
     AccessRights access;
     SettingsProfileElements settings_from_enabled_roles;
+
+    std::vector<UUID> getCurrentRoles() const;
+    std::vector<UUID> getEnabledRoles() const;
 
     Strings getCurrentRolesNames() const;
     Strings getEnabledRolesNames() const;

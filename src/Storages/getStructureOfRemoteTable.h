@@ -1,13 +1,13 @@
 #pragma once
 
 #include <Storages/ColumnsDescription.h>
-#include <Parsers/IAST.h>
-#include <Parsers/queryToString.h>
+#include <Parsers/IAST_fwd.h>
 #include <Interpreters/Cluster.h>
 
 
 namespace DB
 {
+
 class Context;
 struct StorageID;
 
@@ -16,13 +16,7 @@ struct StorageID;
 ColumnsDescription getStructureOfRemoteTable(
     const Cluster & cluster,
     const StorageID & table_id,
-    const Context & context,
-    const ASTPtr & table_func_ptr = nullptr);
-
-ColumnsDescription getStructureOfRemoteTableInShard(
-    const Cluster::ShardInfo & shard_info,
-    const StorageID & table_id,
-    const Context & context,
+    ContextPtr context,
     const ASTPtr & table_func_ptr = nullptr);
 
 }

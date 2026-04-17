@@ -1,93 +1,109 @@
-#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTIdentifier_fwd.h>
 #include <Parsers/ASTRenameQuery.h>
 
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ParserRenameQuery.h>
+#include <Parsers/parseDatabaseAndTableName.h>
 
 
 namespace DB
 {
 
-
-/// Parse database.table or table.
-static bool parseDatabaseAndTable(
-    ASTRenameQuery::Table & db_and_table, IParser::Pos & pos, Expected & expected)
-{
-    ParserIdentifier name_p;
-    ParserToken s_dot(TokenType::Dot);
-
-    ASTPtr database;
-    ASTPtr table;
-
-    if (!name_p.parse(pos, table, expected))
-        return false;
-
-    if (s_dot.ignore(pos, expected))
-    {
-        database = table;
-        if (!name_p.parse(pos, table, expected))
-            return false;
-    }
-
-    db_and_table.database.clear();
-    tryGetIdentifierNameInto(database, db_and_table.database);
-    tryGetIdentifierNameInto(table, db_and_table.table);
-
-    return true;
-}
-
-
 bool ParserRenameQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    ParserKeyword s_rename_table("RENAME TABLE");
-    ParserKeyword s_to("TO");
-    ParserKeyword s_exchange_tables("EXCHANGE TABLES");
-    ParserKeyword s_and("AND");
+    ParserKeyword s_rename(Keyword::RENAME);
+    ParserKeyword s_rename_table(Keyword::RENAME_TABLE);
+    ParserKeyword s_exchange_tables(Keyword::EXCHANGE_TABLES);
+    ParserKeyword s_rename_dictionary(Keyword::RENAME_DICTIONARY);
+    ParserKeyword s_exchange_dictionaries(Keyword::EXCHANGE_DICTIONARIES);
+    ParserKeyword s_rename_database(Keyword::RENAME_DATABASE);
+    ParserKeyword s_if_exists(Keyword::IF_EXISTS);
+    ParserKeyword s_to(Keyword::TO);
+    ParserKeyword s_and(Keyword::AND);
     ParserToken s_comma(TokenType::Comma);
 
     bool exchange = false;
+    bool dictionary = false;
 
-    if (!s_rename_table.ignore(pos, expected))
+    if (s_rename_database.ignore(pos, expected))
     {
-        if (s_exchange_tables.ignore(pos, expected))
-            exchange = true;
-        else
+        ASTPtr from_db;
+        ASTPtr to_db;
+        ParserIdentifier db_name_p(true);
+        bool if_exists = s_if_exists.ignore(pos, expected);
+        if (!db_name_p.parse(pos, from_db, expected))
             return false;
+        if (!s_to.ignore(pos, expected))
+            return false;
+        if (!db_name_p.parse(pos, to_db, expected))
+            return false;
+
+        String cluster_str;
+        if (ParserKeyword{Keyword::ON}.ignore(pos, expected))
+        {
+            if (!ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
+                return false;
+        }
+        ASTRenameQuery::Elements rename_elements;
+        rename_elements.emplace_back();
+        rename_elements.back().if_exists = if_exists;
+        rename_elements.back().from.database = from_db;
+        rename_elements.back().to.database = to_db;
+
+        auto query = make_intrusive<ASTRenameQuery>(std::move(rename_elements));
+        query->database = true;
+        query->cluster = cluster_str;
+        node = query;
+        return true;
     }
+    if (s_rename_table.ignore(pos, expected))
+        ;
+    else if (s_exchange_tables.ignore(pos, expected))
+        exchange = true;
+    else if (s_rename_dictionary.ignore(pos, expected))
+        dictionary = true;
+    else if (s_exchange_dictionaries.ignore(pos, expected))
+    {
+        exchange = true;
+        dictionary = true;
+    }
+    else if (s_rename.ignore(pos, expected))
+        ;
+    else
+        return false;
+
+    const auto ignore_delim = [&] { return exchange ? s_and.ignore(pos, expected) : s_to.ignore(pos, expected); };
 
     ASTRenameQuery::Elements elements;
-
-    auto ignore_delim = [&]()
-    {
-        return exchange ? s_and.ignore(pos) : s_to.ignore(pos);
-    };
 
     while (true)
     {
         if (!elements.empty() && !s_comma.ignore(pos))
             break;
 
-        elements.push_back(ASTRenameQuery::Element());
+        ASTRenameQuery::Element & ref = elements.emplace_back();
 
-        if (!parseDatabaseAndTable(elements.back().from, pos, expected)
+        if (!exchange)
+            ref.if_exists = s_if_exists.ignore(pos, expected);
+
+        if (!parseDatabaseAndTableAsAST(pos, expected, ref.from.database, ref.from.table)
             || !ignore_delim()
-            || !parseDatabaseAndTable(elements.back().to, pos, expected))
+            || !parseDatabaseAndTableAsAST(pos, expected, ref.to.database, ref.to.table))
             return false;
     }
 
     String cluster_str;
-    if (ParserKeyword{"ON"}.ignore(pos, expected))
+    if (ParserKeyword{Keyword::ON}.ignore(pos, expected))
     {
         if (!ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
             return false;
     }
 
-    auto query = std::make_shared<ASTRenameQuery>();
+    auto query = make_intrusive<ASTRenameQuery>(std::move(elements));
     query->cluster = cluster_str;
-    node = query;
-
-    query->elements = elements;
     query->exchange = exchange;
+    query->dictionary = dictionary;
+    node = query;
     return true;
 }
 

@@ -1,11 +1,15 @@
+#include <Columns/IColumn.h>
 #include <Core/ColumnsWithTypeAndName.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
+#include <DataTypes/IDataType.h>
 #include <IO/Operators.h>
+#include <IO/WriteBufferFromString.h>
 
 
 namespace DB
 {
+
+ColumnWithTypeAndName::ColumnWithTypeAndName(const DataTypePtr & type_, const String & name_)
+    : column(type_->createColumn()), type(type_), name(name_) {}
 
 ColumnWithTypeAndName ColumnWithTypeAndName::cloneEmpty() const
 {
@@ -28,7 +32,7 @@ bool ColumnWithTypeAndName::operator==(const ColumnWithTypeAndName & other) cons
 }
 
 
-void ColumnWithTypeAndName::dumpStructure(WriteBuffer & out) const
+void ColumnWithTypeAndName::dumpNameAndType(WriteBuffer & out) const
 {
     out << name;
 
@@ -36,6 +40,11 @@ void ColumnWithTypeAndName::dumpStructure(WriteBuffer & out) const
         out << ' ' << type->getName();
     else
         out << " nullptr";
+}
+
+void ColumnWithTypeAndName::dumpStructure(WriteBuffer & out) const
+{
+    dumpNameAndType(out);
 
     if (column)
         out << ' ' << column->dumpStructure();

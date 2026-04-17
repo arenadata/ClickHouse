@@ -1,47 +1,75 @@
 #pragma once
 
-#include <Interpreters/Cluster.h>
-#include <DataStreams/BlockIO.h>
-#include <Common/CurrentThread.h>
-#include <Common/ThreadPool.h>
-#include <common/logger_useful.h>
-#include <Storages/IStorage.h>
+#include <Core/Names.h>
+#include <Interpreters/Context_fwd.h>
+#include <Interpreters/DDLTask.h>
+#include <Parsers/IAST_fwd.h>
+#include <Storages/IStorage_fwd.h>
+#include <Poco/Event.h>
+#include <Common/CurrentMetrics.h>
+#include <Common/DNSResolver.h>
+#include <Common/SharedMutex.h>
+#include <Common/ThreadPool_fwd.h>
+#include <Common/ZooKeeper/IKeeper.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
 
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
+#include <list>
 #include <mutex>
-#include <thread>
+#include <unordered_set>
+
 
 namespace zkutil
 {
     class ZooKeeper;
 }
 
+namespace Poco
+{
+    class Logger;
+    namespace Util { class AbstractConfiguration; }
+}
+
+namespace Coordination
+{
+    struct Stat;
+}
+
+namespace zkutil
+{
+    class ZooKeeperLock;
+}
+
 namespace DB
 {
-
-class Context;
 class ASTAlterQuery;
-class AccessRightsElements;
 struct DDLLogEntry;
-struct DDLTask;
-
-
-/// Pushes distributed DDL query to the queue
-BlockIO executeDDLQueryOnCluster(const ASTPtr & query_ptr, const Context & context);
-BlockIO executeDDLQueryOnCluster(const ASTPtr & query_ptr, const Context & context, const AccessRightsElements & query_requires_access, bool query_requires_grant_option = false);
-BlockIO executeDDLQueryOnCluster(const ASTPtr & query_ptr, const Context & context, AccessRightsElements && query_requires_access, bool query_requires_grant_option = false);
-
+struct DDLTaskBase;
+using DDLTaskPtr = std::unique_ptr<DDLTaskBase>;
+using ZooKeeperPtr = std::shared_ptr<zkutil::ZooKeeper>;
+class AccessRightsElements;
+struct ZooKeeperRetriesInfo;
+class QueryStatus;
+using QueryStatusPtr = std::shared_ptr<QueryStatus>;
 
 class DDLWorker
 {
 public:
-    DDLWorker(const std::string & zk_root_dir, Context & context_, const Poco::Util::AbstractConfiguration * config, const String & prefix);
-    ~DDLWorker();
+    DDLWorker(
+        int pool_size_,
+        const std::string & zk_queue_dir,
+        const std::string & zk_replicas_dir,
+        ContextPtr context_,
+        const Poco::Util::AbstractConfiguration * config,
+        const String & prefix,
+        const String & zookeeper_name_,
+        const String & logger_name = "DDLWorker",
+        const CurrentMetrics::Metric * max_entry_metric_ = nullptr,
+        const CurrentMetrics::Metric * max_pushed_entry_metric_ = nullptr);
+    virtual ~DDLWorker();
 
     /// Pushes query into DDL queue, returns path to created node
-    String enqueueQuery(DDLLogEntry & entry);
+    virtual String enqueueQuery(DDLLogEntry & entry, const ZooKeeperRetriesInfo & retries_info);
 
     /// Host ID (name:port) for logging purposes
     /// Note that in each task hosts are identified individually by name:port from initiator server cluster config
@@ -50,94 +78,170 @@ public:
         return host_fqdn_id;
     }
 
-private:
-    using ZooKeeperPtr = std::shared_ptr<zkutil::ZooKeeper>;
+    std::string getQueueDir() const
+    {
+        return queue_dir;
+    }
 
+    std::string getReplicasDir() const { return replicas_dir; }
+
+    void startup();
+    virtual void shutdown();
+
+    bool isCurrentlyActive() const { return initialized && !stop_flag; }
+
+    /// Return the latest ZooKeeper session.
+    ZooKeeperPtr getZooKeeperFromContext() const;
     /// Returns cached ZooKeeper session (possibly expired).
-    ZooKeeperPtr tryGetZooKeeper() const;
+    ZooKeeperPtr getZooKeeper() const;
     /// If necessary, creates a new session and caches it.
+    /// Should be called in `initializeMainThread` only, so if it is expired, `runMainThread` will reinitialized the state.
     ZooKeeperPtr getAndSetZooKeeper();
 
-    void processTasks();
+    void requestToResetState();
+    void notifyHostIDsUpdated();
+    void updateHostIDs(const std::vector<HostID> & hosts);
+
+protected:
+
+    class ConcurrentSet
+    {
+    public:
+        bool contains(const String & key) const
+        {
+            std::shared_lock lock(mtx);
+            return set.contains(key);
+        }
+
+        bool insert(const String & key)
+        {
+            std::unique_lock lock(mtx);
+            return set.emplace(key).second;
+        }
+
+        bool remove(const String & key)
+        {
+            std::unique_lock lock(mtx);
+            return set.erase(key);
+        }
+
+    private:
+        std::unordered_set<String> set;
+        mutable SharedMutex mtx;
+    };
+
+    /// Pushes query into DDL queue, returns path to created node
+    String enqueueQueryAttempt(DDLLogEntry & entry);
+
+    /// Iterates through queue tasks in ZooKeeper, runs execution of new tasks
+    virtual void scheduleTasks(bool reinitialized);
+
+    DDLTaskBase & saveTask(DDLTaskPtr && task);
 
     /// Reads entry and check that the host belongs to host list of the task
-    /// Returns true and sets current_task if entry parsed and the check is passed
-    bool initAndCheckTask(const String & entry_name, String & out_reason, const ZooKeeperPtr & zookeeper);
+    /// Returns non-empty DDLTaskPtr if entry parsed and the check is passed
+    /// If dry_run = false, the task will be processed right after this call.
+    virtual DDLTaskPtr initAndCheckTask(const String & entry_name, String & out_reason, const ZooKeeperPtr & zookeeper, bool dry_run);
 
-    void processTask(DDLTask & task, const ZooKeeperPtr & zookeeper);
+    void processTask(DDLTaskBase & task, const ZooKeeperPtr & zookeeper, bool internal_query);
+    void updateMaxDDLEntryID(const String & entry_name);
 
     /// Check that query should be executed on leader replica only
-    static bool taskShouldBeExecutedOnLeader(const ASTPtr ast_ddl, StoragePtr storage);
-
-    /// Check that shard has consistent config with table
-    void checkShardConfig(const String & table, const DDLTask & task, StoragePtr storage) const;
+    static bool taskShouldBeExecutedOnLeader(const ASTPtr & ast_ddl, StoragePtr storage);
 
     /// Executes query only on leader replica in case of replicated table.
     /// Queries like TRUNCATE/ALTER .../OPTIMIZE have to be executed only on one node of shard.
     /// Most of these queries can be executed on non-leader replica, but actually they still send
-    /// query via RemoteBlockOutputStream to leader, so to avoid such "2-phase" query execution we
+    /// query via RemoteQueryExecutor to leader, so to avoid such "2-phase" query execution we
     /// execute query directly on leader.
-    bool tryExecuteQueryOnLeaderReplica(
-        DDLTask & task,
+    bool tryExecuteQueryOnSingleReplica(
+        DDLTaskBase & task,
         StoragePtr storage,
-        const String & rewritten_query,
         const String & node_path,
-        const ZooKeeperPtr & zookeeper);
+        const ZooKeeperPtr & zookeeper,
+        std::unique_ptr<zkutil::ZooKeeperLock> & execute_on_single_replica_lock);
 
-    void parseQueryAndResolveHost(DDLTask & task);
-
-    bool tryExecuteQuery(const String & query, const DDLTask & task, ExecutionStatus & status);
+    bool tryExecuteQuery(DDLTaskBase & task, const ZooKeeperPtr & zookeeper, bool internal);
 
     /// Checks and cleanups queue's nodes
     void cleanupQueue(Int64 current_time_seconds, const ZooKeeperPtr & zookeeper);
+    void cleanupStaleReplicas(Int64 current_time_seconds, const ZooKeeperPtr & zookeeper);
+    virtual bool canRemoveQueueEntry(const String & entry_name, const Coordination::Stat & stat);
 
     /// Init task node
-    static void createStatusDirs(const std::string & node_path, const ZooKeeperPtr & zookeeper);
+    void createStatusDirs(const std::string & node_path, const ZooKeeperPtr & zookeeper);
 
+    /// Return false if the worker was stopped (stop_flag = true)
+    virtual bool initializeMainThread();
+    virtual void initializeReplication();
+
+    virtual void createReplicaDirs(const ZooKeeperPtr & zookeeper, const NameSet & host_ids);
+    virtual void markReplicasActive(bool reinitialized);
 
     void runMainThread();
     void runCleanupThread();
 
-    void attachToThreadGroup();
+    NameSet getAllHostIDsFromClusters() const;
 
-private:
-    bool is_circular_replicated;
-    Context & context;
-    Poco::Logger * log;
-    std::unique_ptr<Context> current_context;
+    ContextMutablePtr context;
+    LoggerPtr log;
+
+    std::optional<std::string> config_host_name; /// host_name from config
 
     std::string host_fqdn;      /// current host domain name
     std::string host_fqdn_id;   /// host_name:port
-    std::string queue_dir;      /// dir with queue of queries
-
-    /// Name of last task that was skipped or successfully executed
-    std::string last_processed_task_name;
+    std::string queue_dir; /// dir with queue of queries
+    std::string replicas_dir;
 
     mutable std::mutex zookeeper_mutex;
-    ZooKeeperPtr current_zookeeper;
+    const std::string zookeeper_name;
+    ZooKeeperPtr current_zookeeper TSA_GUARDED_BY(zookeeper_mutex);
 
     /// Save state of executed task to avoid duplicate execution on ZK error
-    using DDLTaskPtr = std::unique_ptr<DDLTask>;
-    DDLTaskPtr current_task;
+    std::optional<String> last_skipped_entry_name;
+    std::optional<String> first_failed_task_name;
+    std::list<DDLTaskPtr> current_tasks;
 
+    /// This flag is needed for debug assertions only
+    bool queue_fully_loaded_after_initialization_debug_helper = false;
+
+    Coordination::Stat queue_node_stat;
     std::shared_ptr<Poco::Event> queue_updated_event = std::make_shared<Poco::Event>();
     std::shared_ptr<Poco::Event> cleanup_event = std::make_shared<Poco::Event>();
-    std::atomic<bool> stop_flag{false};
+    std::atomic<bool> initialized = false;
+    std::atomic<bool> stop_flag = false;
 
-    ThreadFromGlobalPool main_thread;
-    ThreadFromGlobalPool cleanup_thread;
+    std::unique_ptr<ThreadFromGlobalPool> main_thread;
+    std::unique_ptr<ThreadFromGlobalPool> cleanup_thread;
+
+    /// Size of the pool for query execution.
+    size_t pool_size = 1;
+    std::unique_ptr<ThreadPool> worker_pool;
 
     /// Cleaning starts after new node event is received if the last cleaning wasn't made sooner than N seconds ago
     Int64 cleanup_delay_period = 60; // minute (in seconds)
+    std::atomic_bool reset_state_requested{false};
+    std::atomic_bool host_ids_updated{false};
     /// Delete node if its age is greater than that
     Int64 task_max_lifetime = 7 * 24 * 60 * 60; // week (in seconds)
     /// How many tasks could be in the queue
     size_t max_tasks_in_queue = 1000;
 
-    ThreadGroupStatusPtr thread_group;
+    std::atomic<UInt32> max_id = 0;
 
-    friend class DDLQueryStatusInputStream;
-    friend struct DDLTask;
+    ConcurrentSet entries_to_skip;
+
+    std::atomic_uint64_t subsequent_errors_count = 0;
+    String last_unexpected_error;
+
+    mutable std::mutex checked_host_id_set_mutex;
+    NameSet checked_host_id_set TSA_GUARDED_BY(checked_host_id_set_mutex);
+
+
+    const CurrentMetrics::Metric * max_entry_metric;
+    const CurrentMetrics::Metric * max_pushed_entry_metric;
+
+    std::unordered_map<String, std::pair<ZooKeeperPtr, zkutil::EphemeralNodeHolderPtr>> active_node_holders;
 };
 
 

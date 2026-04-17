@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <common/DateLUT.h>
+#include <Common/DateLUT.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferFromString.h>
 
@@ -29,10 +29,6 @@ auto getTypeName(const ValueType &)
     {
         return "DateTime64WithScale";
     }
-    else
-    {
-        static_assert("unsupported ValueType");
-    }
 }
 
 std::ostream & dump_datetime(std::ostream & ostr, const DayNum & d)
@@ -53,10 +49,10 @@ std::ostream & dump_datetime(std::ostream & ostr, const DateTime64WithScale & dt
 template <typename ValueType>
 struct DateTimeToStringParamTestCase
 {
-    const char* description;
+    const char * description;
     const ValueType input;
-    const char* expected;
-    const char* timezone = "UTC";
+    const char * expected;
+    const char * timezone = "UTC";
 };
 
 template <typename T>
@@ -74,15 +70,7 @@ std::ostream & operator << (std::ostream & ostr, const DateTimeToStringParamTest
 
 }
 
-TEST(DateTimeToStringTest, RFC1123)
-{
-    using namespace DB;
-    WriteBufferFromOwnString out;
-    writeDateTimeTextRFC1123(1111111111, out, DateLUT::instance("UTC"));
-    ASSERT_EQ(out.str(), "Fri, 18 Mar 2005 01:58:31 GMT");
-}
-
-template <typename ValueType>
+template <typename ValueType, bool date_time_64_output_format_cut_trailing_zeros_align_to_groups_of_thousands = false>
 class DateTimeToStringParamTestBase : public ::testing::TestWithParam<DateTimeToStringParamTestCase<ValueType>>
 {
 public:
@@ -103,11 +91,10 @@ public:
         }
         else if constexpr (std::is_same_v<ValueType, DateTime64WithScale>)
         {
-            writeDateTimeText(input.value, input.scale, out, DateLUT::instance(timezone_name));
-        }
-        else
-        {
-            static_assert("unsupported ValueType");
+            if constexpr (date_time_64_output_format_cut_trailing_zeros_align_to_groups_of_thousands)
+                writeDateTimeTextCutTrailingZerosAlignToGroupOfThousands(input.value, input.scale, out, DateLUT::instance(timezone_name));
+            else
+                writeDateTimeText(input.value, input.scale, out, DateLUT::instance(timezone_name));
         }
 
         ASSERT_EQ(expected, out.str());
@@ -138,15 +125,23 @@ TEST_P(DateTimeToStringParamTestDateTime64, writeDateText)
     ASSERT_NO_FATAL_FAILURE(test(GetParam()));
 }
 
-static const Int32 NON_ZERO_TIME_T = 10 * 365 * 3600 * 24 + 123456;
+class DateTimeToStringParamTestDateTime64TrimZeros : public DateTimeToStringParamTestBase<DateTime64WithScale, true>
+{};
+
+TEST_P(DateTimeToStringParamTestDateTime64TrimZeros, writeDateText)
+{
+    ASSERT_NO_FATAL_FAILURE(test(GetParam()));
+}
+
+static const Int32 NON_ZERO_TIME_T = 10 * 365 * 3600 * 24 + 123456; /// NOTE This arithmetic is obviously wrong but it's ok for test.
 
 INSTANTIATE_TEST_SUITE_P(DateTimeToString, DateTimeToStringParamTestDayNum,
     ::testing::ValuesIn(std::initializer_list<DateTimeToStringParamTestCase<DayNum>>
     {
         {
-            "Zero DayNum has special representation of all zeroes despite pointing to 1970-01-01",
+            "Zero DayNum pointing to 1970-01-01",
             DayNum(0),
-            "0000-00-00"
+            "1970-01-01"
         },
         {
             "Non-Zero DayNum",
@@ -161,7 +156,7 @@ INSTANTIATE_TEST_SUITE_P(DateTimeToString, DateTimeToStringParamTestDayNum,
         {
             "Negative DayNum value wraps as if it was UInt16 due to LUT limitations and to maintain compatibility with existing code.",
             DayNum(-10 * 365),
-            "2106-02-07"
+            "2139-06-10"
         },
     })
 );
@@ -170,9 +165,9 @@ INSTANTIATE_TEST_SUITE_P(DateTimeToString, DateTimeToStringParamTestTimeT,
     ::testing::ValuesIn(std::initializer_list<DateTimeToStringParamTestCase<time_t>>
     {
         {
-            "Zero time_t has special representation of all-zeroes despite pointing to 1970-01-01 00:00:00",
+            "Zero time_t pointing to 1970-01-01 00:00:00 in UTC",
             time_t(0),
-            "0000-00-00 00:00:00"
+            "1970-01-01 00:00:00"
         },
         {
             "Non-Zero time_t is a valid date/time",
@@ -196,12 +191,12 @@ INSTANTIATE_TEST_SUITE_P(DateTimeToString, DateTimeToStringParamTestDateTime64,
         {
             "Zero DateTime64 with scale 0 string representation matches one of zero time_t",
             DateTime64WithScale{0, 0},
-            "0000-00-00 00:00:00"
+            "1970-01-01 00:00:00"
         },
         {
             "Zero DateTime64 with scale 3 string representation matches one of zero time_t with subsecond part",
             DateTime64WithScale{0, 3},
-            "0000-00-00 00:00:00.000"
+            "1970-01-01 00:00:00.000"
         },
         {
             "Non-Zero DateTime64 with scale 0",
@@ -220,3 +215,36 @@ INSTANTIATE_TEST_SUITE_P(DateTimeToString, DateTimeToStringParamTestDateTime64,
 //        },
     })
 );
+
+
+INSTANTIATE_TEST_SUITE_P(DateTimeToString, DateTimeToStringParamTestDateTime64TrimZeros,
+    ::testing::ValuesIn(std::initializer_list<DateTimeToStringParamTestCase<DateTime64WithScale>>
+    {
+         /// Inside basic LUT boundaries
+         {
+             "Zero DateTime64 with scale 0",
+             DateTime64WithScale{0, 0},
+             "1970-01-01 00:00:00"
+         },
+         {
+             "Zero DateTime64 with scale 6, fractional is trimmed",
+             DateTime64WithScale{0, 6},
+             "1970-01-01 00:00:00"
+         },
+         {
+             "DateTime64 with scale 3, fractional is trimmed",
+             DateTime64WithScale{NON_ZERO_TIME_T * 1000LL, 3},
+             "1979-12-31 10:17:36"
+         },
+         {
+             "DateTime64 with scale 6, fractional is partially trimmed",
+             DateTime64WithScale{120000, 6},
+             "1970-01-01 00:00:00.120"
+         },
+         {
+             "DateTime64 with scale 6, fractional is kept",
+             DateTime64WithScale{123456, 6},
+             "1970-01-01 00:00:00.123456"
+         },
+    })
+ );

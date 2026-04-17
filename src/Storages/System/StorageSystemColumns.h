@@ -1,7 +1,6 @@
 #pragma once
 
-#include <ext/shared_ptr_helper.h>
-#include <Storages/System/IStorageSystemOneBlock.h>
+#include <Storages/StorageWithCommonVirtualColumns.h>
 
 
 namespace DB
@@ -11,23 +10,26 @@ class Context;
 
 /** Implements system table 'columns', that allows to get information about columns for every table.
   */
-class StorageSystemColumns final : public ext::shared_ptr_helper<StorageSystemColumns>, public IStorage
+class StorageSystemColumns final : public StorageWithCommonVirtualColumns
 {
-    friend struct ext::shared_ptr_helper<StorageSystemColumns>;
 public:
+    explicit StorageSystemColumns(const StorageID & table_id_);
+
     std::string getName() const override { return "SystemColumns"; }
 
-    Pipes read(
+    static VirtualColumnsDescription createVirtuals();
+
+    void readImpl(
+        QueryPlan & query_plan,
         const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
-        const SelectQueryInfo & query_info,
-        const Context & context,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
-        unsigned num_streams) override;
+        size_t num_streams) override;
 
-protected:
-    StorageSystemColumns(const std::string & name_);
+    bool isSystemStorage() const override { return true; }
 };
 
 }

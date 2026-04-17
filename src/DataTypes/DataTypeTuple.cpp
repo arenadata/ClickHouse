@@ -1,41 +1,49 @@
-#include <Common/StringUtils/StringUtils.h>
+#include <base/range.h>
+#include <Common/StringUtils.h>
 #include <Columns/ColumnTuple.h>
+#include <Columns/ColumnConst.h>
+#include <Columns/ColumnReplicated.h>
 #include <Core/Field.h>
-#include <Formats/FormatSettings.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeFactory.h>
+#include <Common/SipHash.h>
+#include <DataTypes/Serializations/SerializationInfo.h>
+#include <DataTypes/Serializations/SerializationTuple.h>
+#include <DataTypes/Serializations/SerializationNamed.h>
+#include <DataTypes/Serializations/SerializationInfoTuple.h>
+#include <DataTypes/Serializations/SerializationWrapper.h>
+#include <DataTypes/Serializations/SerializationReplicated.h>
+#include <DataTypes/Serializations/SerializationDetached.h>
+#include <DataTypes/NestedUtils.h>
 #include <Parsers/IAST.h>
 #include <Parsers/ASTNameTypePair.h>
-#include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
 #include <Common/quoteString.h>
 #include <IO/WriteHelpers.h>
-#include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/Operators.h>
+#include <boost/algorithm/string.hpp>
 
-#include <ext/map.h>
-#include <ext/enumerate.h>
-#include <ext/range.h>
-
+#include <ranges>
 
 namespace DB
 {
 
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
-    extern const int EMPTY_DATA_PASSED;
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
-    extern const int DUPLICATE_COLUMN;
     extern const int BAD_ARGUMENTS;
+    extern const int DUPLICATE_COLUMN;
+    extern const int LOGICAL_ERROR;
     extern const int NOT_FOUND_COLUMN_IN_BLOCK;
+    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int SIZES_OF_COLUMNS_IN_TUPLE_DOESNT_MATCH;
+    extern const int ARGUMENT_OUT_OF_BOUND;
 }
 
 
 DataTypeTuple::DataTypeTuple(const DataTypes & elems_)
-    : elems(elems_), have_explicit_names(false)
+    : elems(elems_), has_explicit_names(false)
 {
     /// Automatically assigned names in form of '1', '2', ...
     size_t size = elems.size();
@@ -44,28 +52,31 @@ DataTypeTuple::DataTypeTuple(const DataTypes & elems_)
         names[i] = toString(i + 1);
 }
 
+static std::optional<Exception> checkTupleNames(const Strings & names)
+{
+    std::unordered_set<String> names_set;
+    for (const auto & name : names)
+    {
+        if (name.empty())
+            return Exception(ErrorCodes::BAD_ARGUMENTS, "Names of tuple elements cannot be empty");
+
+        if (!names_set.insert(name).second)
+            return Exception(ErrorCodes::DUPLICATE_COLUMN, "Names of tuple elements must be unique. Duplicate name: {}", name);
+    }
+
+    return {};
+}
 
 DataTypeTuple::DataTypeTuple(const DataTypes & elems_, const Strings & names_)
-    : elems(elems_), names(names_), have_explicit_names(true)
+    : elems(elems_), names(names_), has_explicit_names(true)
 {
     size_t size = elems.size();
     if (names.size() != size)
-        throw Exception("Wrong number of names passed to constructor of DataTypeTuple", ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+        throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Wrong number of names passed to constructor of DataTypeTuple");
 
-    std::unordered_set<String> names_set;
-    for (size_t i = 0; i < size; ++i)
-    {
-        if (names[i].empty())
-            throw Exception("Names of tuple elements cannot be empty", ErrorCodes::BAD_ARGUMENTS);
-
-        if (isNumericASCII(names[i][0]))
-            throw Exception("Explicitly specified names of tuple elements cannot start with digit", ErrorCodes::BAD_ARGUMENTS);
-
-        if (!names_set.insert(names[i]).second)
-            throw Exception("Names of tuple elements must be unique", ErrorCodes::DUPLICATE_COLUMN);
-    }
+    if (auto exception = checkTupleNames(names))
+        throw std::move(*exception);
 }
-
 
 std::string DataTypeTuple::doGetName() const
 {
@@ -78,7 +89,7 @@ std::string DataTypeTuple::doGetName() const
         if (i != 0)
             s << ", ";
 
-        if (have_explicit_names)
+        if (has_explicit_names)
             s << backQuoteIfNeed(names[i]) << ' ';
 
         s << elems[i]->getName();
@@ -88,42 +99,58 @@ std::string DataTypeTuple::doGetName() const
     return s.str();
 }
 
+std::string DataTypeTuple::doGetPrettyName(size_t indent) const
+{
+    size_t size = elems.size();
+    WriteBufferFromOwnString s;
+
+    /// If the Tuple is named, we will output it in multiple lines with indentation.
+    if (has_explicit_names)
+    {
+        s << "Tuple(\n";
+
+        for (size_t i = 0; i != size; ++i)
+        {
+            if (i != 0)
+                s << ",\n";
+
+            s << fourSpaceIndent(indent + 1)
+                << backQuoteIfNeed(names[i]) << ' '
+                << elems[i]->getPrettyName(indent + 1);
+        }
+
+        s << ')';
+    }
+    else
+    {
+        s << "Tuple(";
+
+        for (size_t i = 0; i != size; ++i)
+        {
+            if (i != 0)
+                s << ", ";
+            s << elems[i]->getPrettyName(indent);
+        }
+
+        s << ')';
+    }
+
+    return s.str();
+}
+
+DataTypePtr DataTypeTuple::getNormalizedType() const
+{
+    DataTypes normalized_elems;
+    normalized_elems.reserve(elems.size());
+    for (const auto & elem : elems)
+        normalized_elems.emplace_back(elem->getNormalizedType());
+    return std::make_shared<DataTypeTuple>(normalized_elems);
+}
 
 static inline IColumn & extractElementColumn(IColumn & column, size_t idx)
 {
     return assert_cast<ColumnTuple &>(column).getColumn(idx);
 }
-
-static inline const IColumn & extractElementColumn(const IColumn & column, size_t idx)
-{
-    return assert_cast<const ColumnTuple &>(column).getColumn(idx);
-}
-
-
-void DataTypeTuple::serializeBinary(const Field & field, WriteBuffer & ostr) const
-{
-    const auto & tuple = get<const Tuple &>(field);
-    for (const auto idx_elem : ext::enumerate(elems))
-        idx_elem.second->serializeBinary(tuple[idx_elem.first], ostr);
-}
-
-void DataTypeTuple::deserializeBinary(Field & field, ReadBuffer & istr) const
-{
-    const size_t size = elems.size();
-
-    Tuple tuple(size);
-    for (const auto i : ext::range(0, size))
-        elems[i]->deserializeBinary(tuple[i], istr);
-
-    field = tuple;
-}
-
-void DataTypeTuple::serializeBinary(const IColumn & column, size_t row_num, WriteBuffer & ostr) const
-{
-    for (const auto idx_elem : ext::enumerate(elems))
-        idx_elem.second->serializeBinary(extractElementColumn(column, idx_elem.first), row_num, ostr);
-}
-
 
 template <typename F>
 static void addElementSafe(const DataTypes & elems, IColumn & column, F && impl)
@@ -134,12 +161,28 @@ static void addElementSafe(const DataTypes & elems, IColumn & column, F && impl)
     try
     {
         impl();
+
+        // Check that all columns now have the same size.
+        size_t new_size = column.size();
+
+        for (auto i : collections::range(0, elems.size()))
+        {
+            const auto & element_column = extractElementColumn(column, i);
+            if (element_column.size() != new_size)
+            {
+                // This is not a logical error because it may work with
+                // user-supplied data.
+                throw Exception(ErrorCodes::SIZES_OF_COLUMNS_IN_TUPLE_DOESNT_MATCH,
+                    "Cannot read a tuple because not all elements are present");
+            }
+        }
     }
     catch (...)
     {
-        for (const auto & i : ext::range(0, ext::size(elems)))
+        for (const auto & i : collections::range(0, elems.size()))
         {
             auto & element_column = extractElementColumn(column, i);
+
             if (element_column.size() > old_size)
                 element_column.popBack(1);
         }
@@ -148,306 +191,11 @@ static void addElementSafe(const DataTypes & elems, IColumn & column, F && impl)
     }
 }
 
-
-void DataTypeTuple::deserializeBinary(IColumn & column, ReadBuffer & istr) const
-{
-    addElementSafe(elems, column, [&]
-    {
-        for (const auto & i : ext::range(0, ext::size(elems)))
-            elems[i]->deserializeBinary(extractElementColumn(column, i), istr);
-    });
-}
-
-void DataTypeTuple::serializeText(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings & settings) const
-{
-    writeChar('(', ostr);
-    for (const auto i : ext::range(0, ext::size(elems)))
-    {
-        if (i != 0)
-            writeChar(',', ostr);
-        elems[i]->serializeAsTextQuoted(extractElementColumn(column, i), row_num, ostr, settings);
-    }
-    writeChar(')', ostr);
-}
-
-void DataTypeTuple::deserializeText(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
-{
-    const size_t size = elems.size();
-    assertChar('(', istr);
-
-    addElementSafe(elems, column, [&]
-    {
-        for (const auto i : ext::range(0, size))
-        {
-            skipWhitespaceIfAny(istr);
-            if (i != 0)
-            {
-                assertChar(',', istr);
-                skipWhitespaceIfAny(istr);
-            }
-            elems[i]->deserializeAsTextQuoted(extractElementColumn(column, i), istr, settings);
-        }
-    });
-
-    // Special format for one element tuple (1,)
-    if (1 == elems.size())
-    {
-        skipWhitespaceIfAny(istr);
-        // Allow both (1) and (1,)
-        checkChar(',', istr);
-    }
-    skipWhitespaceIfAny(istr);
-    assertChar(')', istr);
-}
-
-void DataTypeTuple::serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings & settings) const
-{
-    writeChar('[', ostr);
-    for (const auto i : ext::range(0, ext::size(elems)))
-    {
-        if (i != 0)
-            writeChar(',', ostr);
-        elems[i]->serializeAsTextJSON(extractElementColumn(column, i), row_num, ostr, settings);
-    }
-    writeChar(']', ostr);
-}
-
-void DataTypeTuple::deserializeTextJSON(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
-{
-    const size_t size = elems.size();
-    assertChar('[', istr);
-
-    addElementSafe(elems, column, [&]
-    {
-        for (const auto i : ext::range(0, size))
-        {
-            skipWhitespaceIfAny(istr);
-            if (i != 0)
-            {
-                assertChar(',', istr);
-                skipWhitespaceIfAny(istr);
-            }
-            elems[i]->deserializeAsTextJSON(extractElementColumn(column, i), istr, settings);
-        }
-    });
-
-    skipWhitespaceIfAny(istr);
-    assertChar(']', istr);
-}
-
-void DataTypeTuple::serializeTextXML(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings & settings) const
-{
-    writeCString("<tuple>", ostr);
-    for (const auto i : ext::range(0, ext::size(elems)))
-    {
-        writeCString("<elem>", ostr);
-        elems[i]->serializeAsTextXML(extractElementColumn(column, i), row_num, ostr, settings);
-        writeCString("</elem>", ostr);
-    }
-    writeCString("</tuple>", ostr);
-}
-
-void DataTypeTuple::serializeTextCSV(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings & settings) const
-{
-    for (const auto i : ext::range(0, ext::size(elems)))
-    {
-        if (i != 0)
-            writeChar(',', ostr);
-        elems[i]->serializeAsTextCSV(extractElementColumn(column, i), row_num, ostr, settings);
-    }
-}
-
-void DataTypeTuple::deserializeTextCSV(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
-{
-    addElementSafe(elems, column, [&]
-    {
-        const size_t size = elems.size();
-        for (const auto i : ext::range(0, size))
-        {
-            if (i != 0)
-            {
-                skipWhitespaceIfAny(istr);
-                assertChar(settings.csv.delimiter, istr);
-                skipWhitespaceIfAny(istr);
-            }
-            elems[i]->deserializeAsTextCSV(extractElementColumn(column, i), istr, settings);
-        }
-    });
-}
-
-void DataTypeTuple::enumerateStreams(const StreamCallback & callback, SubstreamPath & path) const
-{
-    path.push_back(Substream::TupleElement);
-    for (const auto i : ext::range(0, ext::size(elems)))
-    {
-        path.back().tuple_element_name = names[i];
-        elems[i]->enumerateStreams(callback, path);
-    }
-    path.pop_back();
-}
-
-struct SerializeBinaryBulkStateTuple : public IDataType::SerializeBinaryBulkState
-{
-    std::vector<IDataType::SerializeBinaryBulkStatePtr> states;
-};
-
-struct DeserializeBinaryBulkStateTuple : public IDataType::DeserializeBinaryBulkState
-{
-    std::vector<IDataType::DeserializeBinaryBulkStatePtr> states;
-};
-
-static SerializeBinaryBulkStateTuple * checkAndGetTupleSerializeState(IDataType::SerializeBinaryBulkStatePtr & state)
-{
-    if (!state)
-        throw Exception("Got empty state for DataTypeTuple.", ErrorCodes::LOGICAL_ERROR);
-
-    auto * tuple_state = typeid_cast<SerializeBinaryBulkStateTuple *>(state.get());
-    if (!tuple_state)
-    {
-        auto & state_ref = *state;
-        throw Exception("Invalid SerializeBinaryBulkState for DataTypeTuple. Expected: "
-                        + demangle(typeid(SerializeBinaryBulkStateTuple).name()) + ", got "
-                        + demangle(typeid(state_ref).name()), ErrorCodes::LOGICAL_ERROR);
-    }
-
-    return tuple_state;
-}
-
-static DeserializeBinaryBulkStateTuple * checkAndGetTupleDeserializeState(IDataType::DeserializeBinaryBulkStatePtr & state)
-{
-    if (!state)
-        throw Exception("Got empty state for DataTypeTuple.", ErrorCodes::LOGICAL_ERROR);
-
-    auto * tuple_state = typeid_cast<DeserializeBinaryBulkStateTuple *>(state.get());
-    if (!tuple_state)
-    {
-        auto & state_ref = *state;
-        throw Exception("Invalid DeserializeBinaryBulkState for DataTypeTuple. Expected: "
-                        + demangle(typeid(DeserializeBinaryBulkStateTuple).name()) + ", got "
-                        + demangle(typeid(state_ref).name()), ErrorCodes::LOGICAL_ERROR);
-    }
-
-    return tuple_state;
-}
-
-void DataTypeTuple::serializeBinaryBulkStatePrefix(
-    SerializeBinaryBulkSettings & settings,
-    SerializeBinaryBulkStatePtr & state) const
-{
-    auto tuple_state = std::make_shared<SerializeBinaryBulkStateTuple>();
-    tuple_state->states.resize(elems.size());
-
-    settings.path.push_back(Substream::TupleElement);
-    for (size_t i = 0; i < elems.size(); ++i)
-    {
-        settings.path.back().tuple_element_name = names[i];
-        elems[i]->serializeBinaryBulkStatePrefix(settings, tuple_state->states[i]);
-    }
-    settings.path.pop_back();
-
-    state = std::move(tuple_state);
-}
-
-void DataTypeTuple::serializeBinaryBulkStateSuffix(
-    SerializeBinaryBulkSettings & settings,
-    SerializeBinaryBulkStatePtr & state) const
-{
-    auto * tuple_state = checkAndGetTupleSerializeState(state);
-
-    settings.path.push_back(Substream::TupleElement);
-    for (size_t i = 0; i < elems.size(); ++i)
-    {
-        settings.path.back().tuple_element_name = names[i];
-        elems[i]->serializeBinaryBulkStateSuffix(settings, tuple_state->states[i]);
-    }
-    settings.path.pop_back();
-}
-
-void DataTypeTuple::deserializeBinaryBulkStatePrefix(
-        DeserializeBinaryBulkSettings & settings,
-        DeserializeBinaryBulkStatePtr & state) const
-{
-    auto tuple_state = std::make_shared<DeserializeBinaryBulkStateTuple>();
-    tuple_state->states.resize(elems.size());
-
-    settings.path.push_back(Substream::TupleElement);
-    for (size_t i = 0; i < elems.size(); ++i)
-    {
-        settings.path.back().tuple_element_name = names[i];
-        elems[i]->deserializeBinaryBulkStatePrefix(settings, tuple_state->states[i]);
-    }
-    settings.path.pop_back();
-
-    state = std::move(tuple_state);
-}
-
-void DataTypeTuple::serializeBinaryBulkWithMultipleStreams(
-    const IColumn & column,
-    size_t offset,
-    size_t limit,
-    SerializeBinaryBulkSettings & settings,
-    SerializeBinaryBulkStatePtr & state) const
-{
-    auto * tuple_state = checkAndGetTupleSerializeState(state);
-
-    settings.path.push_back(Substream::TupleElement);
-    for (const auto i : ext::range(0, ext::size(elems)))
-    {
-        settings.path.back().tuple_element_name = names[i];
-        const auto & element_col = extractElementColumn(column, i);
-        elems[i]->serializeBinaryBulkWithMultipleStreams(element_col, offset, limit, settings, tuple_state->states[i]);
-    }
-    settings.path.pop_back();
-}
-
-void DataTypeTuple::deserializeBinaryBulkWithMultipleStreams(
-    IColumn & column,
-    size_t limit,
-    DeserializeBinaryBulkSettings & settings,
-    DeserializeBinaryBulkStatePtr & state) const
-{
-    auto * tuple_state = checkAndGetTupleDeserializeState(state);
-
-    settings.path.push_back(Substream::TupleElement);
-    settings.avg_value_size_hint = 0;
-    for (const auto i : ext::range(0, ext::size(elems)))
-    {
-        settings.path.back().tuple_element_name = names[i];
-        auto & element_col = extractElementColumn(column, i);
-        elems[i]->deserializeBinaryBulkWithMultipleStreams(element_col, limit, settings, tuple_state->states[i]);
-    }
-    settings.path.pop_back();
-}
-
-void DataTypeTuple::serializeProtobuf(const IColumn & column, size_t row_num, ProtobufWriter & protobuf, size_t & value_index) const
-{
-    for (; value_index < elems.size(); ++value_index)
-    {
-        size_t stored = 0;
-        elems[value_index]->serializeProtobuf(extractElementColumn(column, value_index), row_num, protobuf, stored);
-        if (!stored)
-            break;
-    }
-}
-
-void DataTypeTuple::deserializeProtobuf(IColumn & column, ProtobufReader & protobuf, bool allow_add_row, bool & row_added) const
-{
-    row_added = false;
-    bool all_elements_get_row = true;
-    addElementSafe(elems, column, [&]
-    {
-        for (const auto & i : ext::range(0, ext::size(elems)))
-        {
-            bool element_row_added;
-            elems[i]->deserializeProtobuf(extractElementColumn(column, i), protobuf, allow_add_row, element_row_added);
-            all_elements_get_row &= element_row_added;
-        }
-    });
-    row_added = all_elements_get_row;
-}
-
 MutableColumnPtr DataTypeTuple::createColumn() const
 {
+    if (elems.empty())
+        return ColumnTuple::create(0);
+
     size_t size = elems.size();
     MutableColumns tuple_columns(size);
     for (size_t i = 0; i < size; ++i)
@@ -455,16 +203,59 @@ MutableColumnPtr DataTypeTuple::createColumn() const
     return ColumnTuple::create(std::move(tuple_columns));
 }
 
+MutableColumnPtr DataTypeTuple::createColumn(const ISerialization & serialization) const
+{
+    /// If we read subcolumn of nested Tuple or this Tuple is a subcolumn, it may be wrapped to SerializationWrapper
+    /// several times to allow to reconstruct the substream path name.
+    /// Here we don't need substream path name, so we drop first several wrapper serializations.
+    const auto * current_serialization = &serialization;
+    while (const auto * serialization_wrapper = dynamic_cast<const SerializationWrapper *>(current_serialization))
+        current_serialization = serialization_wrapper->getNested().get();
+
+    /// We can have Replicated serialization over Tuple.
+    if (const auto * serialization_replicated = typeid_cast<const SerializationReplicated *>(current_serialization))
+        return ColumnReplicated::create(createColumn(*serialization_replicated->getNested()), ColumnUInt8::create());
+
+    /// We can have Detached serialization over Tuple (for parallel blocks marshalling).
+    /// Create the inner column; SerializationDetached::deserializeBinaryBulkWithMultipleStreams
+    /// will wrap it in ColumnBLOB during deserialization.
+    if (const auto * serialization_detached = typeid_cast<const SerializationDetached *>(current_serialization))
+        return createColumn(*serialization_detached->getNested());
+
+    const auto * serialization_tuple = typeid_cast<const SerializationTuple *>(current_serialization);
+    if (!serialization_tuple)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected serialization to create column of type Tuple");
+
+    if (elems.empty())
+        return IDataType::createColumn(serialization);
+
+    const auto & element_serializations = serialization_tuple->getElementsSerializations();
+
+    size_t size = elems.size();
+    assert(element_serializations.size() == size);
+    MutableColumns tuple_columns(size);
+    for (size_t i = 0; i < size; ++i)
+        tuple_columns[i] = elems[i]->createColumn(*element_serializations[i]->getNested());
+
+    return ColumnTuple::create(std::move(tuple_columns));
+}
+
 Field DataTypeTuple::getDefault() const
 {
-    return Tuple(ext::map<Tuple>(elems, [] (const DataTypePtr & elem) { return elem->getDefault(); }));
+    return Tuple(std::from_range_t{}, elems | std::views::transform([](const DataTypePtr & elem) { return elem->getDefault(); }));
 }
 
 void DataTypeTuple::insertDefaultInto(IColumn & column) const
 {
+    if (elems.empty())
+    {
+        column.insertDefault();
+        return;
+    }
+
     addElementSafe(elems, column, [&]
     {
-        for (const auto & i : ext::range(0, ext::size(elems)))
+        for (const auto & i : collections::range(0, elems.size()))
             elems[i]->insertDefaultInto(extractElementColumn(column, i));
     });
 }
@@ -481,26 +272,66 @@ bool DataTypeTuple::equals(const IDataType & rhs) const
         return false;
 
     for (size_t i = 0; i < size; ++i)
-        if (!elems[i]->equals(*rhs_tuple.elems[i]))
+        if (!elems[i]->equals(*rhs_tuple.elems[i]) || names[i] != rhs_tuple.names[i])
             return false;
 
     return true;
 }
 
 
-size_t DataTypeTuple::getPositionByName(const String & name) const
+size_t DataTypeTuple::getPositionByName(std::string_view name, bool case_insensitive) const
 {
-    size_t size = elems.size();
-    for (size_t i = 0; i < size; ++i)
-        if (names[i] == name)
-            return i;
-    throw Exception("Tuple doesn't have element with name '" + name + "'", ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK);
+    for (size_t i = 0; i < elems.size(); ++i)
+    {
+        if (case_insensitive)
+        {
+            if (boost::iequals(names[i], name))
+                return i;
+        }
+        else
+        {
+            if (boost::equals(names[i], name))
+                return i;
+        }
+    }
+    throw Exception(ErrorCodes::NOT_FOUND_COLUMN_IN_BLOCK, "Tuple doesn't have element with name '{}'", name);
+}
+
+std::optional<size_t> DataTypeTuple::tryGetPositionByName(std::string_view name, bool case_insensitive) const
+{
+    for (size_t i = 0; i < elems.size(); ++i)
+    {
+        if (case_insensitive)
+        {
+            if (boost::iequals(names[i], name))
+                return i;
+        }
+        else
+        {
+            if (boost::equals(names[i], name))
+                return i;
+        }
+    }
+    return std::nullopt;
+}
+
+String DataTypeTuple::getNameByPosition(size_t i) const
+{
+    if (i == 0 || i > names.size())
+        throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "Index of tuple element ({}) is out range ([1, {}])", i, names.size());
+
+    return names[i - 1];
 }
 
 
 bool DataTypeTuple::textCanContainOnlyValidUTF8() const
 {
     return std::all_of(elems.begin(), elems.end(), [](auto && elem) { return elem->textCanContainOnlyValidUTF8(); });
+}
+
+bool DataTypeTuple::hasDynamicStructure() const
+{
+    return std::ranges::any_of(elems, [](auto && elem) { return elem->hasDynamicStructure(); });
 }
 
 bool DataTypeTuple::haveMaximumSizeOfValue() const
@@ -529,11 +360,109 @@ size_t DataTypeTuple::getSizeOfValueInMemory() const
     return res;
 }
 
+SerializationPtr DataTypeTuple::doGetSerialization(const SerializationInfoSettings & settings) const
+{
+    SerializationTuple::ElementSerializations serializations(elems.size());
+
+    for (size_t i = 0; i < elems.size(); ++i)
+    {
+        String elem_name = has_explicit_names ? names[i] : toString(i + 1);
+        auto serialization = elems[i]->getSerialization(settings);
+        serializations[i] = std::static_pointer_cast<const SerializationNamed>(SerializationNamed::create(serialization, elem_name, SubstreamType::TupleElement));
+    }
+
+    return SerializationTuple::create(std::move(serializations), has_explicit_names);
+}
+
+SerializationPtr DataTypeTuple::getSerialization(const SerializationInfo & info) const
+{
+    SerializationTuple::ElementSerializations serializations(elems.size());
+    const auto & info_tuple = assert_cast<const SerializationInfoTuple &>(info);
+
+    for (size_t i = 0; i < elems.size(); ++i)
+    {
+        String elem_name = has_explicit_names ? names[i] : toString(i + 1);
+        auto serialization = elems[i]->getSerialization(*info_tuple.getElementInfo(i));
+        serializations[i] = std::static_pointer_cast<const SerializationNamed>(SerializationNamed::create(serialization, elem_name, SubstreamType::TupleElement));
+    }
+
+    auto kinds = info.getKindStack();
+    /// Compatibility with older version that may propagate Sparse serialization for Tuple itself (in serialization.json)
+    std::erase(kinds, ISerialization::Kind::SPARSE);
+    return wrapSerializationBasedOnKindStack(SerializationTuple::create(std::move(serializations), has_explicit_names), kinds, info.getSettings());
+}
+
+MutableSerializationInfoPtr DataTypeTuple::createSerializationInfo(const SerializationInfoSettings & settings) const
+{
+    MutableSerializationInfos infos;
+    infos.reserve(elems.size());
+    for (const auto & elem : elems)
+        infos.push_back(elem->createSerializationInfo(settings));
+
+    return std::make_shared<SerializationInfoTuple>(std::move(infos), names);
+}
+
+SerializationInfoPtr DataTypeTuple::getSerializationInfo(const IColumn & column) const
+{
+    if (const auto * column_const = checkAndGetColumn<ColumnConst>(&column))
+        return getSerializationInfo(column_const->getDataColumn());
+    return getSerializationInfoImpl(column);
+}
+
+SerializationInfoMutablePtr DataTypeTuple::getSerializationInfoImpl(const IColumn & column) const
+{
+    if (const auto * column_replicated = checkAndGetColumn<ColumnReplicated>(&column))
+    {
+        auto info = getSerializationInfoImpl(*column_replicated->getNestedColumn());
+        info->appendToKindStack(ISerialization::Kind::REPLICATED);
+        return info;
+    }
+
+    MutableSerializationInfos infos;
+    infos.reserve(elems.size());
+
+    const auto & column_tuple = assert_cast<const ColumnTuple &>(column);
+    assert(elems.size() == column_tuple.getColumns().size());
+
+    for (size_t i = 0; i < elems.size(); ++i)
+    {
+        auto element_info = elems[i]->getSerializationInfo(column_tuple.getColumn(i));
+        infos.push_back(const_pointer_cast<SerializationInfo>(element_info));
+    }
+
+    return std::make_shared<SerializationInfoTuple>(std::move(infos), names);
+}
+
+
+void DataTypeTuple::forEachChild(const ChildCallback & callback) const
+{
+    for (const auto & elem : elems)
+    {
+        callback(*elem);
+        elem->forEachChild(callback);
+    }
+}
+
+void DataTypeTuple::updateHashImpl(SipHash & hash) const
+{
+    hash.update(elems.size());
+    for (const auto & elem : elems)
+        elem->updateHash(hash);
+
+    hash.update(has_explicit_names);
+    // Include names in the hash if they are explicitly set
+    if (has_explicit_names)
+    {
+        hash.update(names.size());
+        for (const auto & name : names)
+            hash.update(name);
+    }
+}
 
 static DataTypePtr create(const ASTPtr & arguments)
 {
     if (!arguments || arguments->children.empty())
-        throw Exception("Tuple cannot be empty", ErrorCodes::EMPTY_DATA_PASSED);
+        return std::make_shared<DataTypeTuple>(DataTypes{});
 
     DataTypes nested_types;
     nested_types.reserve(arguments->children.size());
@@ -554,25 +483,15 @@ static DataTypePtr create(const ASTPtr & arguments)
 
     if (names.empty())
         return std::make_shared<DataTypeTuple>(nested_types);
-    else if (names.size() != nested_types.size())
-        throw Exception("Names are specified not for all elements of Tuple type", ErrorCodes::BAD_ARGUMENTS);
-    else
-        return std::make_shared<DataTypeTuple>(nested_types, names);
+    if (names.size() != nested_types.size())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Names are specified not for all elements of Tuple type");
+    return std::make_shared<DataTypeTuple>(nested_types, names);
 }
 
 
 void registerDataTypeTuple(DataTypeFactory & factory)
 {
     factory.registerDataType("Tuple", create);
-}
-
-void registerDataTypeNested(DataTypeFactory & factory)
-{
-    /// Nested(...) data type is just a sugar for Array(Tuple(...))
-    factory.registerDataType("Nested", [&factory](const ASTPtr & arguments)
-    {
-        return std::make_shared<DataTypeArray>(factory.get("Tuple", arguments));
-    });
 }
 
 }

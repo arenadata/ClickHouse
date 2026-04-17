@@ -1,5 +1,7 @@
 #include <Parsers/ParserDictionaryAttributeDeclaration.h>
 
+#include <Parsers/ASTDictionaryAttributeDeclaration.h>
+#include <Parsers/ASTIdentifier_fwd.h>
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ExpressionListParsers.h>
 #include <Parsers/ParserDataType.h>
@@ -11,13 +13,15 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
 {
     ParserIdentifier name_parser;
     ParserDataType type_parser;
-    ParserKeyword s_default{"DEFAULT"};
-    ParserKeyword s_expression{"EXPRESSION"};
-    ParserKeyword s_hierarchical{"HIERARCHICAL"};
-    ParserKeyword s_injective{"INJECTIVE"};
-    ParserKeyword s_is_object_id{"IS_OBJECT_ID"};
+    ParserKeyword s_default{Keyword::DEFAULT};
+    ParserKeyword s_expression{Keyword::EXPRESSION};
+    ParserKeyword s_hierarchical{Keyword::HIERARCHICAL};
+    ParserKeyword s_bidirectional{Keyword::BIDIRECTIONAL};
+    ParserKeyword s_injective{Keyword::INJECTIVE};
+    ParserKeyword s_is_object_id{Keyword::IS_OBJECT_ID};
     ParserLiteral default_parser;
-    ParserTernaryOperatorExpression expression_parser;
+    ParserArrayOfLiterals array_literals_parser;
+    ParserExpression expression_parser;
 
     /// mandatory attribute name
     ASTPtr name;
@@ -28,6 +32,7 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
     ASTPtr default_value;
     ASTPtr expression;
     bool hierarchical = false;
+    bool bidirectional = false;
     bool injective = false;
     bool is_object_id = false;
 
@@ -40,8 +45,10 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
     {
         if (!default_value && s_default.ignore(pos, expected))
         {
-            if (!default_parser.parse(pos, default_value, expected))
+            if (!default_parser.parse(pos, default_value, expected) &&
+                !array_literals_parser.parse(pos, default_value, expected))
                 return false;
+
             continue;
         }
 
@@ -56,6 +63,12 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
         if (!hierarchical && s_hierarchical.ignore(pos, expected))
         {
             hierarchical = true;
+            continue;
+        }
+
+        if (!bidirectional && s_bidirectional.ignore(pos, expected))
+        {
+            bidirectional = true;
             continue;
         }
 
@@ -74,7 +87,7 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
         break;
     }
 
-    auto attribute_declaration = std::make_shared<ASTDictionaryAttributeDeclaration>();
+    auto attribute_declaration = make_intrusive<ASTDictionaryAttributeDeclaration>();
     node = attribute_declaration;
     tryGetIdentifierNameInto(name, attribute_declaration->name);
 
@@ -97,6 +110,7 @@ bool ParserDictionaryAttributeDeclaration::parseImpl(Pos & pos, ASTPtr & node, E
     }
 
     attribute_declaration->hierarchical = hierarchical;
+    attribute_declaration->bidirectional = bidirectional;
     attribute_declaration->injective = injective;
     attribute_declaration->is_object_id = is_object_id;
 

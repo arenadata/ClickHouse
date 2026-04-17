@@ -1,18 +1,30 @@
 #pragma once
 
-#include <IO/WriteBufferFromFile.h>
-#include <IO/WriteBufferFromFileBase.h>
-#include <Compression/CompressedWriteBuffer.h>
-#include <IO/HashingWriteBuffer.h>
-#include <Storages/MergeTree/MergeTreeData.h>
-#include <DataStreams/IBlockOutputStream.h>
-#include <Storages/MergeTree/IMergeTreeDataPart.h>
-#include <Disks/IDisk.h>
+#include <Columns/IColumn_fwd.h>
+#include <Storages/MergeTree/IDataPartStorage.h>
+#include <Storages/MergeTree/MergeTreeDataPartType.h>
+#include <Storages/MergeTree/MergeTreeIOSettings.h>
+#include <Storages/MergeTree/MergeTreeIndexGranularity.h>
+#include <Storages/MergeTree/MergeTreeIndexGranularityInfo.h>
+#include <Storages/MergeTree/MergeTreeIndices.h>
+#include <Storages/MergeTree/ColumnsSubstreams.h>
+#include <Storages/Statistics/Statistics.h>
+#include <Storages/VirtualColumnsDescription.h>
+#include <Formats/MarkInCompressedFile.h>
 
 
 namespace DB
 {
 
+using IColumnPermutation = PaddedPODArray<size_t>;
+struct MergeTreeSettings;
+using MergeTreeSettingsPtr = std::shared_ptr<const MergeTreeSettings>;
+
+using WrittenOffsetSubstreams = std::set<std::string>;
+
+Block getIndexBlockAndPermute(const Block & block, const Names & names, const IColumnPermutation * permutation);
+
+Block permuteBlockIfNeeded(const Block & block, const IColumnPermutation * permutation);
 
 /// Writes data part to disk in different formats.
 /// Calculates and serializes primary and skip indices if needed.
@@ -20,71 +32,85 @@ class IMergeTreeDataPartWriter : private boost::noncopyable
 {
 public:
     IMergeTreeDataPartWriter(
-        const MergeTreeData::DataPartPtr & data_part_,
+        const String & data_part_name_,
+        const SerializationByName & serializations_,
+        MutableDataPartStoragePtr data_part_storage_,
+        const MergeTreeIndexGranularityInfo & index_granularity_info_,
+        const MergeTreeSettingsPtr & storage_settings_,
         const NamesAndTypesList & columns_list_,
         const StorageMetadataPtr & metadata_snapshot_,
-        const MergeTreeWriterSettings & settings_);
-
-    IMergeTreeDataPartWriter(
-        const MergeTreeData::DataPartPtr & data_part_,
-        const NamesAndTypesList & columns_list_,
-        const StorageMetadataPtr & metadata_snapshot_,
-        const MergeTreeIndices & skip_indices_,
-        const MergeTreeIndexGranularity & index_granularity_,
-        const MergeTreeWriterSettings & settings_);
+        const MergeTreeWriterSettings & settings_,
+        MergeTreeIndexGranularityPtr index_granularity_);
 
     virtual ~IMergeTreeDataPartWriter();
 
-    virtual void write(
-        const Block & block, const IColumn::Permutation * permutation = nullptr,
-        /* Blocks with already sorted index columns */
-        const Block & primary_key_block = {}, const Block & skip_indexes_block = {}) = 0;
+    virtual void write(const Block & block, const IColumnPermutation * permutation) = 0;
 
-    virtual void calculateAndSerializePrimaryIndex(const Block & /* primary_index_block */) {}
-    virtual void calculateAndSerializeSkipIndices(const Block & /* skip_indexes_block */) {}
+    virtual void finalizeIndexGranularity() = 0;
+    virtual void fillChecksums(MergeTreeDataPartChecksums & checksums, NameSet & checksums_to_remove) = 0;
 
-    /// Shift mark and offset to prepare read next mark.
-    /// You must call it after calling write method and optionally
-    ///  calling calculations of primary and skip indices.
-    void next();
+    virtual void finish(bool sync) = 0;
+    virtual void cancel() noexcept = 0;
 
-    virtual void initSkipIndices() {}
-    virtual void initPrimaryIndex() {}
+    virtual size_t getNumberOfOpenStreams() const = 0;
 
-    virtual void finishDataSerialization(IMergeTreeDataPart::Checksums & checksums) = 0;
-    virtual void finishPrimaryIndexSerialization(MergeTreeData::DataPart::Checksums & /* checksums */) {}
-    virtual void finishSkipIndicesSerialization(MergeTreeData::DataPart::Checksums & /* checksums */) {}
+    std::optional<Columns> releaseIndexColumns();
 
-    Columns releaseIndexColumns();
-    const MergeTreeIndexGranularity & getIndexGranularity() const { return index_granularity; }
-    const MergeTreeIndices & getSkipIndices() { return skip_indices; }
+    PlainMarksByName releaseCachedMarks();
+    PlainMarksByName releaseCachedIndexMarks();
+
+    MergeTreeIndexGranularityPtr getIndexGranularity() const { return index_granularity; }
+    MergeTreeWriterSettings getWriterSettings() const { return settings; }
+
+    virtual const Block & getColumnsSample() const = 0;
+
+    virtual const ColumnsSubstreams & getColumnsSubstreams() const = 0;
 
 protected:
-    size_t getCurrentMark() const { return current_mark; }
-    size_t getIndexOffset() const { return index_offset; }
+    SerializationPtr getSerialization(const String & column_name) const;
 
-    using SerializationState = IDataType::SerializeBinaryBulkStatePtr;
-    using SerializationStates = std::unordered_map<String, SerializationState>;
+    ASTPtr getCodecDescOrDefault(const String & column_name, CompressionCodecPtr default_codec) const;
 
-    MergeTreeData::DataPartPtr data_part;
-    const MergeTreeData & storage;
-    StorageMetadataPtr metadata_snapshot;
-    NamesAndTypesList columns_list;
-    MergeTreeIndices skip_indices;
-    MergeTreeIndexGranularity index_granularity;
-    MergeTreeWriterSettings settings;
-    bool with_final_mark;
+    IDataPartStorage & getDataPartStorage() { return *data_part_storage; }
 
-    size_t next_mark = 0;
-    size_t next_index_offset = 0;
+    const String data_part_name;
+    /// Serializations for every columns and subcolumns by their names.
+    const SerializationByName serializations;
+    const MergeTreeIndexGranularityInfo index_granularity_info;
+    const MergeTreeSettingsPtr storage_settings;
+    const StorageMetadataPtr metadata_snapshot;
+    const NamesAndTypesList columns_list;
+    const MergeTreeWriterSettings settings;
+    const bool with_final_mark;
 
+    MutableDataPartStoragePtr data_part_storage;
     MutableColumns index_columns;
-
-private:
-    /// Data is already written up to this mark.
-    size_t current_mark = 0;
-    /// The offset to the first row of the block for which you want to write the index.
-    size_t index_offset = 0;
+    MergeTreeIndexGranularityPtr index_granularity;
+    /// Marks that will be saved to cache on finish.
+    PlainMarksByName cached_marks;
+    /// Index marks (for secondary indices) that will be saved to cache on finish.
+    PlainMarksByName cached_index_marks;
 };
+
+using MergeTreeDataPartWriterPtr = std::unique_ptr<IMergeTreeDataPartWriter>;
+using ColumnPositions = std::unordered_map<std::string, size_t>;
+
+MergeTreeDataPartWriterPtr createMergeTreeDataPartWriter(
+        MergeTreeDataPartType part_type,
+        const String & data_part_name_,
+        const String & logger_name_,
+        const SerializationByName & serializations_,
+        MutableDataPartStoragePtr data_part_storage_,
+        const MergeTreeIndexGranularityInfo & index_granularity_info_,
+        const MergeTreeSettingsPtr & storage_settings_,
+        const NamesAndTypesList & columns_list,
+        const ColumnPositions & column_positions,
+        const StorageMetadataPtr & metadata_snapshot,
+        const std::vector<MergeTreeIndexPtr> & indices_to_recalc,
+        const String & marks_file_extension,
+        const CompressionCodecPtr & default_codec_,
+        const MergeTreeWriterSettings & writer_settings,
+        MergeTreeIndexGranularityPtr computed_index_granularity,
+        WrittenOffsetSubstreams * written_offset_substreams);
 
 }

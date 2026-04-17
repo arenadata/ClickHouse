@@ -1,12 +1,10 @@
-<test max_ignored_relative_change="0.3">
-    <preconditions>
-        <table_exists>hits_100m_single</table_exists>
-    </preconditions>
-
+<test>
     <substitutions>
         <substitution>
             <name>group_scale</name>
-            <value>1000000</value>
+            <values>
+                <value>1000000</value>
+            </values>
         </substitution>
     </substitutions>
 
@@ -89,4 +87,9 @@
 <query>select any(FromTag) from hits_100m_single where FromTag != '' group by intHash32(UserID) % {group_scale} FORMAT Null</query>
 <query>select anyHeavy(FromTag) from hits_100m_single where FromTag != '' group by intHash32(UserID) % {group_scale} FORMAT Null</query>
 
+<!-- Test with tuples (useful when you want to keep 2 columns of the same row) -->
+<query>select min((WatchID, CounterID)) from hits_100m_single FORMAT Null</query>
+<query>select max((WatchID, CounterID)) from hits_100m_single FORMAT Null</query>
+<query>select any((WatchID, CounterID)) from hits_100m_single FORMAT Null</query>
+<query>select anyHeavy((WatchID, CounterID)) from hits_100m_single FORMAT Null</query>
 </test>

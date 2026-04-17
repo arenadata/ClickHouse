@@ -1,17 +1,31 @@
-#include <Functions/IFunctionImpl.h>
+#pragma once
+
+#include <cstddef>
+#include <type_traits>
+
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/getLeastSupertype.h>
 #include <Columns/ColumnArray.h>
+#include <Columns/ColumnMap.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnNullable.h>
-#include <Common/FieldVisitorsAccurateComparison.h>
-#include <Common/memcmpSmall.h>
+#include <Common/FieldAccurateComparison.h>
+#include <base/memcmpSmall.h>
 #include <Common/assert_cast.h>
+#include <Columns/ColumnLowCardinality.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <Interpreters/castColumn.h>
+#include <Columns/ColumnObject.h>
+#include <Columns/ColumnDynamic.h>
+#include <DataTypes/DataTypeObject.h>
 
 
 namespace DB
@@ -21,236 +35,338 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int LOGICAL_ERROR;
 }
 
-/// For has.
-struct IndexToOne
+using NullMap = PaddedPODArray<UInt8>;
+
+/// ConcreteActions -- what to do when the index was found.
+
+struct HasAction
 {
     using ResultType = UInt8;
-    static bool apply(size_t, ResultType & current) { current = 1; return false; }
+    static constexpr const bool resume_execution = false;
+    static constexpr void apply(ResultType & current, size_t) noexcept { current = 1; }
 };
 
-/// For indexOf.
-struct IndexIdentity
+/// The index is returned starting from 1.
+struct IndexOfAction
 {
     using ResultType = UInt64;
-    /// The index is returned starting from 1.
-    static bool apply(size_t j, ResultType & current) { current = j + 1; return false; }
+    static constexpr const bool resume_execution = false;
+    static constexpr void apply(ResultType & current, size_t j) noexcept { current = j + 1; }
 };
 
-/// For countEqual.
-struct IndexCount
+struct IndexOfAssumeSorted : public IndexOfAction
+{
+};
+
+struct CountEqualAction
 {
     using ResultType = UInt64;
-    static bool apply(size_t, ResultType & current) { ++current; return true; }
+    static constexpr const bool resume_execution = true;
+    static constexpr void apply(ResultType & current, size_t) noexcept { ++current; }
 };
 
-
-template <typename T, typename U, typename IndexConv>
-struct ArrayIndexNumImpl
+/// How to perform the search depending on the arguments data types.
+namespace Impl
+{
+template <
+    typename ConcreteAction,
+    bool RightArgIsConstant = false,
+    typename IntegralInitial = UInt64,
+    typename IntegralResult = UInt64>
+struct Main
 {
 private:
+    using Initial = IntegralInitial;
+    using Result = IntegralResult;
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
+    using ResultType = typename ConcreteAction::ResultType;
+    using ResultArr = PaddedPODArray<ResultType>;
 
-    /// compares `lhs` against `i`-th element of `rhs`
-    static bool compare(const T & lhs, const PaddedPODArray<U> & rhs, const size_t i) { return lhs == rhs[i]; }
-    /// compares `lhs against `rhs`, third argument unused
-    static bool compare(const T & lhs, const U & rhs, size_t) { return lhs == rhs; }
+    using ArrOffset = ColumnArray::Offset;
+    using ArrOffsets = ColumnArray::Offsets;
 
-#pragma GCC diagnostic pop
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsign-compare"
 
-    static bool hasNull(const PaddedPODArray<UInt8> & null_map, size_t i)
+    static constexpr bool compare(const Initial & left, const PaddedPODArray<Result> & right, size_t, size_t i)
     {
-        return null_map[i];
+        return left == right[i];
     }
 
-    /// Both function arguments are ordinary.
-    template <typename ScalarOrVector>
-    static void vectorCase1(
-        const PaddedPODArray<T> & data, const ColumnArray::Offsets & offsets,
-        const ScalarOrVector & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result)
+    static constexpr bool compare(const PaddedPODArray<Initial> & left, const Result & right, size_t i, size_t)
     {
-        size_t size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
+        if constexpr (std::is_floating_point_v<Initial> && !std::is_floating_point_v<Result>)
         {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                if (compare(data[current_offset + j], value, i))
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
+            return left[i] == static_cast<Initial>(right);
+        }
+        else if constexpr (!std::is_floating_point_v<Initial> && std::is_floating_point_v<Result>)
+        {
+            return static_cast<Result>(left[i]) == right;
+        }
+        else
+        {
+            return left[i] == right;
         }
     }
 
-    /// The 2nd function argument is nullable.
-    template <typename ScalarOrVector>
-    static void vectorCase2(
-        const PaddedPODArray<T> & data, const ColumnArray::Offsets & offsets,
-        const ScalarOrVector & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> & null_map_item)
+    static constexpr bool compare(
+            const PaddedPODArray<Initial> & left, const PaddedPODArray<Result> & right, size_t i, size_t j)
     {
-        size_t size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
+        if constexpr (std::is_floating_point_v<Initial> && !std::is_floating_point_v<Result>)
         {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                if (!hasNull(null_map_item, i) && compare(data[current_offset + j], value, i))
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
+            return left[i] == static_cast<Initial>(right[j]);
+        }
+        else if constexpr (!std::is_floating_point_v<Initial> && std::is_floating_point_v<Result>)
+        {
+            return static_cast<Result>(left[i]) == right[j];
+        }
+        else
+        {
+            return left[i] == right[j];
         }
     }
 
-    /// The 1st function argument is a non-constant array of nullable values.
-    template <typename ScalarOrVector>
-    static void vectorCase3(
-        const PaddedPODArray<T> & data, const ColumnArray::Offsets & offsets,
-        const ScalarOrVector & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> & null_map_data)
+    /// LowCardinality
+    static bool compare(const IColumn & left, const Result & right, size_t i, size_t)
     {
-        size_t size = offsets.size();
-        result.resize(size);
+        return left.getUInt(i) == right;
+    }
 
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
+    /// Generic
+    static bool compare(const IColumn & left, const IColumn & right, size_t i, size_t j)
+    {
+        return 0 == left.compareAt(i, RightArgIsConstant ? 0 : j, right, 1);
+    }
+
+    static bool compare(const Array & arr, const Field& rhs, size_t pos, size_t)
+    {
+        return accurateEquals(arr[pos], rhs);
+    }
+
+    static constexpr bool lessOrEqual(const PaddedPODArray<Initial> & left, const Result & right, size_t i, size_t)
+    {
+        if constexpr (std::is_floating_point_v<Initial> && !std::is_floating_point_v<Result>)
         {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                if (null_map_data[current_offset + j])
-                {
-                }
-                else if (compare(data[current_offset + j], value, i))
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
+            return left[i] >= static_cast<Initial>(right);
+        }
+        else if constexpr (!std::is_floating_point_v<Initial> && std::is_floating_point_v<Result>)
+        {
+            return static_cast<Result>(left[i]) >= right;
+        }
+        else
+        {
+            return left[i] >= right;
         }
     }
 
-    /// The 1st function argument is a non-constant array of nullable values.
-    /// The 2nd function argument is nullable.
-    template <typename ScalarOrVector>
-    static void vectorCase4(
-        const PaddedPODArray<T> & data, const ColumnArray::Offsets & offsets,
-        const ScalarOrVector & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> & null_map_data,
-        const PaddedPODArray<UInt8> & null_map_item)
+    static bool lessOrEqual(const IColumn & left, const Result & right, size_t i, size_t) { return left[i] >= right; }
+
+    static bool lessOrEqual(const Array & arr, const Field & rhs, size_t pos, size_t)
     {
-        size_t size = offsets.size();
+        return accurateLessOrEqual(rhs, arr[pos]);
+    }
+
+#pragma clang diagnostic pop
+
+public:
+    /** Assuming that the array is sorted, use a binary search */
+    template <typename Data, typename Target>
+    static constexpr ResultType lowerBound(const Data & data, const Target & target, size_t array_size, ArrOffset current_offset)
+    {
+        ResultType current = 0;
+        size_t low = 0;
+        size_t high = array_size;
+        while (high - low > 0)
+        {
+            auto middle = low + ((high - low) >> 1);
+            auto compare_result = lessOrEqual(data, target, current_offset + middle, 0);
+            /// avoid conditional branching
+            high = compare_result ? middle : high;
+            low = compare_result ? low : middle + 1;
+        }
+        if (low < array_size && compare(data, target, current_offset + low, 0))
+        {
+            ConcreteAction::apply(current, low);
+        }
+        return current;
+    }
+
+    template <size_t Case, typename Data, typename Target>
+    static constexpr ResultType linearSearch(
+        const Data & data,
+        const Target & target,
+        size_t array_size,
+        const NullMap * const null_map_data,
+        const NullMap * const null_map_item,
+        size_t row_index,
+        ArrOffset current_offset)
+    {
+        ResultType current = 0;
+        for (size_t j = 0; j < array_size; ++j)
+        {
+            if constexpr (Case == 2) /// Right arg is Nullable
+                if (hasNull(null_map_item, row_index))
+                    continue;
+
+            if constexpr (Case == 3) /// Left arg is an array of Nullables
+                if (hasNull(null_map_data, current_offset + j))
+                    continue;
+
+            if constexpr (Case == 4) /// Both args are nullable
+            {
+                const bool right_is_null = hasNull(null_map_data, current_offset + j);
+                const bool left_is_null = hasNull(null_map_item, row_index);
+
+                if (right_is_null != left_is_null)
+                    continue;
+
+                if (!right_is_null && !compare(data, target, current_offset + j, row_index))
+                    continue;
+            }
+            else if (!compare(data, target, current_offset + j, row_index))
+                continue;
+
+            ConcreteAction::apply(current, j);
+
+            if constexpr (!ConcreteAction::resume_execution)
+                break;
+        }
+        return current;
+    }
+
+    static ResultType linearSearchConst(const Array & arr, const Field & value)
+    {
+        ResultType current = 0;
+        for (size_t i = 0, size = arr.size(); i < size; ++i)
+        {
+            if (!accurateEquals(arr[i], value))
+                continue;
+
+            ConcreteAction::apply(current, i);
+
+            if constexpr (!ConcreteAction::resume_execution)
+                break;
+        }
+        return current;
+    }
+
+private:
+    /** Looking for the target element index in the data (array) */
+    template <size_t Case, typename Data, typename Target>
+    static constexpr ResultType getIndex(
+        const Data & data,
+        const Target & target,
+        size_t array_size,
+        const NullMap * const null_map_data,
+        const NullMap * const null_map_item,
+        size_t row_index,
+        ArrOffset current_offset)
+    {
+        /** Use binary search if the following conditions are met.
+          *   1. The array type is not nullable. (Case = 1)
+          *   2. Target is not a column or an array.
+          */
+        if constexpr (
+            std::is_same_v<ConcreteAction, IndexOfAssumeSorted> && !std::is_same_v<Target, PaddedPODArray<Result>>
+            && !std::is_same_v<Target, IColumn> && Case == 1)
+        {
+            return lowerBound(data, target, array_size, current_offset);
+        }
+        return linearSearch<Case>(data, target, array_size, null_map_data, null_map_item, row_index, current_offset);
+    }
+
+    static constexpr bool hasNull(const NullMap * const null_map, size_t i) noexcept { return (*null_map)[i]; }
+
+    template <size_t Case, typename Data, typename Target>
+    static void process(
+        const Data & data,
+        const ArrOffsets & offsets,
+        const Target & target,
+        ResultArr & result,
+        [[maybe_unused]] const NullMap * const null_map_data,
+        [[maybe_unused]] const NullMap * const null_map_item)
+    {
+        if constexpr (std::is_same_v<Data, IColumn> && std::is_same_v<Target, IColumn>)
+        {
+            /// Generic variant is using IColumn::compare function that only allows to compare columns of identical types.
+            if (typeid(data) != typeid(target))
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Columns {} and {} cannot be compared", data.getName(), target.getName());
+        }
+
+        const size_t size = offsets.size();
         result.resize(size);
 
-        ColumnArray::Offset current_offset = 0;
+        ArrOffset current_offset = 0;
+
         for (size_t i = 0; i < size; ++i)
         {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                bool hit = false;
-                if (null_map_data[current_offset + j])
-                {
-                    if (hasNull(null_map_item, i))
-                        hit = true;
-                }
-                else if (compare(data[current_offset + j], value, i))
-                    hit = true;
-
-                if (hit)
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
+            const size_t array_size = offsets[i] - current_offset;
+            result[i] = getIndex<Case>(data, target, array_size, null_map_data, null_map_item, i, current_offset);
             current_offset = offsets[i];
         }
     }
 
 public:
-    template <typename ScalarOrVector>
+    template <typename Data, typename Target>
     static void vector(
-        const PaddedPODArray<T> & data, const ColumnArray::Offsets & offsets,
-        const ScalarOrVector & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> * null_map_data,
-        const PaddedPODArray<UInt8> * null_map_item)
+        const Data & data,
+        const ArrOffsets & offsets,
+        const Target & value,
+        ResultArr & result,
+        const NullMap * const null_map_data,
+        const NullMap * const null_map_item)
     {
-        /// Processing is split into 4 cases.
         if (!null_map_data && !null_map_item)
-            vectorCase1(data, offsets, value, result);
+            process<1>(data, offsets, value, result, null_map_data, null_map_item);
         else if (!null_map_data && null_map_item)
-            vectorCase2(data, offsets, value, result, *null_map_item);
+            process<2>(data, offsets, value, result, null_map_data, null_map_item);
         else if (null_map_data && !null_map_item)
-            vectorCase3(data, offsets, value, result, *null_map_data);
+            process<3>(data, offsets, value, result, null_map_data, null_map_item);
         else
-            vectorCase4(data, offsets, value, result, *null_map_data, *null_map_item);
+            process<4>(data, offsets, value, result, null_map_data, null_map_item);
     }
 };
 
-
-/// Implementation for arrays of numbers when the 2nd function argument
-/// is a NULL value.
-template <typename T, typename IndexConv>
-struct ArrayIndexNumNullImpl
+/// When the 2nd function argument is a NULL value.
+template <typename ConcreteAction>
+struct Null
 {
-    static void vector(
-        const PaddedPODArray<T> & /*data*/, const ColumnArray::Offsets & offsets,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> * null_map_data)
+    using ResultType = typename ConcreteAction::ResultType;
+
+    static void process(
+        const ColumnArray::Offsets & offsets,
+        PaddedPODArray<ResultType> & result,
+        [[maybe_unused]] const NullMap * null_map_data)
     {
-        size_t size = offsets.size();
+        const size_t size = offsets.size();
+
+        if (!null_map_data)
+        {
+            result.resize_fill(size);
+            return;
+        }
+
         result.resize(size);
 
         ColumnArray::Offset current_offset = 0;
+
         for (size_t i = 0; i < size; ++i)
         {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
+            ResultType current = 0;
+            const size_t array_size = offsets[i] - current_offset;
 
             for (size_t j = 0; j < array_size; ++j)
             {
-                if (null_map_data && (*null_map_data)[current_offset + j])
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
+                if (!(*null_map_data)[current_offset + j])
+                    continue;
+
+                ConcreteAction::apply(current, j);
+
+                if constexpr (!ConcreteAction::resume_execution)
+                    break;
             }
 
             result[i] = current;
@@ -259,158 +375,80 @@ struct ArrayIndexNumNullImpl
     }
 };
 
-/// Implementation for arrays of strings when the 2nd function argument is a NULL value.
-template <typename IndexConv>
-struct ArrayIndexStringNullImpl
-{
-    static void vector_const(
-        const ColumnString::Chars & /*data*/, const ColumnArray::Offsets & offsets, const ColumnString::Offsets & /*string_offsets*/,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> * null_map_data)
-    {
-        const auto size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            const auto array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                if (null_map_data && (*null_map_data)[current_offset + j])
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
-        }
-    }
-};
-
-template <typename IndexConv>
-struct ArrayIndexStringImpl
-{
-    static void vector_const(
-        const ColumnString::Chars & data, const ColumnArray::Offsets & offsets, const ColumnString::Offsets & string_offsets,
-        const ColumnString::Chars & value, ColumnString::Offset value_size,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> * null_map_data)
-    {
-        const auto size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            const auto array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                ColumnArray::Offset string_pos = current_offset == 0 && j == 0
-                    ? 0
-                    : string_offsets[current_offset + j - 1];
-
-                ColumnArray::Offset string_size = string_offsets[current_offset + j] - string_pos - 1;
-
-                if (null_map_data && (*null_map_data)[current_offset + j])
-                {
-                }
-                else if (memequalSmallAllowOverflow15(value.data(), value_size, &data[string_pos], string_size))
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
-        }
-    }
-
-    static void vectorVector(
-        const ColumnString::Chars & data, const ColumnArray::Offsets & offsets, const ColumnString::Offsets & string_offsets,
-        const ColumnString::Chars & item_values, const ColumnString::Offsets & item_offsets,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> * null_map_data,
-        const PaddedPODArray<UInt8> * null_map_item)
-    {
-        const auto size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            const auto array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-            const auto value_pos = 0 == i ? 0 : item_offsets[i - 1];
-            const auto value_size = item_offsets[i] - value_pos;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                ColumnArray::Offset string_pos = current_offset == 0 && j == 0
-                    ? 0
-                    : string_offsets[current_offset + j - 1];
-
-                ColumnArray::Offset string_size = string_offsets[current_offset + j] - string_pos;
-
-                bool hit = false;
-
-                if (null_map_data && (*null_map_data)[current_offset + j])
-                {
-                    if (null_map_item && (*null_map_item)[i])
-                        hit = true;
-                }
-                else if (memequalSmallAllowOverflow15(&item_values[value_pos], value_size, &data[string_pos], string_size))
-                    hit = true;
-
-                if (hit)
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
-        }
-    }
-};
-
-/// Catch-all implementation for arrays of arbitrary type.
-/// To compare with constant value, create non-constant column with single element,
-/// and pass is_value_has_single_element_to_compare = true.
-template <typename IndexConv, bool is_value_has_single_element_to_compare>
-struct ArrayIndexGenericImpl
+template <typename ConcreteAction>
+struct String
 {
 private:
-    /// Both function arguments are ordinary.
-    static void vectorCase1(
-        const IColumn & data, const ColumnArray::Offsets & offsets,
-        const IColumn & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result)
+    using Offset = ColumnString::Offset;
+    template <bool IsConst> using OffsetT = std::conditional_t<IsConst, Offset, const ColumnString::Offsets &>;
+    using ArrayOffset = ColumnArray::Offset;
+    using ResultType = typename ConcreteAction::ResultType;
+
+    template <bool IsConst, bool HasNullMapData, bool HasNullMapItem>
+    static void processImpl(
+        const ColumnString::Chars & data,
+        const ColumnArray::Offsets & offsets,
+        const ColumnString::Offsets & string_offsets,
+        const ColumnString::Chars & item_values,
+        OffsetT<IsConst> item_offsets,
+        PaddedPODArray<ResultType> & result,
+        [[maybe_unused]] const NullMap * data_map,
+        [[maybe_unused]] const NullMap * item_map)
     {
-        size_t size = offsets.size();
+        const size_t size = offsets.size();
         result.resize(size);
 
-        ColumnArray::Offset current_offset = 0;
+        ArrayOffset current_offset = 0;
+
         for (size_t i = 0; i < size; ++i)
         {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
+            const ArrayOffset array_size = offsets[i] - current_offset;
+
+            [[maybe_unused]] Offset value_pos = 0;
+            [[maybe_unused]] Offset value_size = 0;
+
+            if constexpr (!IsConst) // workaround because ?: ternary operator is not constexpr
+            {
+                value_pos = item_offsets[i - 1];
+                value_size = item_offsets[i] - value_pos;
+            }
+
+            ResultType current = 0;
 
             for (size_t j = 0; j < array_size; ++j)
             {
-                if (0 == data.compareAt(current_offset + j, is_value_has_single_element_to_compare ? 0 : i, value, 1))
+                const ArrayOffset string_pos = string_offsets[current_offset + j - 1];
+                const ArrayOffset string_size = string_offsets[current_offset + j] - string_pos;
+
+                if constexpr (IsConst)
                 {
-                    if (!IndexConv::apply(j, current))
-                        break;
+                    if constexpr (HasNullMapData)
+                        if ((*data_map)[current_offset + j])
+                            continue;
+
+                    if (!memequalSmallAllowOverflow15(item_values.data(), item_offsets, &data[string_pos], string_size))
+                        continue;
                 }
+                else if constexpr (HasNullMapData)
+                {
+                    if ((*data_map)[current_offset + j])
+                    {
+                        if constexpr (!HasNullMapItem)
+                            continue;
+
+                        if (!(*item_map)[i])
+                            continue;
+                    }
+                    else if (!memequalSmallAllowOverflow15(&item_values[value_pos], value_size, &data[string_pos], string_size))
+                        continue;
+                }
+                else if (!memequalSmallAllowOverflow15(&item_values[value_pos], value_size, &data[string_pos], string_size))
+                    continue;
+
+                ConcreteAction::apply(current, j);
+
+                if constexpr (!ConcreteAction::resume_execution)
+                    break;
             }
 
             result[i] = current;
@@ -418,591 +456,853 @@ private:
         }
     }
 
-    /// The 2nd function argument is nullable.
-    static void vectorCase2(
-        const IColumn & data, const ColumnArray::Offsets & offsets,
-        const IColumn & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> & null_map_item)
+    template <bool IsConst>
+    static void invokeCheckNullMaps(
+        const ColumnString::Chars & data, const ColumnArray::Offsets & offsets,
+        const ColumnString::Offsets & str_offsets, const ColumnString::Chars & values,
+        OffsetT<IsConst> item_offsets,
+        PaddedPODArray<ResultType> & result, const NullMap * data_map, const NullMap * item_map)
     {
-        size_t size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                if ((null_map_item[i] == 0) &&
-                    (0 == data.compareAt(current_offset + j, is_value_has_single_element_to_compare ? 0 : i, value, 1)))
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
-        }
-    }
-
-    /// The 1st function argument is a non-constant array of nullable values.
-    static void vectorCase3(
-        const IColumn & data, const ColumnArray::Offsets & offsets,
-        const IColumn & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> & null_map_data)
-    {
-        size_t size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                if (null_map_data[current_offset + j])
-                {
-                }
-                else if (0 == data.compareAt(current_offset + j, is_value_has_single_element_to_compare ? 0 : i, value, 1))
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
-        }
-    }
-
-    /// The 1st function argument is a non-constant array of nullable values.
-    /// The 2nd function argument is nullable.
-    static void vectorCase4(
-        const IColumn & data, const ColumnArray::Offsets & offsets,
-        const IColumn & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> & null_map_data,
-        const PaddedPODArray<UInt8> & null_map_item)
-    {
-        size_t size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                bool hit = false;
-                if (null_map_data[current_offset + j])
-                {
-                    if (null_map_item[i])
-                        hit = true;
-                }
-                else if (0 == data.compareAt(current_offset + j, is_value_has_single_element_to_compare ? 0 : i, value, 1))
-                        hit = true;
-
-                if (hit)
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-        }
+        if (data_map && item_map)
+            processImpl<IsConst, true, true>(data, offsets, str_offsets, values, item_offsets, result, data_map, item_map);
+        else if (data_map)
+            processImpl<IsConst, true, false>(data, offsets, str_offsets, values, item_offsets, result, data_map, item_map);
+        else if (item_map)
+            processImpl<IsConst, false, true>(data, offsets, str_offsets, values, item_offsets, result, data_map, item_map);
+        else
+            processImpl<IsConst, false, false>(data, offsets, str_offsets, values, item_offsets, result, data_map, item_map);
     }
 
 public:
-    static void vector(
-        const IColumn & data, const ColumnArray::Offsets & offsets,
-        const IColumn & value,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> * null_map_data,
-        const PaddedPODArray<UInt8> * null_map_item)
+    static void process(
+        const ColumnString::Chars & data, const ColumnArray::Offsets & offsets,
+        const ColumnString::Offsets & string_offsets, const ColumnString::Chars & item_values,
+        Offset item_offsets, PaddedPODArray<ResultType> & result,
+        const NullMap * data_map, const NullMap * item_map)
     {
-        /// Processing is split into 4 cases.
-        if (!null_map_data && !null_map_item)
-            vectorCase1(data, offsets, value, result);
-        else if (!null_map_data && null_map_item)
-            vectorCase2(data, offsets, value, result, *null_map_item);
-        else if (null_map_data && !null_map_item)
-            vectorCase3(data, offsets, value, result, *null_map_data);
-        else
-            vectorCase4(data, offsets, value, result, *null_map_data, *null_map_item);
+        invokeCheckNullMaps<true>(data, offsets, string_offsets, item_values, item_offsets, result, data_map, item_map);
+    }
+
+    static void process(
+        const ColumnString::Chars & data, const ColumnArray::Offsets & offsets,
+        const ColumnString::Offsets & string_offsets, const ColumnString::Chars & item_values,
+        const ColumnString::Offsets & item_offsets, PaddedPODArray<ResultType> & result,
+        const NullMap * data_map, const NullMap * item_map)
+    {
+        invokeCheckNullMaps<false>(data, offsets, string_offsets, item_values, item_offsets, result, data_map, item_map);
     }
 };
-
-/// Catch-all implementation for arrays of arbitrary type
-/// when the 2nd function argument is a NULL value.
-template <typename IndexConv>
-struct ArrayIndexGenericNullImpl
-{
-    static void vector(
-        const IColumn & /*data*/, const ColumnArray::Offsets & offsets,
-        PaddedPODArray<typename IndexConv::ResultType> & result,
-        const PaddedPODArray<UInt8> * null_map_data)
-    {
-        size_t size = offsets.size();
-        result.resize(size);
-
-        ColumnArray::Offset current_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            size_t array_size = offsets[i] - current_offset;
-            typename IndexConv::ResultType current = 0;
-
-            for (size_t j = 0; j < array_size; ++j)
-            {
-                if (null_map_data && (*null_map_data)[current_offset + j])
-                {
-                    if (!IndexConv::apply(j, current))
-                        break;
-                }
-            }
-
-            result[i] = current;
-            current_offset = offsets[i];
-        }
-    }
-};
-
-
-inline bool allowArrayIndex(const DataTypePtr & type0, const DataTypePtr & type1)
-{
-    DataTypePtr data_type0 = removeNullable(type0);
-    DataTypePtr data_type1 = removeNullable(type1);
-
-    return ((isNativeNumber(data_type0) || isEnum(data_type0)) && isNativeNumber(data_type1))
-        || data_type0->equals(*data_type1);
 }
 
-
-template <typename IndexConv, typename Name>
+template <typename ConcreteAction, typename Name>
 class FunctionArrayIndex : public IFunction
 {
 public:
     static constexpr auto name = Name::name;
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionArrayIndex>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionArrayIndex>(); }
 
-private:
-    using ResultColumnType = ColumnVector<typename IndexConv::ResultType>;
-
-    template <typename T>
-    bool executeNumber(Block & block, const ColumnNumbers & arguments, size_t result)
-    {
-        return executeNumberNumber<T, UInt8>(block, arguments, result)
-            || executeNumberNumber<T, UInt16>(block, arguments, result)
-            || executeNumberNumber<T, UInt32>(block, arguments, result)
-            || executeNumberNumber<T, UInt64>(block, arguments, result)
-            || executeNumberNumber<T, Int8>(block, arguments, result)
-            || executeNumberNumber<T, Int16>(block, arguments, result)
-            || executeNumberNumber<T, Int32>(block, arguments, result)
-            || executeNumberNumber<T, Int64>(block, arguments, result)
-            || executeNumberNumber<T, Float32>(block, arguments, result)
-            || executeNumberNumber<T, Float64>(block, arguments, result);
-    }
-
-    template <typename T, typename U>
-    bool executeNumberNumber(Block & block, const ColumnNumbers & arguments, size_t result)
-    {
-        const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(block.getByPosition(arguments[0]).column.get());
-
-        if (!col_array)
-            return false;
-
-        const ColumnVector<T> * col_nested = checkAndGetColumn<ColumnVector<T>>(&col_array->getData());
-
-        if (!col_nested)
-            return false;
-
-        auto col_res = ResultColumnType::create();
-
-        /// Null maps of the 1st and second function arguments,
-        /// if it applies.
-        const PaddedPODArray<UInt8> * null_map_data = nullptr;
-        const PaddedPODArray<UInt8> * null_map_item = nullptr;
-
-        if (arguments.size() > 2)
-        {
-            const auto & null_map1 = block.getByPosition(arguments[2]).column;
-            if (null_map1)
-                null_map_data = &assert_cast<const ColumnUInt8 &>(*null_map1).getData();
-
-            const auto & null_map2 = block.getByPosition(arguments[3]).column;
-            if (null_map2)
-                null_map_item = &assert_cast<const ColumnUInt8 &>(*null_map2).getData();
-        }
-
-        const auto item_arg = block.getByPosition(arguments[1]).column.get();
-
-        if (item_arg->onlyNull())
-            ArrayIndexNumNullImpl<T, IndexConv>::vector(col_nested->getData(), col_array->getOffsets(),
-                col_res->getData(), null_map_data);
-        else if (const auto item_arg_const = checkAndGetColumnConst<ColumnVector<U>>(item_arg))
-            ArrayIndexNumImpl<T, U, IndexConv>::vector(col_nested->getData(), col_array->getOffsets(),
-                item_arg_const->template getValue<U>(), col_res->getData(), null_map_data, nullptr);
-        else if (const auto item_arg_vector = checkAndGetColumn<ColumnVector<U>>(item_arg))
-            ArrayIndexNumImpl<T, U, IndexConv>::vector(col_nested->getData(), col_array->getOffsets(),
-                item_arg_vector->getData(), col_res->getData(), null_map_data, null_map_item);
-        else
-            return false;
-
-        block.getByPosition(result).column = std::move(col_res);
-        return true;
-    }
-
-    bool executeString(Block & block, const ColumnNumbers & arguments, size_t result)
-    {
-        const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(block.getByPosition(arguments[0]).column.get());
-
-        if (!col_array)
-            return false;
-
-        const ColumnString * col_nested = checkAndGetColumn<ColumnString>(&col_array->getData());
-
-        if (!col_nested)
-            return false;
-
-        auto col_res = ResultColumnType::create();
-
-        /// Null maps of the 1st and second function arguments,
-        /// if it applies.
-        const PaddedPODArray<UInt8> * null_map_data = nullptr;
-        const PaddedPODArray<UInt8> * null_map_item = nullptr;
-
-        if (arguments.size() > 2)
-        {
-            const auto & col1 = block.getByPosition(arguments[2]).column;
-            if (col1)
-                null_map_data = &assert_cast<const ColumnUInt8 &>(*col1).getData();
-
-            const auto & col2 = block.getByPosition(arguments[3]).column;
-            if (col2)
-                null_map_item = &assert_cast<const ColumnUInt8 &>(*col2).getData();
-        }
-
-        const auto item_arg = block.getByPosition(arguments[1]).column.get();
-
-        if (item_arg->onlyNull())
-        {
-            ArrayIndexStringNullImpl<IndexConv>::vector_const(col_nested->getChars(), col_array->getOffsets(),
-                col_nested->getOffsets(), col_res->getData(), null_map_data);
-        }
-        else if (const auto item_arg_const = checkAndGetColumnConstStringOrFixedString(item_arg))
-        {
-            const ColumnString * item_const_string = checkAndGetColumn<ColumnString>(&item_arg_const->getDataColumn());
-            const ColumnFixedString * item_const_fixedstring = checkAndGetColumn<ColumnFixedString>(&item_arg_const->getDataColumn());
-
-            if (item_const_string)
-                ArrayIndexStringImpl<IndexConv>::vector_const(col_nested->getChars(), col_array->getOffsets(), col_nested->getOffsets(),
-                    item_const_string->getChars(), item_const_string->getDataAt(0).size,
-                    col_res->getData(), null_map_data);
-            else if (item_const_fixedstring)
-                ArrayIndexStringImpl<IndexConv>::vector_const(col_nested->getChars(), col_array->getOffsets(), col_nested->getOffsets(),
-                    item_const_fixedstring->getChars(), item_const_fixedstring->getN(),
-                    col_res->getData(), null_map_data);
-            else
-                throw Exception("Logical error: ColumnConst contains not String nor FixedString column", ErrorCodes::ILLEGAL_COLUMN);
-        }
-        else if (const auto item_arg_vector = checkAndGetColumn<ColumnString>(item_arg))
-        {
-            ArrayIndexStringImpl<IndexConv>::vectorVector(col_nested->getChars(), col_array->getOffsets(),
-                col_nested->getOffsets(), item_arg_vector->getChars(), item_arg_vector->getOffsets(),
-                col_res->getData(), null_map_data, null_map_item);
-        }
-        else
-            return false;
-
-        block.getByPosition(result).column = std::move(col_res);
-        return true;
-    }
-
-    bool executeConst(Block & block, const ColumnNumbers & arguments, size_t result)
-    {
-        const ColumnConst * col_array = checkAndGetColumnConst<ColumnArray>(block.getByPosition(arguments[0]).column.get());
-
-        if (!col_array)
-            return false;
-
-        Array arr = col_array->getValue<Array>();
-
-        const auto item_arg = block.getByPosition(arguments[1]).column.get();
-        if (isColumnConst(*item_arg))
-        {
-            typename IndexConv::ResultType current = 0;
-            const auto & value = (*item_arg)[0];
-
-            for (size_t i = 0, size = arr.size(); i < size; ++i)
-            {
-                if (applyVisitor(FieldVisitorAccurateEquals(), arr[i], value))
-                {
-                    if (!IndexConv::apply(i, current))
-                        break;
-                }
-            }
-
-            block.getByPosition(result).column = block.getByPosition(result).type->createColumnConst(
-                item_arg->size(),
-                static_cast<typename IndexConv::ResultType>(current));
-        }
-        else
-        {
-            /// Null map of the 2nd function argument, if it applies.
-            const PaddedPODArray<UInt8> * null_map = nullptr;
-
-            if (arguments.size() > 2)
-            {
-                const auto & col = block.getByPosition(arguments[3]).column;
-                if (col)
-                    null_map = &assert_cast<const ColumnUInt8 &>(*col).getData();
-            }
-
-            const auto size = item_arg->size();
-            auto col_res = ResultColumnType::create(size);
-
-            auto & data = col_res->getData();
-
-            for (size_t row = 0; row < size; ++row)
-            {
-                const auto & value = (*item_arg)[row];
-
-                data[row] = 0;
-                for (size_t i = 0, arr_size = arr.size(); i < arr_size; ++i)
-                {
-                    bool hit = false;
-
-                    if (arr[i].isNull())
-                    {
-                        if (null_map && (*null_map)[row])
-                            hit = true;
-                    }
-                    else if (applyVisitor(FieldVisitorAccurateEquals(), arr[i], value))
-                        hit = true;
-
-                    if (hit)
-                    {
-                        if (!IndexConv::apply(i, data[row]))
-                            break;
-                    }
-                }
-            }
-
-            block.getByPosition(result).column = std::move(col_res);
-        }
-
-        return true;
-    }
-
-    bool executeGeneric(Block & block, const ColumnNumbers & arguments, size_t result)
-    {
-        const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(block.getByPosition(arguments[0]).column.get());
-
-        if (!col_array)
-            return false;
-
-        const IColumn & col_nested = col_array->getData();
-        const IColumn & item_arg = *block.getByPosition(arguments[1]).column;
-
-        auto col_res = ResultColumnType::create();
-
-        /// Null maps of the 1st and second function arguments,
-        /// if it applies.
-        const PaddedPODArray<UInt8> * null_map_data = nullptr;
-        const PaddedPODArray<UInt8> * null_map_item = nullptr;
-
-        if (arguments.size() > 2)
-        {
-            const auto & null_map1 = block.getByPosition(arguments[2]).column;
-            if (null_map1)
-                null_map_data = &assert_cast<const ColumnUInt8 &>(*null_map1).getData();
-
-            const auto & null_map2 = block.getByPosition(arguments[3]).column;
-            if (null_map2)
-                null_map_item = &assert_cast<const ColumnUInt8 &>(*null_map2).getData();
-        }
-
-        if (item_arg.onlyNull())
-            ArrayIndexGenericNullImpl<IndexConv>::vector(col_nested, col_array->getOffsets(),
-                col_res->getData(), null_map_data);
-        else if (isColumnConst(item_arg))
-            ArrayIndexGenericImpl<IndexConv, true>::vector(col_nested, col_array->getOffsets(),
-                assert_cast<const ColumnConst &>(item_arg).getDataColumn(), col_res->getData(),    /// TODO This is wrong.
-                null_map_data, nullptr);
-        else
-        {
-            ArrayIndexGenericImpl<IndexConv, false>::vector(
-                col_nested, col_array->getOffsets(), *item_arg.convertToFullColumnIfConst(), col_res->getData(),
-                null_map_data, null_map_item);
-        }
-
-        block.getByPosition(result).column = std::move(col_res);
-        return true;
-    }
-
-
-public:
     /// Get function name.
-    String getName() const override
-    {
-        return name;
-    }
+    String getName() const override { return name; }
 
     bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     size_t getNumberOfArguments() const override { return 2; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
-        const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
-        if (!array_type)
-            throw Exception("First argument for function " + getName() + " must be an array.",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        auto first_argument_type = arguments[0].type;
+        auto second_argument_type = arguments[1].type;
 
-        if (!arguments[1]->onlyNull())
+        const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(first_argument_type.get());
+        const DataTypeMap * map_type = checkAndGetDataType<DataTypeMap>(first_argument_type.get());
+
+        DataTypePtr inner_type;
+
+        const DataTypeObject * object_type = checkAndGetDataType<DataTypeObject>(first_argument_type.get());
+        if constexpr (std::is_same_v<ConcreteAction, HasAction>)
         {
-            if (!allowArrayIndex(array_type->getNestedType(), arguments[1]))
-                throw Exception("Types of array and 2nd argument of function "
-                    + getName() + " must be identical up to nullability or numeric types or Enum and numeric type. Passed: "
-                    + arguments[0]->getName() + " and " + arguments[1]->getName() + ".",
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        }
+            if (!array_type && !map_type && !object_type)
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "First argument for function {} must be an array, map or JSON. Actual {}",
+                    getName(),
+                    first_argument_type->getName());
 
-        return std::make_shared<DataTypeNumber<typename IndexConv::ResultType>>();
-    }
+            if (object_type)
+            {
+                if (!isStringOrFixedString(second_argument_type))
+                    throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                        "Second argument for function {} must be String when the first argument is JSON. Actual {}",
+                        getName(), second_argument_type->getName());
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
-    {
-        /// If one or both arguments passed to this function are nullable,
-        /// we create a new block that contains non-nullable arguments:
-        /// - if the 1st argument is a non-constant array of nullable values,
-        /// it is turned into a non-constant array of ordinary values + a null
-        /// byte map;
-        /// - if the 2nd argument is a nullable value, it is turned into an
-        /// ordinary value + a null byte map.
-        /// Note that since constant arrays have quite a specific structure
-        /// (they are vectors of Fields, which may represent the NULL value),
-        /// they do not require any preprocessing
+                return std::make_shared<DataTypeUInt8>();
+            }
 
-        const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(block.getByPosition(arguments[0]).column.get());
-
-        const ColumnNullable * nullable = nullptr;
-        if (col_array)
-            nullable = checkAndGetColumn<ColumnNullable>(col_array->getData());
-
-        auto & arg_column = block.getByPosition(arguments[1]).column;
-
-        const ColumnNullable * arg_nullable = nullptr;
-        arg_nullable = checkAndGetColumn<ColumnNullable>(*arg_column);
-
-        if (!nullable && !arg_nullable)
-        {
-            /// Simple case: no nullable values passeded.
-            perform(block, arguments, result);
+            inner_type = map_type ? map_type->getKeyType() : array_type->getNestedType();
         }
         else
         {
-            /// Template of the block on which we will actually apply the function.
-            /// Its elements will be filled later.
-            Block source_block =
-            {
-                /// 1st function argument (data)
-                {
-                },
+            if (!array_type)
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "First argument for function {} must be an array. Actual {}",
+                    getName(),
+                    first_argument_type->getName());
 
-                /// 2nd function argument
-                {
-                },
-
-                /// 1st argument null map
-                {
-                },
-
-                /// 2nd argument null map
-                {
-                },
-
-                /// Function result.
-                {
-                    nullptr,
-                    block.getByPosition(result).type,
-                    ""
-                }
-            };
-
-            if (nullable)
-            {
-                const auto & nested_col = nullable->getNestedColumnPtr();
-
-                auto & data = source_block.getByPosition(0);
-                data.column = ColumnArray::create(nested_col, col_array->getOffsetsPtr());
-                data.type = std::make_shared<DataTypeArray>(
-                    static_cast<const DataTypeNullable &>(
-                        *static_cast<const DataTypeArray &>(*block.getByPosition(arguments[0]).type).getNestedType()).getNestedType());
-
-                auto & null_map = source_block.getByPosition(2);
-                null_map.column = nullable->getNullMapColumnPtr();
-                null_map.type = std::make_shared<DataTypeUInt8>();
-            }
-            else
-            {
-                auto & data = source_block.getByPosition(0);
-                data = block.getByPosition(arguments[0]);
-            }
-
-            if (arg_nullable)
-            {
-                auto & arg = source_block.getByPosition(1);
-                arg.column = arg_nullable->getNestedColumnPtr();
-                arg.type = static_cast<const DataTypeNullable &>(*block.getByPosition(arguments[1]).type).getNestedType();
-
-                auto & null_map = source_block.getByPosition(3);
-                null_map.column = arg_nullable->getNullMapColumnPtr();
-                null_map.type = std::make_shared<DataTypeUInt8>();
-            }
-            else
-            {
-                auto & arg = source_block.getByPosition(1);
-                arg = block.getByPosition(arguments[1]);
-            }
-
-            /// Now perform the function.
-            perform(source_block, {0, 1, 2, 3}, 4);
-
-            /// Move the result to its final position.
-            const ColumnWithTypeAndName & source_col = source_block.getByPosition(4);
-            ColumnWithTypeAndName & dest_col = block.getByPosition(result);
-            dest_col.column = std::move(source_col.column);
+            inner_type = array_type->getNestedType();
         }
+
+        if (!second_argument_type->onlyNull() && !allowArguments(inner_type, second_argument_type))
+        {
+            const char * first_argument_type_name = map_type ? "map" : "array";
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                "Types of {} and 2nd argument of function `{}` must be identical up to nullability, cardinality, "
+                "numeric types, or Enum and numeric type. Passed: {} and {}.",
+                first_argument_type_name,
+                getName(),
+                first_argument_type->getName(),
+                second_argument_type->getName());
+        }
+
+        return std::make_shared<DataTypeNumber<ResultType>>();
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t /*input_rows_count*/) const override
+    {
+        if (auto res = executeMap(arguments, result_type))
+            return res;
+
+        if (auto res = executeObject(arguments, result_type))
+            return res;
+
+        if (auto res = executeArrayLowCardinality(arguments))
+            return res;
+
+        auto new_arguments = arguments;
+
+        for (auto & argument : new_arguments)
+        {
+            argument.column = recursiveRemoveLowCardinality(argument.column);
+            argument.type = recursiveRemoveLowCardinality(argument.type);
+        }
+
+        return executeArrayImpl(new_arguments, result_type);
     }
 
 private:
-    /// Perform function on the given block. Internal version.
-    void perform(Block & block, const ColumnNumbers & arguments, size_t result)
+    using ResultType = typename ConcreteAction::ResultType;
+    using ResultColumnType = ColumnVector<ResultType>;
+    using ResultColumnPtr = decltype(ResultColumnType::create());
+
+    using NullMaps = std::pair<const NullMap *, const NullMap *>;
+
+    static bool allowArguments(const DataTypePtr & inner_type, const DataTypePtr & arg)
     {
-        if (!(executeNumber<UInt8>(block, arguments, result)
-            || executeNumber<UInt16>(block, arguments, result)
-            || executeNumber<UInt32>(block, arguments, result)
-            || executeNumber<UInt64>(block, arguments, result)
-            || executeNumber<Int8>(block, arguments, result)
-            || executeNumber<Int16>(block, arguments, result)
-            || executeNumber<Int32>(block, arguments, result)
-            || executeNumber<Int64>(block, arguments, result)
-            || executeNumber<Float32>(block, arguments, result)
-            || executeNumber<Float64>(block, arguments, result)
-            || executeConst(block, arguments, result)
-            || executeString(block, arguments, result)
-            || executeGeneric(block, arguments, result)))
-            throw Exception{"Illegal column " + block.getByPosition(arguments[0]).column->getName()
-                + " of first argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN};
+        auto inner_type_decayed = removeNullable(removeLowCardinality(inner_type));
+        auto arg_decayed = removeNullable(removeLowCardinality(arg));
+
+        return ((isNativeNumber(inner_type_decayed) || isEnum(inner_type_decayed)) && isNativeNumber(arg_decayed))
+            || getLeastSupertype(DataTypes{inner_type_decayed, arg_decayed});
+    }
+
+    /** If one or both arguments passed to this function are nullable,
+      * we create a new column that contains non-nullable arguments:
+      *
+      * - if the 1st argument is a non-constant array of nullable values,
+      * it is turned into a non-constant array of ordinary values + a null
+      * byte map;
+      * - if the 2nd argument is a nullable value, it is turned into an
+      * ordinary value + a null byte map.
+      *
+      * Note that since constant arrays have quite a specific structure
+      * (they are vectors of Fields, which may represent the NULL value),
+      * they do not require any preprocessing.
+      */
+    ColumnPtr executeArrayImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const
+    {
+        const ColumnPtr & ptr = arguments[0].column;
+
+        /** The columns here have two general cases, either being Array(T) or Const(Array(T)).
+          * The last type will return nullptr after casting to ColumnArray, so we leave the casting
+          * to execute* functions.
+          */
+        const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(ptr.get());
+        const ColumnNullable * nullable = nullptr;
+
+        if (col_array)
+            nullable = checkAndGetColumn<ColumnNullable>(&col_array->getData());
+
+        const auto & arg_column = arguments[1].column;
+        const ColumnNullable * arg_nullable = checkAndGetColumn<ColumnNullable>(&*arg_column);
+
+        if (!nullable && !arg_nullable)
+        {
+            return executeOnNonNullable(arguments, result_type);
+        }
+
+        /** To correctly process the Nullable values (either #col_array, #arg_column or both) we create a new columns
+          * and operate on it. The columns structure follows:
+          * {0, 1, 2, 3, 4}
+          * {data (array) argument, "value" argument, data null map, "value" null map, function result}.
+          */
+        ColumnsWithTypeAndName source_columns(4);
+
+        if (nullable)
+        {
+            const auto & nested_col = nullable->getNestedColumnPtr();
+
+            auto & data = source_columns[0];
+
+            data.column = ColumnArray::create(nested_col, col_array->getOffsetsPtr());
+            data.type = std::make_shared<DataTypeArray>(
+                static_cast<const DataTypeNullable &>(*static_cast<const DataTypeArray &>(*arguments[0].type).getNestedType())
+                    .getNestedType());
+
+            auto & null_map = source_columns[2];
+
+            null_map.column = nullable->getNullMapColumnPtr();
+            null_map.type = std::make_shared<DataTypeUInt8>();
+        }
+        else
+        {
+            auto & data = source_columns[0];
+            data = arguments[0];
+        }
+
+        if (arg_nullable)
+        {
+            auto & arg = source_columns[1];
+            arg.column = arg_nullable->getNestedColumnPtr();
+            arg.type = static_cast<const DataTypeNullable &>(*arguments[1].type).getNestedType();
+
+            auto & null_map = source_columns[3];
+            null_map.column = arg_nullable->getNullMapColumnPtr();
+            null_map.type = std::make_shared<DataTypeUInt8>();
+        }
+        else
+        {
+            auto & arg = source_columns[1];
+            arg = arguments[1];
+        }
+
+        /// Now perform the function.
+        return executeOnNonNullable(source_columns, result_type);
+    }
+
+#define INTEGRAL_PACK UInt8, UInt16, UInt32, UInt64, Int8, Int16, Int32, Int64, Float32, Float64
+
+    ColumnPtr executeOnNonNullable(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const
+    {
+        ColumnPtr res;
+        if (!((res = executeNothing(arguments))
+              || (res = executeIntegral<INTEGRAL_PACK>(arguments))
+              || (res = executeConst(arguments, result_type))
+              || (res = executeString(arguments))
+              || (res = executeGeneric(arguments))))
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal internal type of first argument of function {}", getName());
+
+        return res;
+    }
+
+#undef INTEGRAL_PACK
+
+    /**
+     * The Array's internal data type may be quite tricky (containing a Nullable type somewhere). To process the
+     * Nullable types correctly, for each data type specialisation we provide two null maps (one for the data and one
+     * for the items). By convention they are passed as the third and the fourth argument, respectively
+     * (counting from 1).
+     *
+     * @return {nullptr, nullptr} if there are less than 3 arguments.
+     * @return {null_map_data, nullptr} if there are three arguments
+     * @return {nullptr, null_map_item} if there are four arguments but the third is missing.
+     * @return {null_map_data, null_map_item} if there are four arguments.
+     */
+    static NullMaps getNullMaps(const ColumnsWithTypeAndName & arguments)
+    {
+        if (arguments.size() < 3)
+            return {nullptr, nullptr};
+
+        const NullMap * null_map_data = nullptr;
+        const NullMap * null_map_item = nullptr;
+
+        if (const auto & data_map = arguments[2].column; data_map)
+            null_map_data = &assert_cast<const ColumnUInt8 &>(*data_map).getData();
+
+        if (const auto & item_map = arguments[3].column; item_map)
+            null_map_item = &assert_cast<const ColumnUInt8 &>(*item_map).getData();
+
+        return {null_map_data, null_map_item};
+    }
+
+    struct ExecutionData
+    {
+        const IColumn & left;
+        const IColumn & right;
+        const ColumnArray::Offsets & offsets;
+        NullMaps null_maps;
+    };
+
+    /**
+     * Given a variadic pack #Integral, apply executeIntegralExpanded with such parameters:
+     * Integral s = {s1, s2, ...}
+     * (s1, s1, s2, ...), (s2, s1, s2, ...), (s3, s1, s2, ...)
+     */
+    template <typename... Integral>
+    static ColumnPtr executeIntegral(const ColumnsWithTypeAndName & arguments)
+    {
+        const auto * array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
+        if (!array)
+            return nullptr;
+
+        ExecutionData data
+        {
+            .left = array->getData(),
+            .right = *arguments[1].column,
+            .offsets = array->getOffsets(),
+            .null_maps = getNullMaps(arguments),
+        };
+
+        auto result = ResultColumnType::create();
+        return executeIntegral<Integral...>(data, *result) ? std::move(result) : nullptr;
+    }
+
+    template <typename... Integral>
+    static bool executeIntegral(const ExecutionData & data, ResultColumnType & result)
+    {
+        return (executeIntegralExpanded<Integral, Integral...>(data, result) || ...);
+    }
+
+    /// Invoke executeIntegralImpl with such parameters: (A, other1), (A, other2), ...
+    template <typename A, typename... Other>
+    static bool executeIntegralExpanded(const ExecutionData & data, ResultColumnType & result)
+    {
+        return (executeIntegralImpl<A, Other>(data, result) || ...);
+    }
+
+    /**
+     * The internal data type of the first argument (target array), if it's integral, like UInt8, may differ from the
+     * second argument, namely, the @e value, so it's possible to invoke the <tt>has(Array(Int8), UInt64)</tt> e.g.
+     * so we have to check all possible variants for #Initial and #Resulting types.
+     */
+    template <typename Initial, typename Resulting>
+    static bool executeIntegralImpl(const ExecutionData & data, ResultColumnType & result)
+    {
+        const auto * left_typed = checkAndGetColumn<ColumnVector<Initial>>(&data.left);
+        if (!left_typed)
+            return false;
+
+        if (const auto * item_arg_const = checkAndGetColumnConst<ColumnVector<Resulting>>(&data.right))
+            Impl::Main<ConcreteAction, true, Initial, Resulting>::vector(
+                left_typed->getData(),
+                data.offsets,
+                item_arg_const->template getValue<Resulting>(),
+                result.getData(),
+                data.null_maps.first,
+                nullptr);
+        else if (const auto * item_arg_vector = checkAndGetColumn<ColumnVector<Resulting>>(&data.right))
+            Impl::Main<ConcreteAction, false, Initial, Resulting>::vector(
+                left_typed->getData(),
+                data.offsets,
+                item_arg_vector->getData(),
+                result.getData(),
+                data.null_maps.first,
+                data.null_maps.second);
+        else
+            return false;
+
+        return true;
+    }
+
+    /**
+     * Catches arguments of type LowCardinality(T) (left) and U (right).
+     *
+     * The perftests showed that the amount of action needed to convert the non-constant right argument to the index column
+     * (similar to the left one's) is significantly higher than converting the array itself to an ordinary column.
+     *
+     * So, in terms of performance it's more optimal to fall back to default implementation and catch only constant
+     * right arguments.
+     *
+     * Tips and tricks tried can be found at https://github.com/ClickHouse/ClickHouse/pull/12550 .
+     */
+    static ColumnPtr executeArrayLowCardinality(const ColumnsWithTypeAndName & arguments)
+    {
+        const auto * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
+        const auto * col_array_const = checkAndGetColumnConstData<ColumnArray>(arguments[0].column.get());
+
+        if (!col_array && !col_array_const)
+            return nullptr;
+
+        if (col_array_const)
+            col_array = col_array_const;
+
+        const auto * left_lc = checkAndGetColumn<ColumnLowCardinality>(&col_array->getData());
+        if (!left_lc)
+            return nullptr;
+
+        const auto * right_const = checkAndGetColumn<ColumnConst>(arguments[1].column.get());
+        if (!right_const)
+            return nullptr;
+
+        const auto & array_type  = assert_cast<const DataTypeArray &>(*arguments[0].type);
+        const auto target_type = recursiveRemoveLowCardinality(array_type.getNestedType());
+        auto right = recursiveRemoveLowCardinality(right_const->getDataColumnPtr());
+
+        UInt64 index = 0;
+        UInt64 left_size = arguments[0].column->size();
+        ResultColumnPtr col_result = ResultColumnType::create();
+
+        if (!right->isNullAt(0))
+        {
+            auto right_type = recursiveRemoveLowCardinality(arguments[1].type);
+            right = castColumn({right, right_type, ""}, target_type);
+
+            if (right->isNullable())
+                right = checkAndGetColumn<ColumnNullable>(*right).getNestedColumnPtr();
+
+            std::string_view elem = right->getDataAt(0);
+            const auto & left_dict = left_lc->getDictionary();
+
+            if (std::optional<UInt64> maybe_index = left_dict.getOrFindValueIndex(elem); maybe_index)
+            {
+                index = *maybe_index;
+            }
+            else
+            {
+                col_result->getData().resize_fill(col_array->size());
+
+                if (col_array_const)
+                    return ColumnConst::create(std::move(col_result), left_size);
+
+                return col_result;
+            }
+        }
+
+        Impl::Main<ConcreteAction, true>::vector(
+            left_lc->getIndexes(),
+            col_array->getOffsets(),
+            index, /** Assuming LowCardinality has index of NULL always as zero. */
+            col_result->getData(),
+            nullptr,
+            nullptr);
+
+        if (col_array_const)
+            return ColumnConst::create(std::move(col_result), left_size);
+
+        return col_result;
+    }
+
+    ColumnPtr executeMap(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const
+    {
+        if constexpr (!std::is_same_v<ConcreteAction, HasAction>)
+            return nullptr;
+
+        if (!isMap(arguments[0].type))
+            return nullptr;
+
+        auto non_const_map_column = arguments[0].column->convertToFullColumnIfConst();
+
+        const auto & map_column = assert_cast<const ColumnMap &>(*non_const_map_column);
+        const auto & map_array_column = map_column.getNestedColumn();
+        auto offsets = map_array_column.getOffsetsPtr();
+        auto keys = map_column.getNestedData().getColumnPtr(0);
+        auto array_column = ColumnArray::create(keys, offsets);
+
+        const auto & type_map = assert_cast<const DataTypeMap &>(*arguments[0].type);
+        auto array_type = std::make_shared<DataTypeArray>(type_map.getKeyType());
+
+        auto arguments_copy = arguments;
+        arguments_copy[0].column = std::move(array_column);
+        arguments_copy[0].type = std::move(array_type);
+        arguments_copy[0].name = arguments[0].name;
+
+        return executeArrayImpl(arguments_copy, result_type);
+    }
+
+    /**
+     * Helper function to check if a path or its prefix exists in shared data.
+     */
+     static bool hasPathInSharedData(
+        const String & path,
+        const String & prefix,
+        const ColumnString * shared_paths,
+        const ColumnVector<UInt64>::Container & shared_offsets,
+        size_t row)
+    {
+        if (!shared_paths)
+            return false;
+
+        size_t start = shared_offsets[static_cast<ssize_t>(row) - 1];
+        size_t end = shared_offsets[row];
+
+        if (start == end)
+            return false;
+
+        /// Check for exact match
+        size_t pos = ColumnObject::findPathLowerBoundInSharedData(path, *shared_paths, start, end);
+        if (pos < end && shared_paths->getDataAt(pos) == path)
+            return true;
+
+        /// Check for prefix match (path + ".")
+        pos = ColumnObject::findPathLowerBoundInSharedData(prefix, *shared_paths, start, end);
+        if (pos < end && shared_paths->getDataAt(pos).starts_with(prefix))
+            return true;
+
+        return false;
+    }
+
+    /**
+     * Check if a path exists in JSON object for a specific row.
+     * Returns true if the path (or any path with this prefix) exists.
+     */
+    static bool hasPathInObjectRow(
+        const ColumnObject & object_column,
+        size_t row,
+        const String & path,
+        const String & prefix,
+        const ColumnString * shared_paths,
+        const ColumnVector<UInt64>::Container & shared_offsets)
+    {
+        /// First, check for the requested path in typed paths.
+        /// Typed paths are always considered to be present in each row (even if null).
+        const auto & typed_paths = object_column.getTypedPaths();
+        if (typed_paths.contains(path))
+            return true;
+
+        for (const auto & [key, col] : typed_paths)
+        {
+            if (key.starts_with(prefix))
+                return true;
+        }
+
+        /// Second, check for the requested path in dynamic paths.
+        /// For dynamic paths, we consider null equivalent to absence of the value.
+        const auto & dynamic_paths = object_column.getDynamicPathsPtrs();
+        if (auto it = dynamic_paths.find(path); it != dynamic_paths.end() && !it->second->isNullAt(row))
+            return true;
+
+        for (const auto & [key, col] : dynamic_paths)
+        {
+            if (key.starts_with(prefix) && !col->isNullAt(row))
+                return true;
+        }
+
+        /// Third, check for the requested path in shared data.
+        return hasPathInSharedData(path, prefix, shared_paths, shared_offsets, row);
+    }
+
+    /**
+     * Execute has() function for JSON/Object type.
+     * Checks if a path exists in the JSON object.
+     *
+     * The function checks three storage tiers in order:
+     * 1. Typed paths - explicitly declared paths that are always present (even if null)
+     * 2. Dynamic paths - paths inferred at runtime, null means absence
+     * 3. Shared data - overflow storage for rare paths, uses binary search
+     *
+     * Optimizations:
+     * - For constant path: if found in typed paths, returns 1 for all rows immediately
+     * - For constant path: pre-collects relevant dynamic columns to avoid repeated lookups
+     * - For non-constant path: uses hasPathInObjectRow() helper with early returns
+     *
+     * @param arguments - [0] JSON column (or const JSON), [1] path column
+     * @return ColumnUInt8 with 1 if path exists, 0 otherwise
+    */
+    ColumnPtr executeObject(const ColumnsWithTypeAndName & arguments, const DataTypePtr & /*result_type*/) const
+    {
+        if constexpr (!std::is_same_v<ConcreteAction, HasAction>)
+            return nullptr;
+
+        const auto * object_type = checkAndGetDataType<DataTypeObject>(arguments[0].type.get());
+        if (!object_type)
+            return nullptr;
+
+        auto non_const_object_column = arguments[0].column->convertToFullColumnIfConst();
+        const auto & object_column = assert_cast<const ColumnObject &>(*non_const_object_column);
+        const auto & path_column = *arguments[1].column;
+        const size_t input_rows_count = object_column.size();
+
+        if (input_rows_count == 0)
+            return ColumnUInt8::create();
+
+        auto res_col = ColumnUInt8::create(input_rows_count);
+        auto & res_data = res_col->getData();
+
+        const auto [shared_paths, shared_values] = object_column.getSharedDataPathsAndValues();
+        const auto & shared_offsets = object_column.getSharedDataOffsets();
+
+        if (isColumnConst(path_column))
+        {
+            const String path(path_column.getDataAt(0));
+            const String prefix = path + ".";
+
+            /// Optimization: if path or its prefix exists in typed paths,
+            /// we can return 1 for all rows since typed paths are always present.
+            const auto & typed_paths = object_column.getTypedPaths();
+            bool found_in_typed = typed_paths.contains(path);
+            if (!found_in_typed)
+            {
+                for (const auto & [key, col] : typed_paths)
+                {
+                    if (key.starts_with(prefix))
+                    {
+                        found_in_typed = true;
+                        break;
+                    }
+                }
+            }
+
+            if (found_in_typed)
+            {
+                /// Path exists in typed paths - return 1 for all rows
+                std::fill(res_data.begin(), res_data.end(), 1);
+                return res_col;
+            }
+
+            /// Collect columns from dynamic paths that match exact path or prefix.
+            /// These columns need to be checked for non-null values per row.
+            std::vector<const IColumn *> relevant_dynamic_columns;
+            const auto & dynamic_paths = object_column.getDynamicPathsPtrs();
+
+            if (auto it = dynamic_paths.find(path); it != dynamic_paths.end())
+                relevant_dynamic_columns.push_back(it->second);
+
+            for (const auto & [key, col] : dynamic_paths)
+            {
+                if (key.starts_with(prefix))
+                    relevant_dynamic_columns.push_back(col);
+            }
+
+            for (size_t i = 0; i < input_rows_count; ++i)
+            {
+                bool found = false;
+
+                /// Check dynamic paths - need to verify non-null for each row
+                for (const auto * col : relevant_dynamic_columns)
+                {
+                    if (!col->isNullAt(i))
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                /// Check shared data if not found in dynamic paths
+                if (!found)
+                {
+                    found = hasPathInSharedData(path, prefix, shared_paths, shared_offsets, i);
+                }
+                res_data[i] = found;
+            }
+        }
+        else
+        {
+            /// Non-constant path: check each row individually
+            for (size_t i = 0; i < input_rows_count; ++i)
+            {
+                const String path(path_column.getDataAt(i));
+                const String prefix = path + ".";
+
+                res_data[i] = hasPathInObjectRow(object_column, i, path, prefix, shared_paths, shared_offsets);
+            }
+        }
+
+        return res_col;
+    }
+
+    static ColumnPtr executeString(const ColumnsWithTypeAndName & arguments)
+    {
+        const auto * array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
+        if (!array)
+            return nullptr;
+
+        const auto * left = checkAndGetColumn<ColumnString>(&array->getData());
+        if (!left)
+            return nullptr;
+
+        const auto & right = *arguments[1].column;
+        const auto [null_map_data, null_map_item] = getNullMaps(arguments);
+
+        auto result = ResultColumnType::create();
+
+        if (const auto * item_arg_const = checkAndGetColumnConstStringOrFixedString(&right))
+        {
+            const auto * item_const_string = checkAndGetColumn<ColumnString>(&item_arg_const->getDataColumn());
+            const auto * item_const_fixedstring = checkAndGetColumn<ColumnFixedString>(&item_arg_const->getDataColumn());
+
+            if (item_const_string)
+                Impl::String<ConcreteAction>::process(
+                    left->getChars(),
+                    array->getOffsets(),
+                    left->getOffsets(),
+                    item_const_string->getChars(),
+                    item_const_string->getDataAt(0).size(),
+                    result->getData(),
+                    null_map_data,
+                    null_map_item);
+            else if (item_const_fixedstring)
+                Impl::String<ConcreteAction>::process(
+                    left->getChars(),
+                    array->getOffsets(),
+                    left->getOffsets(),
+                    item_const_fixedstring->getChars(),
+                    item_const_fixedstring->getN(),
+                    result->getData(),
+                    null_map_data,
+                    null_map_item);
+            else
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "ColumnConst contains not String nor FixedString column");
+        }
+        else if (const auto * item_arg_vector = checkAndGetColumn<ColumnString>(&right))
+        {
+            Impl::String<ConcreteAction>::process(
+                left->getChars(),
+                array->getOffsets(),
+                left->getOffsets(),
+                item_arg_vector->getChars(),
+                item_arg_vector->getOffsets(),
+                result->getData(),
+                null_map_data,
+                null_map_item);
+        }
+        else
+        {
+            return nullptr;
+        }
+
+        return result;
+    }
+
+    static ColumnPtr executeConst(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type)
+    {
+        const ColumnConst * col_array = checkAndGetColumnConst<ColumnArray>(arguments[0].column.get());
+
+        if (!col_array)
+            return nullptr;
+
+        Array arr = col_array->getValue<Array>();
+        const IColumn * item_arg = arguments[1].column.get();
+
+        if (isColumnConst(*item_arg))
+        {
+            ResultType current = 0;
+            const auto & value = (*item_arg)[0];
+            if constexpr (std::is_same_v<ConcreteAction, IndexOfAssumeSorted>)
+            {
+                if (isColumnNullableOrLowCardinalityNullable(
+                        assert_cast<const ColumnArray &>(col_array->getDataColumn()).getData()))
+                    current = Impl::Main<ConcreteAction, true>::linearSearchConst(arr, value);
+                else
+                    current = Impl::Main<ConcreteAction, true>::lowerBound(arr, value, arr.size(), 0);
+            }
+            else
+            {
+                current = Impl::Main<ConcreteAction, true>::linearSearchConst(arr, value);
+            }
+
+            return result_type->createColumnConst(item_arg->size(), current);
+        }
+
+        /// Null map of the 2nd function argument, if it applies.
+        const NullMap * null_map = nullptr;
+
+        if (arguments.size() > 2)
+            if (const auto & col = arguments[3].column; col)
+                null_map = &assert_cast<const ColumnUInt8 &>(*col).getData();
+
+        const size_t size = item_arg->size();
+        auto col_res = ResultColumnType::create(size);
+
+        auto & data = col_res->getData();
+
+        for (size_t row = 0; row < size; ++row)
+        {
+            const auto & value = (*item_arg)[row];
+
+            data[row] = 0;
+
+            for (size_t i = 0, arr_size = arr.size(); i < arr_size; ++i)
+            {
+                if (arr[i].isNull())
+                {
+                    if (!null_map)
+                        continue;
+
+                    if (!(*null_map)[row])
+                        continue;
+                }
+                else
+                {
+                    if (null_map && (*null_map)[row])
+                        continue;
+                    if (!accurateEquals(arr[i], value))
+                        continue;
+                }
+
+                ConcreteAction::apply(data[row], i);
+
+                if constexpr (!ConcreteAction::resume_execution)
+                    break;
+            }
+        }
+
+        return col_res;
+    }
+
+    static ColumnPtr executeNothing(const ColumnsWithTypeAndName & arguments)
+    {
+        const auto * array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
+        if (!array)
+            return nullptr;
+
+        if (arguments[1].column->onlyNull())
+        {
+            auto result = ResultColumnType::create();
+            Impl::Null<ConcreteAction>::process(array->getOffsets(), result->getData(), getNullMaps(arguments).first);
+            return result;
+        }
+
+        return nullptr;
+    }
+
+    static ColumnPtr executeGeneric(const ColumnsWithTypeAndName & arguments)
+    {
+        const auto * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
+        if (!col_array)
+            return nullptr;
+
+        DataTypePtr array_elements_type = assert_cast<const DataTypeArray &>(*arguments[0].type).getNestedType();
+        const DataTypePtr & index_type = arguments[1].type;
+
+        DataTypePtr common_type = getLeastSupertype(DataTypes{array_elements_type, arguments[1].type});
+        ColumnPtr col_nested = castColumn({ col_array->getDataPtr(), array_elements_type, "" }, common_type);
+        ColumnPtr item_arg = castColumn({ arguments[1].column, removeLowCardinality(index_type), "" }, common_type);
+
+        auto col_res = ResultColumnType::create();
+
+        auto [null_map_data, null_map_item] = getNullMaps(arguments);
+
+        if (const auto * item_arg_const = checkAndGetColumn<ColumnConst>(item_arg.get()))
+        {
+            Impl::Main<ConcreteAction, true>::vector(
+                *col_nested,
+                col_array->getOffsets(),
+                item_arg_const->getDataColumn(),
+                col_res->getData(), /// TODO This is wrong.
+                null_map_data,
+                nullptr);
+        }
+        else
+        {
+            Impl::Main<ConcreteAction>::vector(
+                *col_nested,
+                col_array->getOffsets(),
+                *item_arg,
+                col_res->getData(),
+                null_map_data,
+                null_map_item);
+        }
+
+        return col_res;
     }
 };
-
 }

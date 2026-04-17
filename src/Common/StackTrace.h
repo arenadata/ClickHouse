@@ -1,15 +1,17 @@
 #pragma once
 
-#include <common/types.h>
+#include <base/defines.h>
+#include <base/types.h>
+#include <Common/FramePointers.h>
 
 #include <string>
-#include <vector>
 #include <array>
 #include <optional>
 #include <functional>
-#include <signal.h>
+#include <csignal>
+#include <csetjmp>
 
-#ifdef __APPLE__
+#ifdef OS_DARWIN
 // ucontext is not available without _XOPEN_SOURCE
 #   pragma clang diagnostic ignored "-Wreserved-id-macro"
 #   define _XOPEN_SOURCE 700
@@ -33,30 +35,49 @@ public:
         std::optional<std::string> object;
         std::optional<std::string> file;
         std::optional<UInt64> line;
+        std::optional<UInt64> column;
     };
-    static constexpr size_t capacity = 32;
-    using FramePointers = std::array<void *, capacity>;
-    using Frames = std::array<Frame, capacity>;
+
+    using Frames = std::array<Frame, FRAMEPOINTER_CAPACITY>;
 
     /// Tries to capture stack trace
-    StackTrace();
+    /// NO_INLINE to get correct line of StackTrace() caller in captured stack trace
+    NO_INLINE StackTrace();
 
     /// Tries to capture stack trace. Fallbacks on parsing caller address from
     /// signal context if no stack trace could be captured
-    StackTrace(const ucontext_t & signal_context);
+    explicit StackTrace(const ucontext_t & signal_context);
 
     /// Creates empty object for deferred initialization
-    StackTrace(NoCapture);
+    explicit StackTrace(NoCapture) {}
 
-    size_t getSize() const;
-    size_t getOffset() const;
-    const FramePointers & getFramePointers() const;
+    StackTrace(FramePointers frame_pointers_, size_t size_, size_t offset_ = 0);
+
+    constexpr size_t getSize() const { return size; }
+    constexpr size_t getOffset() const { return offset; }
+    const FramePointers & getFramePointers() const { return frame_pointers; }
     std::string toString() const;
 
-    static std::string toString(void ** frame_pointers, size_t offset, size_t size);
-    static void symbolize(const FramePointers & frame_pointers, size_t offset, size_t size, StackTrace::Frames & frames);
+    static std::string toString(void * const * frame_pointers, size_t offset, size_t size);
+    static void dropCache();
 
-    void toStringEveryLine(std::function<void(const std::string &)> callback) const;
+    /// @param fatal - if true, will process inline frames (slower)
+    static void forEachFrame(
+        const FramePointers & frame_pointers,
+        size_t offset,
+        size_t size,
+        std::function<void(const Frame &)> callback,
+        bool fatal);
+
+    void toStringEveryLine(std::function<void(std::string_view)> callback) const;
+    static void toStringEveryLine(const FramePointers & frame_pointers, std::function<void(std::string_view)> callback);
+    static void toStringEveryLine(void ** frame_pointers_raw, size_t offset, size_t size, std::function<void(std::string_view)> callback);
+
+    /// Displaying the addresses can be disabled for security reasons.
+    /// If you turn off addresses, it will be more secure, but we will be unable to help you with debugging.
+    /// Please note: addresses are also available in the system.stack_trace and system.trace_log tables.
+    static void setShowAddresses(bool show);
+
 protected:
     void tryCapture();
 
@@ -66,3 +87,12 @@ protected:
 };
 
 std::string signalToErrorMessage(int sig, const siginfo_t & info, const ucontext_t & context);
+
+std::optional<UInt64> getFaultAddress(int sig, const siginfo_t & info);
+std::string getFaultMemoryAccessType(int sig, const ucontext_t & context);
+std::string getSignalCodeDescription(int sig, int si_code);
+
+/// Special handling for errors during asynchronous stack unwinding,
+/// Which is used in Query Profiler
+extern thread_local bool asynchronous_stack_unwinding;
+extern thread_local sigjmp_buf asynchronous_stack_unwinding_signal_jump_buffer;

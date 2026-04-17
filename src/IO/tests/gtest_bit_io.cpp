@@ -1,21 +1,21 @@
-#include <string.h>
+#pragma clang diagnostic ignored "-Wreserved-identifier"
+
+#include <cstring>
 #include <IO/BitHelpers.h>
 
-#include <Core/Types.h>
+#include <base/types.h>
 #include <IO/MemoryReadWriteBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <Common/BitHelpers.h>
 #include <Common/PODArray.h>
 
 #include <cmath>
-#include <iomanip>
 #include <memory>
 #include <bitset>
 #include <string>
 #include <vector>
 #include <typeinfo>
 #include <iostream>
-#pragma GCC diagnostic ignored "-Wmissing-declarations"
 #include <gtest/gtest.h>
 
 using namespace DB;
@@ -77,7 +77,8 @@ std::string dumpContents(const T& container,
                          const size_t cols_in_row = 8)
 
 {
-    std::stringstream sstr;
+    std::stringstream sstr;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    sstr.exceptions(std::ios::failbit);
     dumpBuffer(std::begin(container), std::end(container), &sstr, col_sep, row_sep, cols_in_row);
 
     return sstr.str();
@@ -158,7 +159,6 @@ TEST_P(BitIO, WriteAndRead)
 
         BitReader reader(data.data(), data.size());
 
-        int bitpos = 0;
         int item = 0;
         for (const auto & bv : bits_and_vals)
         {
@@ -172,7 +172,6 @@ TEST_P(BitIO, WriteAndRead)
             ASSERT_TRUE(BinaryEqual(getBits(bv.first, bv.second), reader.readBits(bv.first)));
 
             ++item;
-            bitpos += bv.first;
         }
     }
 }
@@ -251,6 +250,7 @@ INSTANTIATE_TEST_SUITE_P(Primes,
 
 TEST(BitHelpers, maskLowBits)
 {
+    // unsigned
     EXPECT_EQ(0b00000111, ::maskLowBits<uint8_t>(3));
     EXPECT_EQ(0b01111111, ::maskLowBits<uint8_t>(7));
     EXPECT_EQ(0b0000000001111111, ::maskLowBits<UInt16>(7));
@@ -259,8 +259,24 @@ TEST(BitHelpers, maskLowBits)
     EXPECT_EQ(0b111111111111111111111111111111111, ::maskLowBits<UInt64>(33));
     EXPECT_EQ(0b11111111111111111111111111111111111, ::maskLowBits<UInt64>(35));
 
+    // signed
+    EXPECT_EQ(static_cast<int8_t>(0b00000111), ::maskLowBits<int8_t>(3));
+    EXPECT_EQ(static_cast<int8_t>(0b01111111), ::maskLowBits<int8_t>(7));
+    EXPECT_EQ(static_cast<Int16>(0b0000000001111111), ::maskLowBits<Int16>(7));
+    EXPECT_EQ(static_cast<Int16>(0b0001111111111111), ::maskLowBits<Int16>(13));
+    EXPECT_EQ(static_cast<Int32>(0b00000111111111111111111111111111), ::maskLowBits<Int32>(27));
+    EXPECT_EQ(static_cast<Int64>(0b111111111111111111111111111111111), ::maskLowBits<Int64>(33));
+    EXPECT_EQ(static_cast<Int64>(0b11111111111111111111111111111111111), ::maskLowBits<Int64>(35));
+
+    // unsigned
     EXPECT_EQ(0xFF, ::maskLowBits<uint8_t>(8));
     EXPECT_EQ(0xFFFF, ::maskLowBits<UInt16>(16));
     EXPECT_EQ(0xFFFFFFFF, ::maskLowBits<UInt32>(32));
     EXPECT_EQ(0xFFFFFFFFFFFFFFFF, ::maskLowBits<UInt64>(64));
+
+    // signed
+    EXPECT_EQ(static_cast<int8_t>(0xFF), ::maskLowBits<int8_t>(8));
+    EXPECT_EQ(static_cast<Int16>(0xFFFF), ::maskLowBits<Int16>(16));
+    EXPECT_EQ(static_cast<Int32>(0xFFFFFFFF), ::maskLowBits<Int32>(32));
+    EXPECT_EQ(static_cast<Int64>(0xFFFFFFFFFFFFFFFF), ::maskLowBits<Int64>(64));
 }

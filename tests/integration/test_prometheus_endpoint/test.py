@@ -1,14 +1,14 @@
-from __future__ import print_function
-import pytest
-
 import re
-import requests
 import time
+
+import pytest
+import requests
 
 from helpers.cluster import ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
-node = cluster.add_instance('node', main_configs=['configs/prom_conf.xml'])
+node = cluster.add_instance("node", main_configs=["configs/prom_conf.xml"])
+
 
 @pytest.fixture(scope="module")
 def start_cluster():
@@ -29,7 +29,7 @@ def parse_response_line(line):
 
     if line.startswith("#"):
         return {}
-    match = re.match('^([a-zA-Z_:][a-zA-Z0-9_:]+)(\{.*\})? (\d)', line)
+    match = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]+)(\{.*\})? -?(\d+)", line)
     assert match, line
     name, _, val = match.groups()
     return {name: int(val)}
@@ -38,8 +38,12 @@ def parse_response_line(line):
 def get_and_check_metrics(retries):
     while True:
         try:
-            response = requests.get("http://{host}:{port}/metrics".format(
-                host=node.ip_address, port=8001), allow_redirects=False)
+            response = requests.get(
+                "http://{host}:{port}/metrics".format(host=node.ip_address, port=8001),
+                allow_redirects=False,
+                # less than default keep-alive timeout (10 seconds)
+                timeout=5,
+            )
 
             if response.status_code != 200:
                 response.raise_for_status()
@@ -53,10 +57,10 @@ def get_and_check_metrics(retries):
             else:
                 raise
 
-    assert response.headers['content-type'].startswith('text/plain')
+    assert response.headers["content-type"].startswith("text/plain")
 
     results = {}
-    for resp_line in response.text.split('\n'):
+    for resp_line in response.text.split("\n"):
         resp_line = resp_line.rstrip()
         if not resp_line:
             continue
@@ -66,14 +70,22 @@ def get_and_check_metrics(retries):
 
 
 def test_prometheus_endpoint(start_cluster):
-
     metrics_dict = get_and_check_metrics(10)
-    assert metrics_dict['ClickHouseProfileEvents_Query'] >= 0
-    prev_query_count = metrics_dict['ClickHouseProfileEvents_Query']
+    assert metrics_dict["ClickHouseProfileEvents_Query"] >= 0
+    prev_query_count = metrics_dict["ClickHouseProfileEvents_Query"]
 
     node.query("SELECT 1")
     node.query("SELECT 2")
     node.query("SELECT 3")
 
     metrics_dict = get_and_check_metrics(10)
-    assert metrics_dict['ClickHouseProfileEvents_Query'] >= prev_query_count + 3
+    assert metrics_dict["ClickHouseProfileEvents_Query"] >= prev_query_count + 3
+
+    node.query_and_get_error(
+        "SELECT throwIf(1, 'test', toInt16(42)) SETTINGS allow_custom_error_code_in_throwif=1"
+    )
+    metrics_dict = get_and_check_metrics(10)
+
+    assert metrics_dict["ClickHouseErrorMetric_NUMBER_OF_ARGUMENTS_DOESNT_MATCH"] >= 1
+    assert metrics_dict["ClickHouseErrorMetric_ALL"] >= 1
+    assert metrics_dict["ClickHouse_Info"] == 1

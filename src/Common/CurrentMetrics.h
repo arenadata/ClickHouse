@@ -1,10 +1,11 @@
 #pragma once
 
-#include <stddef.h>
-#include <cstdint>
+#include <cstddef>
 #include <utility>
 #include <atomic>
-#include <Core/Types.h>
+#include <cassert>
+#include <base/types.h>
+#include <base/strong_typedef.h>
 
 /** Allows to count number of simultaneously happening processes or current value of some metric.
   *  - for high-level profiling.
@@ -15,19 +16,19 @@
   *  or just current value of some metric - for example, replica delay in seconds.
   *
   * CurrentMetrics are updated instantly and are correct for any point in time.
-  * For periodically (asynchronously) updated metrics, see AsynchronousMetrics.h
+  * For periodically (asynchronously) updated metrics, see .h
   */
 
 namespace CurrentMetrics
 {
     /// Metric identifier (index in array).
-    using Metric = size_t;
-    using Value = DB::Int64;
+    using Metric = StrongTypedef<size_t, struct MetricTag>;
+    using Value = Int64;
 
     /// Get name of metric by identifier. Returns statically allocated string.
-    const char * getName(Metric event);
+    const std::string_view & getName(Metric event);
     /// Get text description of metric by identifier. Returns statically allocated string.
-    const char * getDocumentation(Metric event);
+    const std::string_view & getDocumentation(Metric event);
 
     /// Metric identifier -> current value of metric.
     extern std::atomic<Value> values[];
@@ -41,6 +42,12 @@ namespace CurrentMetrics
         values[metric].store(value, std::memory_order_relaxed);
     }
 
+    /// Get value of specified metric.
+    inline Value get(Metric metric)
+    {
+        return values[metric].load(std::memory_order_relaxed);
+    }
+
     /// Add value for specified metric. You must subtract value later; or see class Increment below.
     inline void add(Metric metric, Value value = 1)
     {
@@ -50,6 +57,16 @@ namespace CurrentMetrics
     inline void sub(Metric metric, Value value = 1)
     {
         add(metric, -value);
+    }
+
+    inline bool cas(Metric metric, Value expected, Value desired)
+    {
+        return values[metric].compare_exchange_strong(expected, desired, std::memory_order_relaxed);
+    }
+
+    inline void max(Metric metric, Value value)
+    {
+        __atomic_fetch_max(reinterpret_cast<Value *>(&values[metric]), value, __ATOMIC_RELAXED);
     }
 
     /// For lifetime of object, add amount for specified metric. Then subtract.
@@ -66,8 +83,16 @@ namespace CurrentMetrics
         }
 
     public:
-        Increment(Metric metric, Value amount_ = 1)
-            : Increment(&values[metric], amount_) {}
+        explicit Increment(Metric metric, Value amount_ = 1)
+            : Increment(&values[metric], amount_)
+        {
+            // in src/Core/tests/gtest_BackgroundSchedulePool.cpp we create pool as
+            // auto pool = BackgroundSchedulePool::create(4, 0, CurrentMetrics::end(), CurrentMetrics::end(), "tests");
+            // which leads as to creation of Increment with metric == CurrentMetrics::end()
+            // actually this is not a real metric, however it is presented in CurrentMetrics::values array
+            // so we are able to increment it and we should not assert here when metric == CurrentMetrics::end()
+            assert(metric <= CurrentMetrics::end());
+        }
 
         ~Increment()
         {
@@ -75,12 +100,12 @@ namespace CurrentMetrics
                 what->fetch_sub(amount, std::memory_order_relaxed);
         }
 
-        Increment(Increment && old)
+        Increment(Increment && old) noexcept
         {
             *this = std::move(old);
         }
 
-        Increment & operator= (Increment && old)
+        Increment & operator=(Increment && old) noexcept
         {
             what = old.what;
             amount = old.amount;
@@ -98,6 +123,12 @@ namespace CurrentMetrics
         {
             what->fetch_sub(value, std::memory_order_relaxed);
             amount -= value;
+        }
+
+        void add(Value value = 1)
+        {
+            what->fetch_add(value, std::memory_order_relaxed);
+            amount += value;
         }
 
         /// Subtract value before destructor.

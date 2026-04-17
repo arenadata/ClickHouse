@@ -4,21 +4,37 @@
 #include <Interpreters/Aggregator.h>
 #include <Processors/ISimpleTransform.h>
 #include <Processors/Transforms/AggregatingTransform.h>
-#include <Processors/Transforms/TotalsHavingTransform.h>
+#include <Processors/Transforms/finalizeChunk.h>
+#include <Processors/Chunk.h>
 
 namespace DB
 {
 
+struct InputOrderInfo;
+using InputOrderInfoPtr = std::shared_ptr<const InputOrderInfo>;
+
+struct ChunkInfoWithAllocatedBytes : public ChunkInfoCloneable<ChunkInfoWithAllocatedBytes>
+{
+    ChunkInfoWithAllocatedBytes(const ChunkInfoWithAllocatedBytes & other) = default;
+    explicit ChunkInfoWithAllocatedBytes(Int64 allocated_bytes_)
+        : allocated_bytes(allocated_bytes_) {}
+
+    Int64 allocated_bytes;
+};
+
 class AggregatingInOrderTransform : public IProcessor
 {
-
 public:
-    AggregatingInOrderTransform(Block header, AggregatingTransformParamsPtr params,
-                                const SortDescription & group_by_description, size_t res_block_size,
+    AggregatingInOrderTransform(SharedHeader header, AggregatingTransformParamsPtr params,
+                                const SortDescription & sort_description_for_merging,
+                                const SortDescription & group_by_description_,
+                                size_t max_block_size_, size_t max_block_bytes_,
                                 ManyAggregatedDataPtr many_data, size_t current_variant);
 
-    AggregatingInOrderTransform(Block header, AggregatingTransformParamsPtr params,
-                                const SortDescription & group_by_description, size_t res_block_size);
+    AggregatingInOrderTransform(SharedHeader header, AggregatingTransformParamsPtr params,
+                                const SortDescription & sort_description_for_merging,
+                                const SortDescription & group_by_description_,
+                                size_t max_block_size_, size_t max_block_bytes_);
 
     ~AggregatingInOrderTransform() override;
 
@@ -29,18 +45,29 @@ public:
     void work() override;
 
     void consume(Chunk chunk);
+    void setRowsBeforeAggregationCounter(RowsBeforeStepCounterPtr counter) override { rows_before_aggregation.swap(counter); }
 
 private:
     void generate();
+    void finalizeCurrentChunk(Chunk chunk, size_t key_end);
 
-    size_t res_block_size;
+    size_t max_block_size;
+    size_t max_block_bytes;
     size_t cur_block_size = 0;
+    size_t cur_block_bytes = 0;
 
     MutableColumns res_key_columns;
     MutableColumns res_aggregate_columns;
 
     AggregatingTransformParamsPtr params;
-    SortDescription group_by_description;
+    ColumnsMask aggregates_mask;
+
+    /// For sortBlock()
+    SortDescription sort_description;
+    SortDescriptionWithPositions group_by_description;
+    bool group_by_key = false;
+    Chunk group_by_chunk;
+    ColumnRawPtrs key_columns_raw;
 
     Aggregator::AggregateColumns aggregate_columns;
 
@@ -60,32 +87,23 @@ private:
     Chunk current_chunk;
     Chunk to_push_chunk;
 
-    Poco::Logger * log = &Poco::Logger::get("AggregatingInOrderTransform");
+    RowsBeforeStepCounterPtr rows_before_aggregation;
+
+    LoggerPtr log = getLogger("AggregatingInOrderTransform");
 };
 
 
-class FinalizingSimpleTransform : public ISimpleTransform
+class FinalizeAggregatedTransform : public ISimpleTransform
 {
 public:
-    FinalizingSimpleTransform(Block header, AggregatingTransformParamsPtr params_)
-        : ISimpleTransform({std::move(header)}, {params_->getHeader()}, true)
-        , params(params_) {}
+    FinalizeAggregatedTransform(SharedHeader header, const AggregatingTransformParamsPtr & params_);
 
-    void transform(Chunk & chunk) override
-    {
-        if (params->final)
-            finalizeChunk(chunk);
-        else if (!chunk.getChunkInfo())
-        {
-            auto info = std::make_shared<AggregatedChunkInfo>();
-            chunk.setChunkInfo(std::move(info));
-        }
-    }
-
-    String getName() const override { return "FinalizingSimpleTransform"; }
+    void transform(Chunk & chunk) override;
+    String getName() const override { return "FinalizeAggregatedTransform"; }
 
 private:
     AggregatingTransformParamsPtr params;
+    ColumnsMask aggregates_mask;
 };
 
 

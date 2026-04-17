@@ -1,10 +1,9 @@
-#include <IO/ReadHelpers.h>
+#pragma once
+
 #include <Common/Exception.h>
-#include <Common/StringUtils/StringUtils.h>
+#include <Common/StringUtils.h>
 #include <Poco/Util/AbstractConfiguration.h>
-#include <Compression/ICompressionCodec.h>
 #include <Compression/CompressionFactory.h>
-#include <Compression/CompressionInfo.h>
 
 namespace DB
 {
@@ -68,7 +67,7 @@ private:
     std::vector<Element> elements;
 
 public:
-    CompressionCodecSelector() {}    /// Always returns the default method.
+    CompressionCodecSelector() = default;    /// Always returns the default method.
 
     CompressionCodecSelector(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
     {
@@ -77,8 +76,8 @@ public:
 
         for (const auto & name : keys)
         {
-            if (!startsWith(name.data(), "case"))
-                throw Exception("Unknown element in config: " + config_prefix + "." + name + ", must be 'case'", ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG);
+            if (!startsWith(name, "case"))
+                throw Exception(ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG, "Unknown element in config: {}.{}, must be 'case'", config_prefix, name);
 
             elements.emplace_back(config, config_prefix + "." + name);
         }
@@ -91,7 +90,7 @@ public:
 
         for (const auto & element : elements)
             if (element.check(part_size, part_size_ratio))
-                res = factory.get(element.family_name, element.level, false);
+                res = factory.get(element.family_name, element.level);
 
         return res;
     }

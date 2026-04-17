@@ -6,7 +6,6 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int TOO_MANY_ROWS;
     extern const int TOO_MANY_ROWS_OR_BYTES;
 }
 
@@ -18,7 +17,7 @@ void ProcessorProfileInfo::update(const Chunk & block)
     bytes += block.bytes();
 }
 
-LimitsCheckingTransform::LimitsCheckingTransform(const Block & header_, LocalLimits limits_)
+LimitsCheckingTransform::LimitsCheckingTransform(SharedHeader header_, StreamLocalLimits limits_)
     : ISimpleTransform(header_, header_, false)
     , limits(std::move(limits_))
 {
@@ -58,16 +57,16 @@ void LimitsCheckingTransform::checkQuota(Chunk & chunk)
     switch (limits.mode)
     {
         case LimitsMode::LIMITS_TOTAL:
-            /// Checked in SourceWithProgress::progress method.
+            /// Checked in ISource::progress method.
             break;
 
         case LimitsMode::LIMITS_CURRENT:
         {
             UInt64 total_elapsed = info.total_stopwatch.elapsedNanoseconds();
             quota->used(
-                {Quota::RESULT_ROWS, chunk.getNumRows()},
-                {Quota::RESULT_BYTES, chunk.bytes()},
-                {Quota::EXECUTION_TIME, total_elapsed - prev_elapsed});
+                {QuotaType::RESULT_ROWS, chunk.getNumRows()},
+                {QuotaType::RESULT_BYTES, chunk.bytes()},
+                {QuotaType::EXECUTION_TIME, total_elapsed - prev_elapsed});
             prev_elapsed = total_elapsed;
             break;
         }

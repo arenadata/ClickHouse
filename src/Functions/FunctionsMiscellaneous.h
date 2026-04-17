@@ -1,12 +1,12 @@
 #pragma once
 
-#include <Functions/IFunctionAdaptors.h>
-#include <Interpreters/ExpressionActions.h>
-#include <DataTypes/DataTypeFunction.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/Operators.h>
+#include <Columns/ColumnConst.h>
 #include <Columns/ColumnFunction.h>
-#include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeFunction.h>
+#include <Functions/IFunctionAdaptors.h>
+#include <IO/Operators.h>
+#include <IO/WriteBufferFromString.h>
+#include <Interpreters/ExpressionActions.h>
 
 
 namespace DB
@@ -17,7 +17,19 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
-class ExecutableFunctionExpression : public IExecutableFunctionImpl
+struct LambdaCapture
+{
+    Names captured_names;
+    DataTypes captured_types;
+    NamesAndTypesList lambda_arguments;
+    String return_name;
+    DataTypePtr return_type;
+    bool allow_constant_folding = false;
+};
+
+using LambdaCapturePtr = std::shared_ptr<LambdaCapture>;
+
+class ExecutableFunctionExpression : public IExecutableFunction
 {
 public:
     struct Signature
@@ -29,28 +41,40 @@ public:
     using SignaturePtr = std::shared_ptr<Signature>;
 
     ExecutableFunctionExpression(ExpressionActionsPtr expression_actions_, SignaturePtr signature_)
-        : expression_actions(std::move(expression_actions_))
-        , signature(std::move(signature_))
-    {}
+        : expression_actions(std::move(expression_actions_)), signature(std::move(signature_))
+    {
+    }
 
     String getName() const override { return "FunctionExpression"; }
 
-    void execute(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
-        Block expr_block;
+        if (input_rows_count == 0)
+            return result_type->createColumn();
+
+        if (!expression_actions)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "No actions were passed to FunctionExpression");
+
+        DB::Block expr_columns;
         for (size_t i = 0; i < arguments.size(); ++i)
         {
-            const auto & argument = block.getByPosition(arguments[i]);
+            const auto & argument = arguments[i];
             /// Replace column name with value from argument_names.
-            expr_block.insert({argument.column, argument.type, signature->argument_names[i]});
+            expr_columns.insert({argument.column, argument.type, signature->argument_names[i]});
         }
 
-        expression_actions->execute(expr_block);
+        expression_actions->execute(expr_columns);
 
-        block.getByPosition(result).column = expr_block.getByName(signature->return_name).column;
+        return expr_columns.getByName(signature->return_name).column;
     }
 
-bool useDefaultImplementationForNulls() const override { return false; }
+    bool useDefaultImplementationForNulls() const override { return false; }
+    /// It's possible if expression_actions contains function that don't use
+    /// default implementation for Nothing.
+    /// Example: arrayMap(x -> CAST(x, 'UInt8'), []);
+    bool useDefaultImplementationForNothing() const override { return false; }
+    /// Example: SELECT arrayMap(x -> (x + (arrayMap(y -> ((x + y) + toLowCardinality(1)), [])[1])), [])
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
 
 private:
     ExpressionActionsPtr expression_actions;
@@ -58,72 +82,16 @@ private:
 };
 
 /// Executes expression. Uses for lambda functions implementation. Can't be created from factory.
-class FunctionExpression : public IFunctionBaseImpl
+class FunctionExpression : public IFunctionBase
 {
 public:
     using Signature = ExecutableFunctionExpression::Signature;
     using SignaturePtr = ExecutableFunctionExpression::SignaturePtr;
 
-    FunctionExpression(ExpressionActionsPtr expression_actions_,
-            DataTypes argument_types_, const Names & argument_names_,
-            DataTypePtr return_type_, const std::string & return_name_)
-            : expression_actions(std::move(expression_actions_))
-            , signature(std::make_shared<Signature>(Signature{argument_names_, return_name_}))
-            , argument_types(std::move(argument_types_)), return_type(std::move(return_type_))
+    FunctionExpression(LambdaCapturePtr capture_, ExpressionActionsPtr expression_actions_)
+        : expression_actions(std::move(expression_actions_))
+        , capture(std::move(capture_))
     {
-    }
-
-    String getName() const override { return "FunctionExpression"; }
-
-    bool isDeterministic() const override { return true; }
-    bool isDeterministicInScopeOfQuery() const override { return true; }
-
-    const DataTypes & getArgumentTypes() const override { return argument_types; }
-    const DataTypePtr & getReturnType() const override { return return_type; }
-
-    ExecutableFunctionImplPtr prepare(const Block &, const ColumnNumbers &, size_t) const override
-    {
-        return std::make_unique<ExecutableFunctionExpression>(expression_actions, signature);
-    }
-
-private:
-    ExpressionActionsPtr expression_actions;
-    SignaturePtr signature;
-    DataTypes argument_types;
-    DataTypePtr return_type;
-};
-
-/// Captures columns which are used by lambda function but not in argument list.
-/// Returns ColumnFunction with captured columns.
-/// For lambda(x, x + y) x is in lambda_arguments, y is in captured arguments, expression_actions is 'x + y'.
-///  execute(y) returns ColumnFunction(FunctionExpression(x + y), y) with type Function(x) -> function_return_type.
-class ExecutableFunctionCapture : public IExecutableFunctionImpl
-{
-public:
-    struct Capture
-    {
-        Names captured_names;
-        DataTypes captured_types;
-        NamesAndTypesList lambda_arguments;
-        String return_name;
-        DataTypePtr return_type;
-    };
-
-    using CapturePtr = std::shared_ptr<Capture>;
-
-    ExecutableFunctionCapture(ExpressionActionsPtr expression_actions_, CapturePtr capture_)
-        : expression_actions(std::move(expression_actions_)), capture(std::move(capture_)) {}
-
-    String getName() const override { return "FunctionCapture"; }
-
-    bool useDefaultImplementationForNulls() const override { return false; }
-    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
-
-    void execute(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
-    {
-        ColumnsWithTypeAndName columns;
-        columns.reserve(arguments.size());
-
         Names names;
         DataTypes types;
 
@@ -139,29 +107,111 @@ public:
             types.push_back(lambda_argument.type);
         }
 
-        for (const auto & argument : arguments)
-            columns.push_back(block.getByPosition(argument));
+        argument_types = std::move(types);
+        signature = std::make_shared<Signature>(Signature{names, capture->return_name});
+    }
 
-        auto function = std::make_unique<FunctionExpression>(expression_actions, types, names,
-                                                             capture->return_type, capture->return_name);
-        auto function_adaptor = std::make_shared<FunctionBaseAdaptor>(std::move(function));
-        block.getByPosition(result).column = ColumnFunction::create(input_rows_count, std::move(function_adaptor), columns);
+    String getName() const override { return "FunctionExpression"; }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
+    const DataTypes & getArgumentTypes() const override { return argument_types; }
+    const DataTypePtr & getResultType() const override { return capture->return_type; }
+
+    const LambdaCapture & getCapture() const { return *capture; }
+    const ActionsDAG & getAcionsDAG() const { return expression_actions->getActionsDAG(); }
+
+    ExecutableFunctionPtr prepare(const ColumnsWithTypeAndName &) const override
+    {
+        return std::make_unique<ExecutableFunctionExpression>(expression_actions, signature);
     }
 
 private:
     ExpressionActionsPtr expression_actions;
-    CapturePtr capture;
+    LambdaCapturePtr capture;
+
+    /// This is redundant and is built from capture.
+    SignaturePtr signature;
+    DataTypes argument_types;
 };
 
-class FunctionCapture : public IFunctionBaseImpl
+/// Captures columns which are used by lambda function but not in argument list.
+/// Returns ColumnFunction with captured columns.
+/// For lambda(x, x + y) x is in lambda_arguments, y is in captured arguments, expression_actions is 'x + y'.
+///  execute(y) returns ColumnFunction(FunctionExpression(x + y), y) with type Function(x) -> function_return_type.
+class ExecutableFunctionCapture : public IExecutableFunction
 {
 public:
-    using Capture = ExecutableFunctionCapture::Capture;
-    using CapturePtr = ExecutableFunctionCapture::CapturePtr;
+    ExecutableFunctionCapture(ExpressionActionsPtr expression_actions_, LambdaCapturePtr capture_)
+        : expression_actions(std::move(expression_actions_)), capture(std::move(capture_))
+    {
+    }
 
+    String getName() const override { return "FunctionCapture"; }
+
+    bool useDefaultImplementationForNulls() const override { return false; }
+
+    /// It's possible if expression_actions contains function that don't use
+    /// default implementation for Nothing and one of captured columns can be Nothing
+    /// Example: SELECT arrayMap(x -> [x, arrayElement(y, 0)], []), [] as y
+    bool useDefaultImplementationForNothing() const override { return false; }
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        Names names;
+        DataTypes types;
+
+        names.reserve(capture->captured_names.size() + capture->lambda_arguments.size());
+        names.insert(names.end(), capture->captured_names.begin(), capture->captured_names.end());
+
+        types.reserve(capture->captured_types.size() + capture->lambda_arguments.size());
+        types.insert(types.end(), capture->captured_types.begin(), capture->captured_types.end());
+
+        for (const auto & lambda_argument : capture->lambda_arguments)
+        {
+            names.push_back(lambda_argument.name);
+            types.push_back(lambda_argument.type);
+        }
+
+        auto function = std::make_unique<FunctionExpression>(capture, expression_actions);
+
+        /// If all the captured arguments are constant, let's also return ColumnConst (with ColumnFunction inside it).
+        /// Consequently, it allows to treat higher order functions with constant arrays and constant captured columns
+        /// as constant expressions.
+        /// Consequently, it allows its usage in contexts requiring constants, such as the right hand side of IN.
+        bool constant_folding = capture->allow_constant_folding
+            && std::all_of(arguments.begin(), arguments.end(),
+            [](const auto & arg) { return arg.column->isConst(); });
+
+        if (constant_folding)
+        {
+            ColumnsWithTypeAndName arguments_resized = arguments;
+            for (auto & elem : arguments_resized)
+                elem.column = elem.column->cloneResized(1);
+
+            return ColumnConst::create(ColumnFunction::create(1, std::move(function), arguments_resized), input_rows_count);
+        }
+        else
+        {
+            return ColumnFunction::create(input_rows_count, std::move(function), arguments);
+        }
+    }
+
+    const ExpressionActionsPtr & getActions() const { return expression_actions; }
+    const LambdaCapturePtr & getCapture() const { return capture; }
+
+private:
+    ExpressionActionsPtr expression_actions;
+    LambdaCapturePtr capture;
+};
+
+class FunctionCapture : public IFunctionBase
+{
+public:
     FunctionCapture(
         ExpressionActionsPtr expression_actions_,
-        CapturePtr capture_,
+        LambdaCapturePtr capture_,
         DataTypePtr return_type_,
         String name_)
         : expression_actions(std::move(expression_actions_))
@@ -173,96 +223,98 @@ public:
 
     String getName() const override { return name; }
 
-    bool isDeterministic() const override { return true; }
-    bool isDeterministicInScopeOfQuery() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     const DataTypes & getArgumentTypes() const override { return capture->captured_types; }
-    const DataTypePtr & getReturnType() const override { return return_type; }
+    const DataTypePtr & getResultType() const override { return return_type; }
 
-    ExecutableFunctionImplPtr prepare(const Block &, const ColumnNumbers &, size_t) const override
+    ExecutableFunctionPtr prepare(const ColumnsWithTypeAndName &) const override
     {
         return std::make_unique<ExecutableFunctionCapture>(expression_actions, capture);
     }
 
+    const LambdaCapture & getCapture() const { return *capture; }
+    const ActionsDAG & getAcionsDAG() const { return expression_actions->getActionsDAG(); }
+
 private:
     ExpressionActionsPtr expression_actions;
-    CapturePtr capture;
+    LambdaCapturePtr capture;
     DataTypePtr return_type;
     String name;
 };
 
-class FunctionCaptureOverloadResolver : public IFunctionOverloadResolverImpl
+class FunctionCaptureOverloadResolver : public IFunctionOverloadResolver
 {
 public:
-    using Capture = ExecutableFunctionCapture::Capture;
-    using CapturePtr = ExecutableFunctionCapture::CapturePtr;
-
     FunctionCaptureOverloadResolver(
-            ExpressionActionsPtr expression_actions_,
-            const Names & captured_names_,
-            const NamesAndTypesList & lambda_arguments_,
-            const DataTypePtr & function_return_type_,
-            const String & expression_return_name_)
-        : expression_actions(std::move(expression_actions_))
+        ActionsDAG actions_dag,
+        const ExpressionActionsSettings & actions_settings,
+        const Names & captured_names,
+        const NamesAndTypesList & lambda_arguments,
+        const DataTypePtr & function_return_type,
+        const String & expression_return_name,
+        bool allow_constant_folding)
     {
-        /// Check that expression does not contain unusual actions that will break blocks structure.
-        for (const auto & action : expression_actions->getActions())
-            if (action.type == ExpressionAction::Type::JOIN || action.type == ExpressionAction::Type::ARRAY_JOIN)
-                throw Exception("Expression with arrayJoin or other unusual action cannot be captured", ErrorCodes::BAD_ARGUMENTS);
+        /// Check that expression does not contain unusual actions that will break columns structure.
+        if (actions_dag.hasArrayJoin())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expression with arrayJoin or other unusual action cannot be captured");
 
         std::unordered_map<std::string, DataTypePtr> arguments_map;
 
-        const auto & all_arguments = expression_actions->getRequiredColumnsWithTypes();
-        for (const auto & arg : all_arguments)
-            arguments_map[arg.name] = arg.type;
+        for (const auto * input : actions_dag.getInputs())
+            arguments_map[input->result_name] = input->result_type;
 
         DataTypes captured_types;
-        captured_types.reserve(captured_names_.size());
+        captured_types.reserve(captured_names.size());
 
-        for (const auto & captured_name : captured_names_)
+        for (const auto & captured_name : captured_names)
         {
             auto it = arguments_map.find(captured_name);
             if (it == arguments_map.end())
-                throw Exception("Lambda captured argument " + captured_name + " not found in required columns.",
-                                ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Lambda captured argument {} not found in required columns.", captured_name);
 
             captured_types.push_back(it->second);
             arguments_map.erase(it);
         }
 
         DataTypes argument_types;
-        argument_types.reserve(lambda_arguments_.size());
-        for (const auto & lambda_argument : lambda_arguments_)
+        argument_types.reserve(lambda_arguments.size());
+        for (const auto & lambda_argument : lambda_arguments)
             argument_types.push_back(lambda_argument.type);
 
-        return_type = std::make_shared<DataTypeFunction>(argument_types, function_return_type_);
+        return_type = std::make_shared<DataTypeFunction>(argument_types, function_return_type);
 
         name = "Capture[" + toString(captured_types) + "](" + toString(argument_types) + ") -> "
-               + function_return_type_->getName();
+               + function_return_type->getName();
 
-        capture = std::make_shared<Capture>(Capture{
-                .captured_names = captured_names_,
-                .captured_types = std::move(captured_types),
-                .lambda_arguments = lambda_arguments_,
-                .return_name = expression_return_name_,
-                .return_type = function_return_type_,
+        capture = std::make_shared<LambdaCapture>(LambdaCapture{
+            .captured_names = captured_names,
+            .captured_types = std::move(captured_types),
+            .lambda_arguments = lambda_arguments,
+            .return_name = expression_return_name,
+            .return_type = function_return_type,
+            .allow_constant_folding = allow_constant_folding,
         });
+
+        expression_actions = std::make_shared<ExpressionActions>(std::move(actions_dag), actions_settings);
     }
 
     String getName() const override { return name; }
     bool useDefaultImplementationForNulls() const override { return false; }
+    /// See comment in ExecutableFunctionCapture.
+    bool useDefaultImplementationForNothing() const override { return false; }
     bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
-    DataTypePtr getReturnType(const ColumnsWithTypeAndName &) const override { return return_type; }
+    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName &) const override { return return_type; }
     size_t getNumberOfArguments() const override { return capture->captured_types.size(); }
 
-    FunctionBaseImplPtr build(const ColumnsWithTypeAndName &, const DataTypePtr &) const override
+    FunctionBasePtr buildImpl(const ColumnsWithTypeAndName &, const DataTypePtr &) const override
     {
         return std::make_unique<FunctionCapture>(expression_actions, capture, return_type, name);
     }
 
 private:
     ExpressionActionsPtr expression_actions;
-    CapturePtr capture;
+    LambdaCapturePtr capture;
     DataTypePtr return_type;
     String name;
 

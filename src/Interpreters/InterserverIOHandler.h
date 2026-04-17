@@ -1,20 +1,19 @@
 #pragma once
 
-#include <IO/ReadBuffer.h>
-#include <IO/WriteBuffer.h>
-#include <IO/ReadBufferFromString.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <Common/ActionBlocker.h>
-#include <Core/Types.h>
-#include <map>
-#include <atomic>
-#include <utility>
-#include <shared_mutex>
-#include <Poco/Net/HTMLForm.h>
+#include <Common/Exception.h>
+#include <Common/SharedMutex.h>
+#include <IO/ReadBuffer.h>
+#include <base/types.h>
 
-namespace Poco { namespace Net { class HTTPServerResponse; } }
+#include <map>
+#include <mutex>
+
+namespace zkutil
+{
+    class ZooKeeper;
+    using ZooKeeperPtr = std::shared_ptr<ZooKeeper>;
+}
 
 namespace DB
 {
@@ -25,18 +24,23 @@ namespace ErrorCodes
     extern const int NO_SUCH_INTERSERVER_IO_ENDPOINT;
 }
 
+class HTMLForm;
+class HTTPServerResponse;
+class ReadBuffer;
+class WriteBuffer;
+
 /** Query processor from other servers.
   */
 class InterserverIOEndpoint
 {
 public:
     virtual std::string getId(const std::string & path) const = 0;
-    virtual void processQuery(const Poco::Net::HTMLForm & params, ReadBuffer & body, WriteBuffer & out, Poco::Net::HTTPServerResponse & response) = 0;
+    virtual void processQuery(const HTMLForm & params, ReadBufferPtr body, WriteBuffer & out, HTTPServerResponse & response) = 0;
     virtual ~InterserverIOEndpoint() = default;
 
     /// You need to stop the data transfer if blocker is activated.
     ActionBlocker blocker;
-    std::shared_mutex rwlock;
+    SharedMutex rwlock;
 };
 
 using InterserverIOEndpointPtr = std::shared_ptr<InterserverIOEndpoint>;
@@ -53,7 +57,7 @@ public:
         std::lock_guard lock(mutex);
         bool inserted = endpoint_map.try_emplace(name, std::move(endpoint)).second;
         if (!inserted)
-            throw Exception("Duplicate interserver IO endpoint: " + name, ErrorCodes::DUPLICATE_INTERSERVER_IO_ENDPOINT);
+            throw Exception(ErrorCodes::DUPLICATE_INTERSERVER_IO_ENDPOINT, "Duplicate interserver IO endpoint: {}", name);
     }
 
     bool removeEndpointIfExists(const String & name)
@@ -62,7 +66,7 @@ public:
         return endpoint_map.erase(name);
     }
 
-    InterserverIOEndpointPtr getEndpoint(const String & name)
+    InterserverIOEndpointPtr getEndpoint(const String & name) const
     try
     {
         std::lock_guard lock(mutex);
@@ -70,14 +74,14 @@ public:
     }
     catch (...)
     {
-        throw Exception("No interserver IO endpoint named " + name, ErrorCodes::NO_SUCH_INTERSERVER_IO_ENDPOINT);
+        throw Exception(ErrorCodes::NO_SUCH_INTERSERVER_IO_ENDPOINT, "No interserver IO endpoint named {}", name);
     }
 
 private:
     using EndpointMap = std::map<String, InterserverIOEndpointPtr>;
 
     EndpointMap endpoint_map;
-    std::mutex mutex;
+    mutable std::mutex mutex;
 };
 
 }

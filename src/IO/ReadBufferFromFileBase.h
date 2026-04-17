@@ -2,24 +2,36 @@
 
 #include <IO/BufferWithOwnMemory.h>
 #include <IO/SeekableReadBuffer.h>
-#include <common/time.h>
+#include <IO/WithFileName.h>
+#include <Interpreters/Context_fwd.h>
+#include <base/time.h>
 
 #include <functional>
+#include <utility>
 #include <string>
 
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <fcntl.h>
+
+#ifndef O_DIRECT
+#define O_DIRECT 00040000
+#endif
 
 
 namespace DB
 {
-class ReadBufferFromFileBase : public BufferWithOwnMemory<SeekableReadBuffer>
+
+class ReadBufferFromFileBase : public BufferWithOwnMemory<SeekableReadBuffer>, public WithFileName, public WithFileSize
 {
 public:
     ReadBufferFromFileBase();
-    ReadBufferFromFileBase(size_t buf_size, char * existing_memory, size_t alignment);
-    ReadBufferFromFileBase(ReadBufferFromFileBase &&) = default;
+    ReadBufferFromFileBase(
+        size_t buf_size,
+        char * existing_memory,
+        size_t alignment,
+        std::optional<size_t> file_size_ = std::nullopt);
     ~ReadBufferFromFileBase() override;
-    virtual std::string getFileName() const = 0;
 
     /// It is possible to get information about the time of each reading.
     struct ProfileInfo
@@ -38,7 +50,27 @@ public:
         clock_type = clock_type_;
     }
 
+    std::optional<size_t> tryGetFileSize() override;
+
+    void setProgressCallback(ContextPtr context);
+
+    /// Returns true if this file is on local filesystem, and getFileName() is its path.
+    /// I.e. it can be read using open() or mmap(). If this buffer is a "view" into a subrange of the
+    /// file, *out_view_offset is set to the start of that subrange, i.e. the difference between actual
+    /// file offset and what getPosition() returns.
+    virtual bool isRegularLocalFile(size_t * /*out_view_offsee*/) { return false; }
+
+    virtual bool isCached() const { return false; }
+
+    /// Query the actual object size directly from remote storage.
+    /// Unlike tryGetFileSize(), which typically returns a pre-known cached value passed at construction time,
+    /// this method issues a real metadata request (e.g. S3 HeadObject, Azure GetProperties) and reflects
+    /// the current state of the object. Useful for detecting mismatches between the expected and actual size.
+    /// Returns std::nullopt for non-remote or local file buffers.
+    virtual std::optional<size_t> getRemoteFileSize() const { return std::nullopt; }
+
 protected:
+    std::optional<size_t> file_size;
     ProfileCallback profile_callback;
     clockid_t clock_type{};
 };

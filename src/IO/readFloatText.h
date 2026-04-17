@@ -1,10 +1,16 @@
+#pragma once
 #include <type_traits>
 #include <IO/ReadHelpers.h>
 #include <Core/Defines.h>
-#include <common/shift10.h>
-#include <Common/StringUtils/StringUtils.h>
-#include <double-conversion/double-conversion.h>
+#include <base/shift10.h>
+#include <Common/StringUtils.h>
 
+// NOLINTBEGIN(clang-analyzer-core.UndefinedBinaryOperatorResult,clang-analyzer-optin.core.EnumCastOutOfRange)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunneeded-internal-declaration"
+#include <fast_float/fast_float.h>
+#pragma clang diagnostic pop
+// NOLINTEND(clang-analyzer-core.UndefinedBinaryOperatorResult,clang-analyzer-optin.core.EnumCastOutOfRange)
 
 /** Methods for reading floating point numbers from text with decimal representation.
   * There are "precise", "fast" and "simple" implementations.
@@ -132,105 +138,91 @@ bool assertOrParseNaN(ReadBuffer & buf)
 }
 
 
-/// Some garbage may be successfully parsed, examples: '--1' parsed as '1'.
 template <typename T, typename ReturnType>
 ReturnType readFloatTextPreciseImpl(T & x, ReadBuffer & buf)
 {
-    static_assert(std::is_same_v<T, double> || std::is_same_v<T, float>, "Argument for readFloatTextImpl must be float or double");
+    static_assert(std::is_same_v<T, double> || std::is_same_v<T, float>, "Argument for readFloatTextPreciseImpl must be float or double");
+    static_assert('a' > '.' && 'A' > '.' && '\n' < '.' && '\t' < '.' && '\'' < '.' && '"' < '.', "Layout of char is not like ASCII");
+
     static constexpr bool throw_exception = std::is_same_v<ReturnType, void>;
-
-    if (buf.eof())
-    {
-        if constexpr (throw_exception)
-            throw Exception("Cannot read floating point value", ErrorCodes::CANNOT_PARSE_NUMBER);
-        else
-            return ReturnType(false);
-    }
-
-    /// We use special code to read denormals (inf, nan), because we support slightly more variants that double-conversion library does:
-    /// Example: inf and Infinity.
-
-    bool negative = false;
-
-    while (true)
-    {
-        switch (*buf.position())
-        {
-            case '+':
-                continue;
-
-            case '-':
-            {
-                negative = true;
-                ++buf.position();
-                continue;
-            }
-
-            case 'i': [[fallthrough]];
-            case 'I':
-            {
-                if (assertOrParseInfinity<throw_exception>(buf))
-                {
-                    x = std::numeric_limits<T>::infinity();
-                    if (negative)
-                        x = -x;
-                    return ReturnType(true);
-                }
-                return ReturnType(false);
-            }
-
-            case 'n': [[fallthrough]];
-            case 'N':
-            {
-                if (assertOrParseNaN<throw_exception>(buf))
-                {
-                    x = std::numeric_limits<T>::quiet_NaN();
-                    if (negative)
-                        x = -x;
-                    return ReturnType(true);
-                }
-                return ReturnType(false);
-            }
-
-            default:
-                break;
-        }
-        break;
-    }
-
-    static const double_conversion::StringToDoubleConverter converter(
-        double_conversion::StringToDoubleConverter::ALLOW_TRAILING_JUNK,
-        0, 0, nullptr, nullptr);
-
-    /// Fast path (avoid copying) if the buffer have at least MAX_LENGTH bytes.
     static constexpr int MAX_LENGTH = 316;
 
-    if (buf.position() + MAX_LENGTH <= buf.buffer().end())
+    /// NOLINTBEGIN(readability-else-after-return)
+    ReadBufferFromMemory * buf_from_memory = dynamic_cast<ReadBufferFromMemory *>(&buf);
+    /// Fast path (avoid copying) if the buffer have at least MAX_LENGTH bytes or buf is ReadBufferFromMemory
+    if (likely(!buf.eof() && (buf_from_memory || buf.position() + MAX_LENGTH <= buf.buffer().end())))
     {
-        int num_processed_characters = 0;
+        auto * initial_position = buf.position();
+        auto res = fast_float::from_chars(initial_position, buf.buffer().end(), x, fast_float::chars_format::general | fast_float::chars_format::allow_leading_plus);
 
-        if constexpr (std::is_same_v<T, double>)
-            x = converter.StringToDouble(buf.position(), buf.buffer().end() - buf.position(), &num_processed_characters);
-        else
-            x = converter.StringToFloat(buf.position(), buf.buffer().end() - buf.position(), &num_processed_characters);
-
-        if (num_processed_characters < 0)
+        if (unlikely(res.ec != std::errc()))
         {
             if constexpr (throw_exception)
-                throw Exception("Cannot read floating point value", ErrorCodes::CANNOT_PARSE_NUMBER);
+                throw Exception(
+                    ErrorCodes::CANNOT_PARSE_NUMBER,
+                    "Cannot read floating point value here: {}",
+                    String(initial_position, buf.buffer().end() - initial_position));
             else
                 return ReturnType(false);
         }
 
-        buf.position() += num_processed_characters;
+        buf.position() += res.ptr - initial_position;
 
-        if (negative)
-            x = -x;
         return ReturnType(true);
     }
     else
     {
         /// Slow path. Copy characters that may be present in floating point number to temporary buffer.
+        bool negative = false;
+
+        /// We check eof here because we can parse +inf +nan
+        while (!buf.eof())
+        {
+            switch (*buf.position())
+            {
+                case '+':
+                    ++buf.position();
+                    continue;
+
+                case '-':
+                {
+                    negative = true;
+                    ++buf.position();
+                    continue;
+                }
+
+                case 'i': [[fallthrough]];
+                case 'I':
+                {
+                    if (assertOrParseInfinity<throw_exception>(buf))
+                    {
+                        x = std::numeric_limits<T>::infinity();
+                        if (negative)
+                            x = -x;
+                        return ReturnType(true);
+                    }
+                    return ReturnType(false);
+                }
+
+                case 'n': [[fallthrough]];
+                case 'N':
+                {
+                    if (assertOrParseNaN<throw_exception>(buf))
+                    {
+                        x = std::numeric_limits<T>::quiet_NaN();
+                        if (negative)
+                            x = -x;
+                        return ReturnType(true);
+                    }
+                    return ReturnType(false);
+                }
+
+                default:
+                    break;
+            }
+
+            break;
+        }
 
         char tmp_buf[MAX_LENGTH];
         int num_copied_chars = 0;
@@ -246,27 +238,45 @@ ReturnType readFloatTextPreciseImpl(T & x, ReadBuffer & buf)
             ++num_copied_chars;
         }
 
-        int num_processed_characters = 0;
-
-        if constexpr (std::is_same_v<T, double>)
-            x = converter.StringToDouble(tmp_buf, num_copied_chars, &num_processed_characters);
+        fast_float::from_chars_result res;
+        if constexpr (std::endian::native == std::endian::little)
+            res = fast_float::from_chars(tmp_buf, tmp_buf + num_copied_chars, x);
         else
-            x = converter.StringToFloat(tmp_buf, num_copied_chars, &num_processed_characters);
-
-        if (num_processed_characters < num_copied_chars)
+        {
+            Float64 x64 = 0.0;
+            res = fast_float::from_chars(tmp_buf, tmp_buf + num_copied_chars, x64);
+            x = static_cast<T>(x64);
+        }
+        if (unlikely(res.ec != std::errc() || res.ptr - tmp_buf != num_copied_chars))
         {
             if constexpr (throw_exception)
-                throw Exception("Cannot read floating point value", ErrorCodes::CANNOT_PARSE_NUMBER);
+                throw Exception(
+                    ErrorCodes::CANNOT_PARSE_NUMBER, "Cannot read floating point value here: {}", String(tmp_buf, num_copied_chars));
             else
                 return ReturnType(false);
         }
 
         if (negative)
             x = -x;
+
         return ReturnType(true);
     }
+    /// NOLINTEND(readability-else-after-return)
 }
 
+
+// credit: https://johnnylee-sde.github.io/Fast-numeric-string-to-int/
+static inline bool is_made_of_eight_digits_fast(uint64_t val) noexcept
+{
+    return (((val & 0xF0F0F0F0F0F0F0F0) | (((val + 0x0606060606060606) & 0xF0F0F0F0F0F0F0F0) >> 4)) == 0x3333333333333333);
+}
+
+static inline bool is_made_of_eight_digits_fast(const char * chars) noexcept
+{
+    uint64_t val;
+    ::memcpy(&val, chars, 8);
+    return is_made_of_eight_digits_fast(val);
+}
 
 template <size_t N, typename T>
 static inline void readUIntTextUpToNSignificantDigits(T & x, ReadBuffer & buf)
@@ -285,9 +295,6 @@ static inline void readUIntTextUpToNSignificantDigits(T & x, ReadBuffer & buf)
             else
                 return;
         }
-
-        while (!buf.eof() && isNumericASCII(*buf.position()))
-            ++buf.position();
     }
     else
     {
@@ -302,18 +309,26 @@ static inline void readUIntTextUpToNSignificantDigits(T & x, ReadBuffer & buf)
             else
                 return;
         }
-
-        while (!buf.eof() && isNumericASCII(*buf.position()))
-            ++buf.position();
     }
+
+    while (!buf.eof() && (buf.position() + 8 <= buf.buffer().end()) &&
+         is_made_of_eight_digits_fast(buf.position()))
+    {
+        buf.position() += 8;
+    }
+
+    while (!buf.eof() && isNumericASCII(*buf.position()))
+        ++buf.position();
 }
 
 
-template <typename T, typename ReturnType>
-ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
+template <typename T, typename ReturnType, bool allow_exponent = true>
+ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in, bool & has_fractional)
 {
     static_assert(std::is_same_v<T, double> || std::is_same_v<T, float>, "Argument for readFloatTextImpl must be float or double");
-    static_assert('a' > '.' && 'A' > '.' && '\n' < '.' && '\t' < '.' && '\'' < '.' && '"' < '.', "Layout of char is not like ASCII"); //-V590
+    static_assert('a' > '.' && 'A' > '.' && '\n' < '.' && '\t' < '.' && '\'' < '.' && '"' < '.', "Layout of char is not like ASCII");
+
+    has_fractional = false;
 
     static constexpr bool throw_exception = std::is_same_v<ReturnType, void>;
 
@@ -327,7 +342,7 @@ ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
     if (in.eof())
     {
         if constexpr (throw_exception)
-            throw Exception("Cannot read floating point value", ErrorCodes::CANNOT_PARSE_NUMBER);
+            throw Exception(ErrorCodes::CANNOT_PARSE_NUMBER, "Cannot read floating point value");
         else
             return false;
     }
@@ -337,23 +352,24 @@ ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
         negative = true;
         ++in.position();
     }
-
+    else if (*in.position() == '+')
+        ++in.position();
 
     auto count_after_sign = in.count();
 
     constexpr int significant_digits = std::numeric_limits<UInt64>::digits10;
     readUIntTextUpToNSignificantDigits<significant_digits>(before_point, in);
 
-    int read_digits = in.count() - count_after_sign;
+    size_t read_digits = in.count() - count_after_sign;
 
     if (unlikely(read_digits > significant_digits))
     {
-        int before_point_additional_exponent = read_digits - significant_digits;
-        x = shift10(before_point, before_point_additional_exponent);
+        int before_point_additional_exponent = static_cast<int>(read_digits) - significant_digits;
+        x = static_cast<T>(shift10(before_point, before_point_additional_exponent));
     }
     else
     {
-        x = before_point;
+        x = static_cast<T>(before_point);
 
         /// Shortcut for the common case when there is an integer that fit in Int64.
         if (read_digits && (in.eof() || *in.position() < '.'))
@@ -366,50 +382,59 @@ ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
 
     if (checkChar('.', in))
     {
+        has_fractional = true;
         auto after_point_count = in.count();
 
         while (!in.eof() && *in.position() == '0')
             ++in.position();
 
         auto after_leading_zeros_count = in.count();
-        auto after_point_num_leading_zeros = after_leading_zeros_count - after_point_count;
+        int after_point_num_leading_zeros = static_cast<int>(after_leading_zeros_count - after_point_count);
 
         readUIntTextUpToNSignificantDigits<significant_digits>(after_point, in);
         read_digits = in.count() - after_leading_zeros_count;
-        after_point_exponent = (read_digits > significant_digits ? -significant_digits : -read_digits) - after_point_num_leading_zeros;
+        after_point_exponent = (read_digits > significant_digits ? -significant_digits : static_cast<int>(-read_digits)) - after_point_num_leading_zeros;
     }
 
-    if (checkChar('e', in) || checkChar('E', in))
+    if constexpr (allow_exponent)
     {
-        if (in.eof())
+        if (checkChar('e', in) || checkChar('E', in))
         {
-            if constexpr (throw_exception)
-                throw Exception("Cannot read floating point value: nothing after exponent", ErrorCodes::CANNOT_PARSE_NUMBER);
-            else
-                return false;
-        }
+            has_fractional = true;
+            if (in.eof())
+            {
+                if constexpr (throw_exception)
+                    throw Exception(ErrorCodes::CANNOT_PARSE_NUMBER, "Cannot read floating point value: nothing after exponent");
+                else
+                    return false;
+            }
 
-        bool exponent_negative = false;
-        if (*in.position() == '-')
-        {
-            exponent_negative = true;
-            ++in.position();
-        }
-        else if (*in.position() == '+')
-        {
-            ++in.position();
-        }
+            bool exponent_negative = false;
+            if (*in.position() == '-')
+            {
+                exponent_negative = true;
+                ++in.position();
+            }
+            else if (*in.position() == '+')
+            {
+                ++in.position();
+            }
 
-        readUIntTextUpToNSignificantDigits<4>(exponent, in);
-        if (exponent_negative)
-            exponent = -exponent;
+            readUIntTextUpToNSignificantDigits<4>(exponent, in);
+            if (exponent_negative)
+                exponent = -exponent;
+        }
     }
 
     if (after_point)
-        x += shift10(after_point, after_point_exponent);
+    {
+        x += static_cast<T>(shift10(after_point, after_point_exponent));
+    }
 
     if (exponent)
-        x = shift10(x, exponent);
+    {
+        x = static_cast<T>(shift10(x, exponent));
+    }
 
     if (negative)
         x = -x;
@@ -422,7 +447,7 @@ ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
         if (in.eof())
         {
             if constexpr (throw_exception)
-                throw Exception("Cannot read floating point value: no digits read", ErrorCodes::CANNOT_PARSE_NUMBER);
+                throw Exception(ErrorCodes::CANNOT_PARSE_NUMBER, "Cannot read floating point value: no digits read");
             else
                 return false;
         }
@@ -433,14 +458,14 @@ ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
             if (in.eof())
             {
                 if constexpr (throw_exception)
-                    throw Exception("Cannot read floating point value: nothing after plus sign", ErrorCodes::CANNOT_PARSE_NUMBER);
+                    throw Exception(ErrorCodes::CANNOT_PARSE_NUMBER, "Cannot read floating point value: nothing after plus sign");
                 else
                     return false;
             }
             else if (negative)
             {
                 if constexpr (throw_exception)
-                    throw Exception("Cannot read floating point value: plus after minus sign", ErrorCodes::CANNOT_PARSE_NUMBER);
+                    throw Exception(ErrorCodes::CANNOT_PARSE_NUMBER, "Cannot read floating point value: plus after minus sign");
                 else
                     return false;
             }
@@ -457,7 +482,7 @@ ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
             }
             return ReturnType(false);
         }
-        else if (*in.position() == 'n' || *in.position() == 'N')
+        if (*in.position() == 'n' || *in.position() == 'N')
         {
             if (assertOrParseNaN<throw_exception>(in))
             {
@@ -473,7 +498,6 @@ ReturnType readFloatTextFastImpl(T & x, ReadBuffer & in)
     return ReturnType(true);
 }
 
-
 template <typename T, typename ReturnType>
 ReturnType readFloatTextSimpleImpl(T & x, ReadBuffer & buf)
 {
@@ -482,7 +506,7 @@ ReturnType readFloatTextSimpleImpl(T & x, ReadBuffer & buf)
     bool negative = false;
     x = 0;
     bool after_point = false;
-    double power_of_ten = 1;
+    T power_of_ten = 1;
 
     if (buf.eof())
         throwReadAfterEOF();
@@ -574,15 +598,85 @@ ReturnType readFloatTextSimpleImpl(T & x, ReadBuffer & buf)
     return ReturnType(true);
 }
 
+template <typename T> void readFloatTextPrecise(T & x, ReadBuffer & in)
+{
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        readFloatTextPreciseImpl<Float32, void>(tmp, in);
+        x = BFloat16(tmp);
+    }
+    else
+        readFloatTextPreciseImpl<T, void>(x, in);
+}
 
-template <typename T> void readFloatTextPrecise(T & x, ReadBuffer & in) { readFloatTextPreciseImpl<T, void>(x, in); }
-template <typename T> bool tryReadFloatTextPrecise(T & x, ReadBuffer & in) { return readFloatTextPreciseImpl<T, bool>(x, in); }
+template <typename T> bool tryReadFloatTextPrecise(T & x, ReadBuffer & in)
+{
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        bool res = readFloatTextPreciseImpl<Float32, bool>(tmp, in);
+        if (res)
+            x = BFloat16(tmp);
+        return res;
+    }
+    else
+        return readFloatTextPreciseImpl<T, bool>(x, in);
+}
 
-template <typename T> void readFloatTextFast(T & x, ReadBuffer & in) { readFloatTextFastImpl<T, void>(x, in); }
-template <typename T> bool tryReadFloatTextFast(T & x, ReadBuffer & in) { return readFloatTextFastImpl<T, bool>(x, in); }
+template <typename T> void readFloatTextFast(T & x, ReadBuffer & in)
+{
+    bool has_fractional;
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        readFloatTextFastImpl<Float32, void>(tmp, in, has_fractional);
+        x = BFloat16(tmp);
+    }
+    else
+        readFloatTextFastImpl<T, void>(x, in, has_fractional);
+}
 
-template <typename T> void readFloatTextSimple(T & x, ReadBuffer & in) { readFloatTextSimpleImpl<T, void>(x, in); }
-template <typename T> bool tryReadFloatTextSimple(T & x, ReadBuffer & in) { return readFloatTextSimpleImpl<T, bool>(x, in); }
+template <typename T> bool tryReadFloatTextFast(T & x, ReadBuffer & in)
+{
+    bool has_fractional;
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        bool res = readFloatTextFastImpl<Float32, bool>(tmp, in, has_fractional);
+        if (res)
+            x = BFloat16(tmp);
+        return res;
+    }
+    else
+        return readFloatTextFastImpl<T, bool>(x, in, has_fractional);
+}
+
+template <typename T> void readFloatTextSimple(T & x, ReadBuffer & in)
+{
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        readFloatTextSimpleImpl<Float32, void>(tmp, in);
+        x = BFloat16(tmp);
+    }
+    else
+        readFloatTextSimpleImpl<T, void>(x, in);
+}
+
+template <typename T> bool tryReadFloatTextSimple(T & x, ReadBuffer & in)
+{
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        bool res = readFloatTextSimpleImpl<Float32, bool>(tmp, in);
+        if (res)
+            x = BFloat16(tmp);
+        return res;
+    }
+    else
+        return readFloatTextSimpleImpl<T, bool>(x, in);
+}
 
 
 /// Implementation that is selected as default.
@@ -590,5 +684,51 @@ template <typename T> bool tryReadFloatTextSimple(T & x, ReadBuffer & in) { retu
 template <typename T> void readFloatText(T & x, ReadBuffer & in) { readFloatTextFast(x, in); }
 template <typename T> bool tryReadFloatText(T & x, ReadBuffer & in) { return tryReadFloatTextFast(x, in); }
 
+/// Don't read exponent part of the number.
+template <typename T> bool tryReadFloatTextNoExponent(T & x, ReadBuffer & in)
+{
+    bool has_fractional;
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        bool res = readFloatTextFastImpl<Float32, bool, false>(tmp, in, has_fractional);
+        if (res)
+            x = BFloat16(tmp);
+        return res;
+
+    }
+    else
+        return readFloatTextFastImpl<T, bool, false>(x, in, has_fractional);
+}
+
+/// With a @has_fractional flag
+/// Used for input_format_try_infer_integers
+template <typename T> bool tryReadFloatTextExt(T & x, ReadBuffer & in, bool & has_fractional)
+{
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        bool res = readFloatTextFastImpl<Float32, bool>(tmp, in, has_fractional);
+        if (res)
+            x = BFloat16(tmp);
+        return res;
+    }
+    else
+        return readFloatTextFastImpl<T, bool>(x, in, has_fractional);
+}
+
+template <typename T> bool tryReadFloatTextExtNoExponent(T & x, ReadBuffer & in, bool & has_fractional)
+{
+    if constexpr (std::is_same_v<T, BFloat16>)
+    {
+        Float32 tmp;
+        bool res = readFloatTextFastImpl<Float32, bool, false>(tmp, in, has_fractional);
+        if (res)
+            x = BFloat16(tmp);
+        return res;
+    }
+    else
+        return readFloatTextFastImpl<T, bool, false>(x, in, has_fractional);
+}
 
 }

@@ -9,8 +9,6 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License. */
-#include <Parsers/ASTLiteral.h>
-#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTWatchQuery.h>
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ParserWatchQuery.h>
@@ -22,15 +20,15 @@ namespace DB
 
 bool ParserWatchQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    ParserKeyword s_watch("WATCH");
+    ParserKeyword s_watch(Keyword::WATCH);
     ParserToken s_dot(TokenType::Dot);
-    ParserIdentifier name_p;
-    ParserKeyword s_events("EVENTS");
-    ParserKeyword s_limit("LIMIT");
+    ParserIdentifier name_p(true);
+    ParserKeyword s_events(Keyword::EVENTS);
+    ParserKeyword s_limit(Keyword::LIMIT);
 
     ASTPtr database;
     ASTPtr table;
-    auto query = std::make_shared<ASTWatchQuery>();
+    auto query = make_intrusive<ASTWatchQuery>();
 
     if (!s_watch.ignore(pos, expected))
     {
@@ -62,11 +60,14 @@ bool ParserWatchQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
             return false;
     }
 
+    query->database = database;
+    query->table = table;
+
     if (database)
-        query->database = getIdentifierName(database);
+        query->children.push_back(database);
 
     if (table)
-        query->table = getIdentifierName(table);
+        query->children.push_back(table);
 
     node = query;
 

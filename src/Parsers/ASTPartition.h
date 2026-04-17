@@ -1,8 +1,7 @@
 #pragma once
 
 #include <Parsers/IAST.h>
-#include <common/StringRef.h>
-
+#include <optional>
 
 namespace DB
 {
@@ -11,17 +10,26 @@ namespace DB
 class ASTPartition : public IAST
 {
 public:
-    ASTPtr value;
-    String fields_str; /// The extent of comma-separated partition expression fields without parentheses.
-    size_t fields_count = 0;
+    IAST * value{nullptr};
+    std::optional<size_t> fields_count;
 
-    String id;
+    IAST * id{nullptr};
+    bool all = false;
 
     String getID(char) const override;
     ASTPtr clone() const override;
 
+    void setPartitionID(const ASTPtr & ast);
+    void setPartitionValue(const ASTPtr & ast);
+
+    void forEachPointerToChild(std::function<void(IAST **, boost::intrusive_ptr<IAST> *)> f) override
+    {
+        f(&value, nullptr);
+        f(&id, nullptr);
+    }
+
 protected:
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 }

@@ -1,11 +1,8 @@
-#include <Functions/IFunctionImpl.h>
-#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnString.h>
-#include <Columns/ColumnVector.h>
 #include <Common/UnicodeBar.h>
-#include <Common/FieldVisitors.h>
 #include <IO/WriteHelpers.h>
 
 
@@ -18,7 +15,11 @@ namespace ErrorCodes
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int ILLEGAL_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int BAD_ARGUMENTS;
 }
+
+namespace
+{
 
 /** bar(x, min, max, width) - draws a strip from the number of characters proportional to (x - min) and equal to width for x == max.
   * Returns a string with nice Unicode-art bar with resolution of 1/8 part of symbol.
@@ -27,7 +28,7 @@ class FunctionBar : public IFunction
 {
 public:
     static constexpr auto name = "bar";
-    static FunctionPtr create(const Context &)
+    static FunctionPtr create(ContextPtr)
     {
         return std::make_shared<FunctionBar>();
     }
@@ -41,6 +42,9 @@ public:
     {
         return true;
     }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     size_t getNumberOfArguments() const override
     {
         return 0;
@@ -49,122 +53,146 @@ public:
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.size() != 3 && arguments.size() != 4)
-            throw Exception("Function " + getName()
-                    + " requires from 3 or 4 parameters: value, min_value, max_value, [max_width_of_bar = 80]. Passed "
-                    + toString(arguments.size())
-                    + ".",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                    "Function {} requires from 3 or 4 parameters: value, min_value, max_value, [max_width_of_bar = 80]. "
+                    "Passed {}.", getName(), arguments.size());
 
-        if (!isNativeNumber(arguments[0]) || !isNativeNumber(arguments[1]) || !isNativeNumber(arguments[2])
-            || (arguments.size() == 4 && !isNativeNumber(arguments[3])))
-            throw Exception("All arguments for function " + getName() + " must be numeric.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        if (!isNumber(arguments[0]) || !isNumber(arguments[1]) || !isNumber(arguments[2])
+            || (arguments.size() == 4 && !isNumber(arguments[3])))
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "All arguments for function {} must be numeric.", getName());
 
         return std::make_shared<DataTypeString>();
     }
 
-    bool useDefaultImplementationForConstants() const override { return true; }
-    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1, 2, 3}; }
-
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
     {
-        Int64 min = extractConstant<Int64>(block, arguments, 1, "Second"); /// The level at which the line has zero length.
-        Int64 max = extractConstant<Int64>(block, arguments, 2, "Third"); /// The level at which the line has the maximum length.
+        return std::make_shared<DataTypeString>();
+    }
 
-        /// The maximum width of the bar in characters, by default.
-        Float64 max_width = arguments.size() == 4 ? extractConstant<Float64>(block, arguments, 3, "Fourth") : 80;
+    bool useDefaultImplementationForConstants() const override { return true; }
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {3}; }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        /// The maximum width of the bar in characters.
+        Float64 max_width = 80; /// Motivated by old-school terminal size.
+
+        if (arguments.size() == 4)
+        {
+            const auto & max_width_column = *arguments[3].column;
+
+            if (!isColumnConst(max_width_column))
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Fourth argument for function {} must be constant", getName());
+
+            max_width = max_width_column.getFloat64(0);
+        }
+
+        if (isNaN(max_width))
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Argument 'max_width' must not be NaN");
 
         if (max_width < 1)
-            throw Exception("Max_width argument must be >= 1.", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+            throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "Argument 'max_width' must be >= 1");
 
         if (max_width > 1000)
-            throw Exception("Too large max_width.", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
+            throw Exception(ErrorCodes::ARGUMENT_OUT_OF_BOUND, "Argument 'max_width' must be <= 1000");
 
-        const auto & src = *block.getByPosition(arguments[0]).column;
+        const auto & src = *arguments[0].column;
+
+        size_t current_offset = 0;
 
         auto res_column = ColumnString::create();
 
-        if (executeNumber<UInt8>(src, *res_column, min, max, max_width)
-            || executeNumber<UInt16>(src, *res_column, min, max, max_width)
-            || executeNumber<UInt32>(src, *res_column, min, max, max_width)
-            || executeNumber<UInt64>(src, *res_column, min, max, max_width)
-            || executeNumber<Int8>(src, *res_column, min, max, max_width)
-            || executeNumber<Int16>(src, *res_column, min, max, max_width)
-            || executeNumber<Int32>(src, *res_column, min, max, max_width)
-            || executeNumber<Int64>(src, *res_column, min, max, max_width)
-            || executeNumber<Float32>(src, *res_column, min, max, max_width)
-            || executeNumber<Float64>(src, *res_column, min, max, max_width))
+        ColumnString::Chars & dst_chars = res_column->getChars();
+        ColumnString::Offsets & dst_offsets = res_column->getOffsets();
+
+        dst_offsets.resize(input_rows_count);
+        dst_chars.reserve(input_rows_count * UnicodeBar::getWidthInBytes(max_width));
+
+        for (size_t i = 0; i < input_rows_count; ++i)
         {
-            block.getByPosition(result).column = std::move(res_column);
-        }
-        else
-            throw Exception(
-                "Illegal column " + block.getByPosition(arguments[0]).column->getName() + " of argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN);
-    }
+            Float64 width = UnicodeBar::getWidth(
+                src.getFloat64(i),
+                arguments[1].column->getFloat64(i),
+                arguments[2].column->getFloat64(i),
+                max_width);
 
-private:
-    template <typename T>
-    T extractConstant(Block & block, const ColumnNumbers & arguments, size_t argument_pos, const char * which_argument) const
-    {
-        const auto & column = *block.getByPosition(arguments[argument_pos]).column;
+            if (!isFinite(width))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Value of width must not be NaN and Inf");
 
-        if (!isColumnConst(column))
-            throw Exception(
-                which_argument + String(" argument for function ") + getName() + " must be constant.", ErrorCodes::ILLEGAL_COLUMN);
-
-        return applyVisitor(FieldVisitorConvertToNumber<T>(), column[0]);
-    }
-
-    template <typename T>
-    static void fill(const PaddedPODArray<T> & src,
-        ColumnString::Chars & dst_chars,
-        ColumnString::Offsets & dst_offsets,
-        Int64 min,
-        Int64 max,
-        Float64 max_width)
-    {
-        size_t size = src.size();
-        size_t current_offset = 0;
-
-        dst_offsets.resize(size);
-        dst_chars.reserve(size * (UnicodeBar::getWidthInBytes(max_width) + 1)); /// lines 0-terminated.
-
-        for (size_t i = 0; i < size; ++i)
-        {
-            Float64 width = UnicodeBar::getWidth(src[i], min, max, max_width);
-            size_t next_size = current_offset + UnicodeBar::getWidthInBytes(width) + 1;
+            size_t next_size = current_offset + UnicodeBar::getWidthInBytes(width);
             dst_chars.resize(next_size);
-            UnicodeBar::render(width, reinterpret_cast<char *>(&dst_chars[current_offset]));
+            UnicodeBar::render(width, reinterpret_cast<char *>(&dst_chars[current_offset]), reinterpret_cast<char *>(&dst_chars[next_size]));
             current_offset = next_size;
             dst_offsets[i] = current_offset;
         }
-    }
 
-    template <typename T>
-    static void fill(T src, String & dst_chars, Int64 min, Int64 max, Float64 max_width)
-    {
-        Float64 width = UnicodeBar::getWidth(src, min, max, max_width);
-        dst_chars.resize(UnicodeBar::getWidthInBytes(width));
-        UnicodeBar::render(width, dst_chars.data());
-    }
-
-    template <typename T>
-    static bool executeNumber(const IColumn & src, ColumnString & dst, Int64 min, Int64 max, Float64 max_width)
-    {
-        if (const ColumnVector<T> * col = checkAndGetColumn<ColumnVector<T>>(&src))
-        {
-            fill(col->getData(), dst.getChars(), dst.getOffsets(), min, max, max_width);
-            return true;
-        }
-        else
-            return false;
+        return res_column;
     }
 };
 
+}
 
-void registerFunctionBar(FunctionFactory & factory)
+REGISTER_FUNCTION(Bar)
 {
-    factory.registerFunction<FunctionBar>();
+    FunctionDocumentation::Description description = R"(
+Builds a bar chart.
+Draws a band with width proportional to (x - min) and equal to width characters when x = max.
+The band is drawn with accuracy to one eighth of a symbol.
+)";
+    FunctionDocumentation::Syntax syntax = "bar(x, min, max[, width])";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "Size to display.", {"(U)Int*", "Float*", "Decimal"}},
+        {"min", "The minimum value.", {"(U)Int*", "Float*", "Decimal"}},
+        {"max", "The maximum value.", {"(U)Int*", "Float*", "Decimal"}},
+        {"width", "Optional. The width of the bar in characters. The default is `80`.", {"const (U)Int*", "const Float*", "const Decimal"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns a unicode-art bar string.", {"String"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+SELECT
+toHour(EventTime) AS h,
+count() AS c,
+bar(c, 0, 600000, 20) AS bar
+FROM test.hits
+GROUP BY h
+ORDER BY h ASC
+        )",
+        R"(
+┌──h─┬──────c─┬─bar────────────────┐
+│  0 │ 292907 │ █████████▋         │
+│  1 │ 180563 │ ██████             │
+│  2 │ 114861 │ ███▋               │
+│  3 │  85069 │ ██▋                │
+│  4 │  68543 │ ██▎                │
+│  5 │  78116 │ ██▌                │
+│  6 │ 113474 │ ███▋               │
+│  7 │ 170678 │ █████▋             │
+│  8 │ 278380 │ █████████▎         │
+│  9 │ 391053 │ █████████████      │
+│ 10 │ 457681 │ ███████████████▎   │
+│ 11 │ 493667 │ ████████████████▍  │
+│ 12 │ 509641 │ ████████████████▊  │
+│ 13 │ 522947 │ █████████████████▍ │
+│ 14 │ 539954 │ █████████████████▊ │
+│ 15 │ 528460 │ █████████████████▌ │
+│ 16 │ 539201 │ █████████████████▊ │
+│ 17 │ 523539 │ █████████████████▍ │
+│ 18 │ 506467 │ ████████████████▊  │
+│ 19 │ 520915 │ █████████████████▎ │
+│ 20 │ 521665 │ █████████████████▍ │
+│ 21 │ 542078 │ ██████████████████ │
+│ 22 │ 493642 │ ████████████████▍  │
+│ 23 │ 400397 │ █████████████▎     │
+└────┴────────┴────────────────────┘
+        )"
+        }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionBar>(documentation);
 }
 
 }

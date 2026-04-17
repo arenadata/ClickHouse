@@ -5,7 +5,6 @@
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBuffer.h>
 #include <IO/WriteBufferFromString.h>
-#include <IO/ReadHelpers.h>
 #include <IO/Operators.h>
 
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
@@ -15,14 +14,12 @@ namespace DB
 
 struct ReplicatedMergeTreeQuorumAddedParts
 {
-    using PartitionIdToMaxBlock = std::unordered_map<String, Int64>;
     using PartitionIdToPartName = std::unordered_map<String, String>;
-
     PartitionIdToPartName added_parts;
 
     MergeTreeDataFormatVersion format_version;
 
-    ReplicatedMergeTreeQuorumAddedParts(const MergeTreeDataFormatVersion format_version_)
+    explicit ReplicatedMergeTreeQuorumAddedParts(const MergeTreeDataFormatVersion format_version_)
         : format_version(format_version_)
     {}
 
@@ -65,8 +62,8 @@ struct ReplicatedMergeTreeQuorumAddedParts
             added_parts = readV1(in);
     }
 
-    /// Read added bloks when node in ZooKeeper supports only one partition.
-    PartitionIdToPartName readV1(ReadBuffer & in)
+    /// Read added blocks when node in ZooKeeper supports only one partition.
+    PartitionIdToPartName readV1(ReadBuffer & in) const
     {
         PartitionIdToPartName parts_in_quorum;
 
@@ -75,7 +72,7 @@ struct ReplicatedMergeTreeQuorumAddedParts
         readText(part_name, in);
 
         auto part_info = MergeTreePartInfo::fromPartName(part_name, format_version);
-        parts_in_quorum[part_info.partition_id] = part_name;
+        parts_in_quorum[part_info.getPartitionId()] = part_name;
 
         return parts_in_quorum;
     }

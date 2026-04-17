@@ -1,31 +1,35 @@
 #pragma once
 
 #include <Interpreters/IInterpreter.h>
+#include <Interpreters/SelectQueryOptions.h>
+#include <Parsers/ASTExplainQuery.h>
 #include <Parsers/IAST_fwd.h>
-
 
 namespace DB
 {
 
-class Context;
-
 /// Returns single row with explain results
-class InterpreterExplainQuery : public IInterpreter
+class InterpreterExplainQuery : public IInterpreter, WithContext
 {
 public:
-    InterpreterExplainQuery(const ASTPtr & query_, const Context & context_)
-        : query(query_), context(context_)
-    {}
+    InterpreterExplainQuery(const ASTPtr & query_, ContextPtr context_, const SelectQueryOptions & options_)
+        : WithContext(context_)
+        , query(query_)
+        , options(options_)
+    {
+    }
 
     BlockIO execute() override;
 
-    static Block getSampleBlock();
+    static Block getSampleBlock(ASTExplainQuery::ExplainKind kind);
+
+    bool supportsTransactions() const override { return true; }
 
 private:
     ASTPtr query;
-    const Context & context;
+    SelectQueryOptions options;
 
-    BlockInputStreamPtr executeImpl();
+    QueryPipeline executeImpl();
 };
 
 

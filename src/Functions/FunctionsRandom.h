@@ -1,11 +1,10 @@
 #pragma once
 
+#include <Common/TargetSpecific.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnVector.h>
-#include <Functions/IFunctionImpl.h>
-#include <Functions/TargetSpecific.h>
+#include <Functions/IFunction.h>
 #include <Functions/PerformanceAdaptors.h>
-#include <IO/WriteHelpers.h>
 
 
 namespace DB
@@ -32,8 +31,8 @@ namespace ErrorCodes
   * randConstant - service function, produces a constant column with a random value.
   *
   * The time is used as the seed.
-  * Note: it is reinitialized for each block.
-  * This means that the timer must be of sufficient resolution to give different values to each block.
+  * Note: it is reinitialized for each columns.
+  * This means that the timer must be of sufficient resolution to give different values to each columns.
   */
 
 DECLARE_MULTITARGET_CODE(
@@ -60,6 +59,7 @@ public:
     bool isDeterministic() const override { return false; }
     bool isDeterministicInScopeOfQuery() const override { return false; }
     bool useDefaultImplementationForNulls() const override { return false; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
@@ -67,23 +67,22 @@ public:
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.size() > 1)
-            throw Exception("Number of arguments for function " + getName() + " doesn't match: passed "
-                + toString(arguments.size()) + ", should be 0 or 1.",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                "Number of arguments for function {} doesn't match: passed {}, should be 0 or 1.",
+                getName(), arguments.size());
 
         return std::make_shared<DataTypeNumber<ToType>>();
     }
 
-    void executeImpl(Block & block, const ColumnNumbers &, size_t result, size_t input_rows_count) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
     {
         auto col_to = ColumnVector<ToType>::create();
         typename ColumnVector<ToType>::Container & vec_to = col_to->getData();
 
-        size_t size = input_rows_count;
-        vec_to.resize(size);
+        vec_to.resize(input_rows_count);
         RandImpl::execute(reinterpret_cast<char *>(vec_to.data()), vec_to.size() * sizeof(ToType));
 
-        block.getByPosition(result).column = std::move(col_to);
+        return col_to;
     }
 };
 
@@ -91,23 +90,23 @@ template <typename ToType, typename Name>
 class FunctionRandom : public FunctionRandomImpl<TargetSpecific::Default::RandImpl, ToType, Name>
 {
 public:
-    explicit FunctionRandom(const Context & context) : selector(context)
+    explicit FunctionRandom(ContextPtr context) : selector(context)
     {
         selector.registerImplementation<TargetArch::Default,
             FunctionRandomImpl<TargetSpecific::Default::RandImpl, ToType, Name>>();
 
     #if USE_MULTITARGET_CODE
-        selector.registerImplementation<TargetArch::AVX2,
-            FunctionRandomImpl<TargetSpecific::AVX2::RandImpl, ToType, Name>>();
+        selector.registerImplementation<TargetArch::x86_64_v3,
+            FunctionRandomImpl<TargetSpecific::x86_64_v3::RandImpl, ToType, Name>>();
     #endif
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
-        selector.selectAndExecute(block, arguments, result, input_rows_count);
+        return selector.selectAndExecute(arguments, result_type, input_rows_count);
     }
 
-    static FunctionPtr create(const Context & context)
+    static FunctionPtr create(ContextPtr context)
     {
         return std::make_shared<FunctionRandom<ToType, Name>>(context);
     }

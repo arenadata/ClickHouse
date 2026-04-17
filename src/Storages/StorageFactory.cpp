@@ -1,14 +1,20 @@
 #include <Storages/StorageFactory.h>
 #include <Interpreters/Context.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Common/Exception.h>
-#include <Common/StringUtils/StringUtils.h>
+#include <Common/StringUtils.h>
+#include <Core/Settings.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/StorageID.h>
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool log_queries;
+}
 
 namespace ErrorCodes
 {
@@ -23,50 +29,71 @@ namespace ErrorCodes
 
 
 /// Some types are only for intermediate values of expressions and cannot be used in tables.
-static void checkAllTypesAreAllowedInTable(const NamesAndTypesList & names_and_types)
+void checkAllTypesAreAllowedInTable(const NamesAndTypesList & names_and_types)
 {
     for (const auto & elem : names_and_types)
         if (elem.type->cannotBeStoredInTables())
-            throw Exception("Data type " + elem.type->getName() + " cannot be used in tables", ErrorCodes::DATA_TYPE_CANNOT_BE_USED_IN_TABLES);
+            throw Exception(ErrorCodes::DATA_TYPE_CANNOT_BE_USED_IN_TABLES, "Data type {} of column '{}' cannot be used in tables", elem.type->getName(), elem.name);
+}
+
+
+ContextMutablePtr StorageFactory::Arguments::getContext() const
+{
+    auto ptr = context.lock();
+    if (!ptr)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Context has expired");
+    return ptr;
+}
+
+ContextMutablePtr StorageFactory::Arguments::getLocalContext() const
+{
+    auto ptr = local_context.lock();
+    if (!ptr)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Context has expired");
+    return ptr;
 }
 
 
 void StorageFactory::registerStorage(const std::string & name, CreatorFn creator_fn, StorageFeatures features)
 {
+    if (features.supports_settings && !features.has_builtin_setting_fn)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR, "StorageFactory: Storage '{}' supports settings but has_builtin_setting_fn is not provided", name);
     if (!storages.emplace(name, Creator{std::move(creator_fn), features}).second)
-        throw Exception("TableFunctionFactory: the table function name '" + name + "' is not unique",
-            ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "StorageFactory: the storage '{}' is not unique", name);
 }
 
 
 StoragePtr StorageFactory::get(
     const ASTCreateQuery & query,
     const String & relative_data_path,
-    Context & local_context,
-    Context & context,
+    ContextMutablePtr local_context,
+    ContextMutablePtr context,
     const ColumnsDescription & columns,
     const ConstraintsDescription & constraints,
-    bool has_force_restore_data_flag) const
+    LoadingStrictnessLevel mode,
+    bool is_restore_from_backup) const
 {
     String name;
+    String comment;
+
     ASTStorage * storage_def = query.storage;
 
     bool has_engine_args = false;
 
-    if (query.is_view)
+    if (query.is_ordinary_view)
     {
         if (query.storage)
-            throw Exception("Specifying ENGINE is not allowed for a View", ErrorCodes::INCORRECT_QUERY);
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Specifying ENGINE is not allowed for a View");
 
         name = "View";
     }
-    else if (query.is_live_view)
+    else if (query.is_dictionary)
     {
-
         if (query.storage)
-            throw Exception("Specifying ENGINE is not allowed for a LiveView", ErrorCodes::INCORRECT_QUERY);
+            throw Exception(ErrorCodes::INCORRECT_QUERY, "Specifying ENGINE is not allowed for a Dictionary");
 
-        name = "LiveView";
+        name = "Dictionary";
     }
     else
     {
@@ -78,16 +105,22 @@ StoragePtr StorageFactory::get(
         {
             name = "MaterializedView";
         }
+        else if (query.is_window_view)
+        {
+            name = "WindowView";
+        }
         else
         {
-            if (!storage_def)
-                throw Exception("Incorrect CREATE query: ENGINE required", ErrorCodes::ENGINE_REQUIRED);
+            if (!query.storage)
+                throw Exception(ErrorCodes::INCORRECT_QUERY, "Incorrect CREATE query: storage required");
+
+            if (!storage_def->engine)
+                throw Exception(ErrorCodes::ENGINE_REQUIRED, "Incorrect CREATE query: ENGINE required");
 
             const ASTFunction & engine_def = *storage_def->engine;
 
             if (engine_def.parameters)
-                throw Exception(
-                    "Engine definition cannot take the form of a parametric function", ErrorCodes::FUNCTION_CANNOT_HAVE_PARAMETERS);
+                throw Exception(ErrorCodes::FUNCTION_CANNOT_HAVE_PARAMETERS, "Engine definition cannot take the form of a parametric function");
 
             if (engine_def.arguments)
                 has_engine_args = true;
@@ -96,21 +129,25 @@ StoragePtr StorageFactory::get(
 
             if (name == "View")
             {
-                throw Exception(
-                    "Direct creation of tables with ENGINE View is not supported, use CREATE VIEW statement",
-                    ErrorCodes::INCORRECT_QUERY);
+                throw Exception(ErrorCodes::INCORRECT_QUERY, "Direct creation of tables with ENGINE View is not supported, use CREATE VIEW statement");
             }
-            else if (name == "MaterializedView")
+            if (name == "Loop")
+            {
+                throw Exception(ErrorCodes::INCORRECT_QUERY, "Direct creation of tables with ENGINE Loop is not supported, use Loop as a table function only");
+            }
+            if (name == "MaterializedView")
             {
                 throw Exception(
-                    "Direct creation of tables with ENGINE MaterializedView is not supported, use CREATE MATERIALIZED VIEW statement",
-                    ErrorCodes::INCORRECT_QUERY);
+                    ErrorCodes::INCORRECT_QUERY,
+                    "Direct creation of tables with ENGINE MaterializedView "
+                    "is not supported, use CREATE MATERIALIZED VIEW statement");
             }
-            else if (name == "LiveView")
+            if (name == "WindowView")
             {
                 throw Exception(
-                    "Direct creation of tables with ENGINE LiveView is not supported, use CREATE LIVE VIEW statement",
-                    ErrorCodes::INCORRECT_QUERY);
+                    ErrorCodes::INCORRECT_QUERY,
+                    "Direct creation of tables with ENGINE WindowView "
+                    "is not supported, use CREATE WINDOW VIEW statement");
             }
 
             auto it = storages.find(name);
@@ -118,17 +155,15 @@ StoragePtr StorageFactory::get(
             {
                 auto hints = getHints(name);
                 if (!hints.empty())
-                    throw Exception("Unknown table engine " + name + ". Maybe you meant: " + toString(hints), ErrorCodes::UNKNOWN_STORAGE);
-                else
-                    throw Exception("Unknown table engine " + name, ErrorCodes::UNKNOWN_STORAGE);
+                    throw Exception(ErrorCodes::UNKNOWN_STORAGE, "Unknown table engine {}. Maybe you meant: {}", name, toString(hints));
+                throw Exception(ErrorCodes::UNKNOWN_STORAGE, "Unknown table engine {}", name);
             }
 
             auto check_feature = [&](String feature_description, FeatureMatcherFn feature_matcher_fn)
             {
                 if (!feature_matcher_fn(it->second.features))
                 {
-                    String msg = "Engine " + name + " doesn't support " + feature_description + ". "
-                        "Currently only the following engines have support for the feature: [";
+                    String msg;
                     auto supporting_engines = getAllRegisteredNamesByFeatureMatcherFn(feature_matcher_fn);
                     for (size_t index = 0; index < supporting_engines.size(); ++index)
                     {
@@ -136,8 +171,9 @@ StoragePtr StorageFactory::get(
                             msg += ", ";
                         msg += supporting_engines[index];
                     }
-                    msg += "]";
-                    throw Exception(msg, ErrorCodes::BAD_ARGUMENTS);
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Engine {} doesn't support {}. "
+                                    "Currently only the following engines have support for the feature: [{}]",
+                                    name, feature_description, msg);
                 }
             };
 
@@ -160,27 +196,49 @@ StoragePtr StorageFactory::get(
                 check_feature(
                     "skipping indices",
                     [](StorageFeatures features) { return features.supports_skipping_indices; });
+
+            if (query.columns_list && query.columns_list->projections && !query.columns_list->projections->children.empty())
+                check_feature(
+                    "projections",
+                    [](StorageFeatures features) { return features.supports_projections; });
         }
     }
 
+    if (query.comment)
+        comment = query.comment->as<ASTLiteral &>().value.safeGet<String>();
+
     ASTs empty_engine_args;
-    Arguments arguments
-    {
+    Arguments arguments{
         .engine_name = name,
         .engine_args = has_engine_args ? storage_def->engine->arguments->children : empty_engine_args,
         .storage_def = storage_def,
         .query = query,
         .relative_data_path = relative_data_path,
-        .table_id = StorageID(query.database, query.table, query.uuid),
+        .table_id = StorageID(query.getDatabase(), query.getTable(), query.uuid),
         .local_context = local_context,
         .context = context,
         .columns = columns,
         .constraints = constraints,
-        .attach = query.attach,
-        .has_force_restore_data_flag = has_force_restore_data_flag
-    };
+        .mode = mode,
+        .comment = comment,
+        .is_restore_from_backup = is_restore_from_backup};
 
-    return storages.at(name).creator_fn(arguments);
+    assert(arguments.getContext() == arguments.getContext()->getGlobalContext());
+
+    auto res = storages.at(name).creator_fn(arguments);
+    if (!empty_engine_args.empty())
+    {
+        /// Storage creator modified empty arguments list, so we should modify the query
+        assert(storage_def && storage_def->engine && !storage_def->engine->arguments);
+        storage_def->engine->arguments = make_intrusive<ASTExpressionList>();  /// NOLINT(clang-analyzer-core.NullDereference)
+        storage_def->engine->children.push_back(storage_def->engine->arguments);
+        storage_def->engine->arguments->children = empty_engine_args;
+    }
+
+    if (local_context->hasQueryContext() && local_context->getSettingsRef()[Setting::log_queries])
+        local_context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Storage, name);
+
+    return res;
 }
 
 StorageFactory & StorageFactory::instance()
@@ -190,12 +248,23 @@ StorageFactory & StorageFactory::instance()
 }
 
 
-AccessType StorageFactory::getSourceAccessType(const String & table_engine) const
+std::optional<AccessTypeObjects::Source> StorageFactory::getSourceAccessObject(const String & table_engine) const
 {
-    auto it = storages.find(table_engine);
+    if (table_engine.empty())
+        return {};
+    const auto it = storages.find(table_engine);
     if (it == storages.end())
-        return AccessType::NONE;
+        throw Exception(ErrorCodes::UNKNOWN_STORAGE, "Unknown table engine {}", table_engine);
     return it->second.features.source_access_type;
+}
+
+
+const StorageFactory::StorageFeatures & StorageFactory::getStorageFeatures(const String & storage_name) const
+{
+    auto it = storages.find(storage_name);
+    if (it == storages.end())
+        throw Exception(ErrorCodes::UNKNOWN_STORAGE, "Unknown table engine {}", storage_name);
+    return it->second.features;
 }
 
 }

@@ -1,7 +1,7 @@
-<?xml version="1.0"?>
-<yandex>
+<clickhouse>
     <profiles>
         <default>
+            <async_insert>0</async_insert>
         </default>
     </profiles>
 
@@ -50,4 +50,4 @@
         <default>
         </default>
     </quotas>
-</yandex>
+</clickhouse>

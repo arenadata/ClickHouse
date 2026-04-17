@@ -3,13 +3,14 @@
 #include <city.h>
 #include <Core/Defines.h>
 #include <Common/SipHash.h>
-#include <Common/UInt128.h>
 #include <Common/assert_cast.h>
 #include <Columns/ColumnTuple.h>
+#include <DataTypes/IDataType.h>
 
 
 namespace DB
 {
+struct Settings;
 
 /** Hashes a set of arguments to the aggregate function
   *  to calculate the number of unique values
@@ -37,7 +38,7 @@ bool isAllArgumentsContiguousInMemory(const DataTypes & argument_types);
 template <>
 struct UniqVariadicHash<false, false>
 {
-    static inline UInt64 apply(size_t num_args, const IColumn ** columns, size_t row_num)
+    static UInt64 apply(size_t num_args, const IColumn ** columns, size_t row_num)
     {
         UInt64 hash;
 
@@ -45,15 +46,15 @@ struct UniqVariadicHash<false, false>
         const IColumn ** columns_end = column + num_args;
 
         {
-            StringRef value = (*column)->getDataAt(row_num);
-            hash = CityHash_v1_0_2::CityHash64(value.data, value.size);
+            auto value = (*column)->getDataAt(row_num);
+            hash = CityHash_v1_0_2::CityHash64(value.data(), value.size());
             ++column;
         }
 
         while (column < columns_end)
         {
-            StringRef value = (*column)->getDataAt(row_num);
-            hash = CityHash_v1_0_2::Hash128to64(CityHash_v1_0_2::uint128(CityHash_v1_0_2::CityHash64(value.data, value.size), hash));
+            auto value = (*column)->getDataAt(row_num);
+            hash = CityHash_v1_0_2::Hash128to64(CityHash_v1_0_2::uint128(CityHash_v1_0_2::CityHash64(value.data(), value.size()), hash));
             ++column;
         }
 
@@ -64,8 +65,11 @@ struct UniqVariadicHash<false, false>
 template <>
 struct UniqVariadicHash<false, true>
 {
-    static inline UInt64 apply(size_t num_args, const IColumn ** columns, size_t row_num)
+    static UInt64 apply(size_t num_args, const IColumn ** columns, size_t row_num)
     {
+        if (!num_args)
+            return 0;
+
         UInt64 hash;
 
         const auto & tuple_columns = assert_cast<const ColumnTuple *>(columns[0])->getColumns();
@@ -74,15 +78,15 @@ struct UniqVariadicHash<false, true>
         const auto * columns_end = column + num_args;
 
         {
-            StringRef value = column->get()->getDataAt(row_num);
-            hash = CityHash_v1_0_2::CityHash64(value.data, value.size);
+            auto value = column->get()->getDataAt(row_num);
+            hash = CityHash_v1_0_2::CityHash64(value.data(), value.size());
             ++column;
         }
 
         while (column < columns_end)
         {
-            StringRef value = column->get()->getDataAt(row_num);
-            hash = CityHash_v1_0_2::Hash128to64(CityHash_v1_0_2::uint128(CityHash_v1_0_2::CityHash64(value.data, value.size), hash));
+            auto value = column->get()->getDataAt(row_num);
+            hash = CityHash_v1_0_2::Hash128to64(CityHash_v1_0_2::uint128(CityHash_v1_0_2::CityHash64(value.data(), value.size()), hash));
             ++column;
         }
 
@@ -93,7 +97,7 @@ struct UniqVariadicHash<false, true>
 template <>
 struct UniqVariadicHash<true, false>
 {
-    static inline UInt128 apply(size_t num_args, const IColumn ** columns, size_t row_num)
+    static UInt128 apply(size_t num_args, const IColumn ** columns, size_t row_num)
     {
         const IColumn ** column = columns;
         const IColumn ** columns_end = column + num_args;
@@ -106,16 +110,14 @@ struct UniqVariadicHash<true, false>
             ++column;
         }
 
-        UInt128 key;
-        hash.get128(key.low, key.high);
-        return key;
+        return hash.get128();
     }
 };
 
 template <>
 struct UniqVariadicHash<true, true>
 {
-    static inline UInt128 apply(size_t num_args, const IColumn ** columns, size_t row_num)
+    static UInt128 apply(size_t num_args, const IColumn ** columns, size_t row_num)
     {
         const auto & tuple_columns = assert_cast<const ColumnTuple *>(columns[0])->getColumns();
 
@@ -130,9 +132,7 @@ struct UniqVariadicHash<true, true>
             ++column;
         }
 
-        UInt128 key;
-        hash.get128(key.low, key.high);
-        return key;
+        return hash.get128();
     }
 };
 

@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Core/Names.h>
-#include <Common/typeid_cast.h>
 
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTSelectQuery.h>
@@ -60,9 +59,9 @@ public:
 private:
     static void visit(const ASTSelectQuery & node, ASTPtr &, Data & data)
     {
-        ASTPtr array_join_expression_list = node.arrayJoinExpressionList();
+        auto [array_join_expression_list, _] = node.arrayJoinExpressionList();
         if (!array_join_expression_list)
-            throw Exception("Logical error: no ARRAY JOIN", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "No ARRAY JOIN");
 
         std::vector<ASTPtr *> out;
         out.reserve(array_join_expression_list->children.size());
@@ -73,10 +72,10 @@ private:
             const String nested_table_alias = ast->getAliasOrColumnName();
 
             if (nested_table_alias == nested_table_name && !ast->as<ASTIdentifier>())
-                throw Exception("No alias for non-trivial value in ARRAY JOIN: " + nested_table_name, ErrorCodes::ALIAS_REQUIRED);
+                throw Exception(ErrorCodes::ALIAS_REQUIRED, "No alias for non-trivial value in ARRAY JOIN: {}", nested_table_name);
 
-            if (data.array_join_alias_to_name.count(nested_table_alias) || data.aliases.count(nested_table_alias))
-                throw Exception("Duplicate alias in ARRAY JOIN: " + nested_table_alias, ErrorCodes::MULTIPLE_EXPRESSIONS_FOR_ALIAS);
+            if (data.array_join_alias_to_name.contains(nested_table_alias) || data.aliases.contains(nested_table_alias))
+                throw Exception(ErrorCodes::MULTIPLE_EXPRESSIONS_FOR_ALIAS, "Duplicate alias in ARRAY JOIN: {}", nested_table_alias);
 
             data.array_join_alias_to_name[nested_table_alias] = nested_table_name;
             data.array_join_name_to_alias[nested_table_name] = nested_table_alias;
@@ -98,33 +97,33 @@ private:
         if (!IdentifierSemantic::getColumnName(node))
             return;
 
-        auto splitted = Nested::splitName(node.name);  /// ParsedParams, Key1
+        auto split = Nested::splitName(node.name());  /// ParsedParams, Key1
 
-        if (array_join_alias_to_name.count(node.name))
+        if (array_join_alias_to_name.contains(node.name()))
         {
             /// ARRAY JOIN was written with an array column. Example: SELECT K1 FROM ... ARRAY JOIN ParsedParams.Key1 AS K1
-            array_join_result_to_source[node.name] = array_join_alias_to_name[node.name];    /// K1 -> ParsedParams.Key1
+            array_join_result_to_source[node.name()] = array_join_alias_to_name[node.name()];    /// K1 -> ParsedParams.Key1
         }
-        else if (array_join_alias_to_name.count(splitted.first) && !splitted.second.empty())
+        else if (array_join_alias_to_name.contains(split.first) && !split.second.empty())
         {
             /// ARRAY JOIN was written with a nested table. Example: SELECT PP.KEY1 FROM ... ARRAY JOIN ParsedParams AS PP
-            array_join_result_to_source[node.name]    /// PP.Key1 -> ParsedParams.Key1
-                = Nested::concatenateName(array_join_alias_to_name[splitted.first], splitted.second);
+            array_join_result_to_source[node.name()]    /// PP.Key1 -> ParsedParams.Key1
+                = Nested::concatenateName(array_join_alias_to_name[split.first], split.second);
         }
-        else if (array_join_name_to_alias.count(node.name))
+        else if (array_join_name_to_alias.contains(node.name()))
         {
             /** Example: SELECT ParsedParams.Key1 FROM ... ARRAY JOIN ParsedParams.Key1 AS PP.Key1.
             * That is, the query uses the original array, replicated by itself.
             */
             array_join_result_to_source[    /// PP.Key1 -> ParsedParams.Key1
-                array_join_name_to_alias[node.name]] = node.name;
+                array_join_name_to_alias[node.name()]] = node.name();
         }
-        else if (array_join_name_to_alias.count(splitted.first) && !splitted.second.empty())
+        else if (array_join_name_to_alias.contains(split.first) && !split.second.empty())
         {
             /** Example: SELECT ParsedParams.Key1 FROM ... ARRAY JOIN ParsedParams AS PP.
             */
             array_join_result_to_source[    /// PP.Key1 -> ParsedParams.Key1
-                Nested::concatenateName(array_join_name_to_alias[splitted.first], splitted.second)] = node.name;
+                Nested::concatenateName(array_join_name_to_alias[split.first], split.second)] = node.name();
         }
     }
 };

@@ -3,28 +3,32 @@
 #include <Common/HashTable/Hash.h>
 #include <Common/HashTable/HashTable.h>
 #include <Common/HashTable/HashTableAllocator.h>
+#include <Common/HashTable/TwoLevelHashTable.h>
 
 #include <IO/WriteBuffer.h>
-#include <IO/WriteHelpers.h>
-#include <IO/ReadBuffer.h>
-#include <IO/ReadHelpers.h>
 #include <IO/VarInt.h>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+}
 
 /** NOTE HashSet could only be used for memmoveable (position independent) types.
   * Example: std::string is not position independent in libstdc++ with C++11 ABI or in libc++.
-  * Also, key must be of type, that zero bytes is compared equals to zero key.
+  * Also, key must be of a type, such as that zero bytes is compared equals to zero key.
   */
 
 
-template
-<
+template <
     typename Key,
     typename TCell,
     typename Hash = DefaultHash<Key>,
-    typename Grower = HashTableGrower<>,
-    typename Allocator = HashTableAllocator
->
-class HashSetTable : public HashTable<Key, TCell, Hash, Grower, Allocator>
+    typename Grower = HashTableGrowerWithPrecalculation<>,
+    typename Allocator = HashTableAllocator>
+class HashSetTable final : public HashTable<Key, TCell, Hash, Grower, Allocator>
 {
 public:
     using Self = HashSetTable;
@@ -33,8 +37,24 @@ public:
     using Base = HashTable<Key, TCell, Hash, Grower, Allocator>;
     using typename Base::LookupResult;
 
+    using Base::Base;
+
     void merge(const Self & rhs)
     {
+        if (rhs.empty())
+            return;
+
+        if (Base::empty())
+        {
+            *this = rhs;
+            return;
+        }
+
+        /// We know 100% we will need to resize so let's do it preemtively and add enough to hold all elements even in the case
+        /// there are no duplicates (might use more memory than needed in case of many duplicates between the 2 tables).
+        if (rhs.grower.bufSize() > Base::grower.bufSize())
+            Base::resize(rhs.size() + Base::size());
+
         if (!this->hasZero() && rhs.hasZero())
         {
             this->setHasZero();
@@ -43,25 +63,64 @@ public:
 
         for (size_t i = 0; i < rhs.grower.bufSize(); ++i)
             if (!rhs.buf[i].isZero(*this))
-                this->insert(rhs.buf[i].getValue());
+                this->insert(rhs.buf[i]);
+    }
+};
+
+
+template <
+    typename Key,
+    typename TCell, /// Supposed to have no state (HashTableNoState)
+    typename Hash = DefaultHash<Key>,
+    typename Grower = TwoLevelHashTableGrower<>,
+    typename Allocator = HashTableAllocator>
+class TwoLevelHashSetTable final
+    : public TwoLevelHashTable<Key, TCell, Hash, Grower, Allocator, HashSetTable<Key, TCell, Hash, Grower, Allocator>>
+{
+public:
+    using Self = TwoLevelHashSetTable;
+    using Base = TwoLevelHashTable<Key, TCell, Hash, Grower, Allocator, HashSetTable<Key, TCell, Hash, Grower, Allocator>>;
+
+    using Base::Base;
+
+    template <typename... Args>
+    void merge(const HashSetTable<Key, Args...> & rhs)
+    {
+        for (auto it = rhs.begin(), end = rhs.end(); it != end; ++it)
+            this->insert(*it);
     }
 
-
-    void readAndMerge(DB::ReadBuffer & rb)
+    void merge(const Self & rhs)
     {
-        Cell::State::read(rb);
+        if (rhs.empty())
+            return;
 
-        size_t new_size = 0;
-        DB::readVarUInt(new_size, rb);
+        for (size_t i = 0; i < Base::NUM_BUCKETS; ++i)
+            this->impls[i].merge(rhs.impls[i]);
+    }
 
-        this->resize(new_size);
+    /// Writes its content in a way that it will be correctly read by HashSetTable.
+    /// Used by uniqExact to preserve backward compatibility.
+    void writeAsSingleLevel(DB::WriteBuffer & wb) const
+    {
+        DB::writeVarUInt(this->size(), wb);
 
-        for (size_t i = 0; i < new_size; ++i)
+        bool zero_written = false;
+        for (size_t i = 0; i < Base::NUM_BUCKETS; ++i)
         {
-            Cell x;
-            x.read(rb);
-            this->insert(x.getValue());
+            if (this->impls[i].hasZero())
+            {
+                if (zero_written)
+                    throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "No more than one zero value expected");
+                this->impls[i].zeroValue()->write(wb);
+                zero_written = true;
+            }
         }
+
+        static constexpr HashTableNoState state;
+        for (auto ptr = this->begin(); ptr != this->end(); ++ptr)
+            if (!ptr.getPtr()->isZero(state))
+                ptr.getPtr()->write(wb);
     }
 };
 
@@ -76,22 +135,27 @@ struct HashSetCellWithSavedHash : public HashTableCell<Key, Hash, TState>
     HashSetCellWithSavedHash() : Base() {}
     HashSetCellWithSavedHash(const Key & key_, const typename Base::State & state) : Base(key_, state) {}
 
-    bool keyEquals(const Key & key_) const { return this->key == key_; }
-    bool keyEquals(const Key & key_, size_t hash_) const { return saved_hash == hash_ && this->key == key_; }
+    bool keyEquals(const Key & key_) const { return bitEquals(this->key, key_); }
+    bool keyEquals(const Key & key_, size_t hash_) const { return saved_hash == hash_ && bitEquals(this->key, key_); }
     bool keyEquals(const Key & key_, size_t hash_, const typename Base::State &) const { return keyEquals(key_, hash_); }
 
     void setHash(size_t hash_value) { saved_hash = hash_value; }
     size_t getHash(const Hash & /*hash_function*/) const { return saved_hash; }
 };
 
-template
-<
+template <
     typename Key,
     typename Hash = DefaultHash<Key>,
-    typename Grower = HashTableGrower<>,
-    typename Allocator = HashTableAllocator
->
+    typename Grower = HashTableGrowerWithPrecalculation<>,
+    typename Allocator = HashTableAllocator>
 using HashSet = HashSetTable<Key, HashTableCell<Key, Hash>, Hash, Grower, Allocator>;
+
+template <
+    typename Key,
+    typename Hash = DefaultHash<Key>,
+    typename Grower = TwoLevelHashTableGrower<>,
+    typename Allocator = HashTableAllocator>
+using TwoLevelHashSet = TwoLevelHashSetTable<Key, HashTableCell<Key, Hash>, Hash, Grower, Allocator>;
 
 template <typename Key, typename Hash, size_t initial_size_degree>
 using HashSetWithStackMemory = HashSet<
@@ -102,14 +166,19 @@ using HashSetWithStackMemory = HashSet<
         (1ULL << initial_size_degree)
         * sizeof(HashTableCell<Key, Hash>)>>;
 
-template
-<
+template <
     typename Key,
     typename Hash = DefaultHash<Key>,
-    typename Grower = HashTableGrower<>,
-    typename Allocator = HashTableAllocator
->
+    typename Grower = HashTableGrowerWithPrecalculation<>,
+    typename Allocator = HashTableAllocator>
 using HashSetWithSavedHash = HashSetTable<Key, HashSetCellWithSavedHash<Key, Hash>, Hash, Grower, Allocator>;
+
+template <
+    typename Key,
+    typename Hash = DefaultHash<Key>,
+    typename Grower = TwoLevelHashTableGrower<>,
+    typename Allocator = HashTableAllocator>
+using TwoLevelHashSetWithSavedHash = TwoLevelHashSetTable<Key, HashSetCellWithSavedHash<Key, Hash>, Hash, Grower, Allocator>;
 
 template <typename Key, typename Hash, size_t initial_size_degree>
 using HashSetWithSavedHashWithStackMemory = HashSetWithSavedHash<

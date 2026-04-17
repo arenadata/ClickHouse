@@ -1,11 +1,36 @@
-#include <Storages/MergeTree/MergeTreeDataPartWriterWide.h>
+#include <Columns/ColumnSparse.h>
+#include <Compression/CompressedReadBufferFromFile.h>
+#include <Compression/CompressionFactory.h>
+#include <DataTypes/Serializations/ISerialization.h>
 #include <Interpreters/Context.h>
+#include <Storages/ColumnsDescription.h>
+#include <Storages/MarkCache.h>
+#include <Storages/MergeTree/MergeTreeDataPartWriterWide.h>
+#include <Storages/MergeTree/MergeTreeMarksLoader.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/StorageInMemoryMetadata.h>
+#include <Common/Logger.h>
+#include <Common/SipHash.h>
+#include <Common/escapeForFileName.h>
+#include <Common/logger_useful.h>
+#include <Common/quoteString.h>
+#include <Common/FailPoint.h>
+#include <IO/NullWriteBuffer.h>
 
 namespace DB
 {
+
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int INCORRECT_FILE_NAME;
+    extern const int FAULT_INJECTED;
+}
+
+namespace FailPoints
+{
+    extern const char wide_part_writer_fail_in_add_streams[];
 }
 
 namespace
@@ -13,312 +38,927 @@ namespace
     constexpr auto DATA_FILE_EXTENSION = ".bin";
 }
 
+namespace
+{
+
+/// Get granules for block using index_granularity
+Granules getGranulesToWrite(const MergeTreeIndexGranularity & index_granularity, size_t block_rows, size_t current_mark, size_t rows_written_in_last_mark)
+{
+    if (current_mark >= index_granularity.getMarksCount())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Request to get granules from mark {} but index granularity size is {}",
+                        current_mark, index_granularity.getMarksCount());
+
+    Granules result;
+    size_t current_row = 0;
+
+    /// When our last mark is not finished yet and we have to write rows into it
+    if (rows_written_in_last_mark > 0)
+    {
+        size_t rows_left_in_last_mark = index_granularity.getMarkRows(current_mark) - rows_written_in_last_mark;
+        size_t rows_left_in_block = block_rows - current_row;
+        result.emplace_back(Granule{
+            .start_row = current_row,
+            .rows_to_write = std::min(rows_left_in_block, rows_left_in_last_mark),
+            .mark_number = current_mark,
+            .mark_on_start = false, /// Don't mark this granule because we have already marked it
+            .is_complete = (rows_left_in_block >= rows_left_in_last_mark),
+        });
+        current_row += result.back().rows_to_write;
+        ++current_mark;
+    }
+
+    /// Calculating normal granules for block
+    while (current_row < block_rows)
+    {
+        size_t expected_rows_in_mark = index_granularity.getMarkRows(current_mark);
+        size_t rows_left_in_block  = block_rows - current_row;
+        /// If we have less rows in block than expected in granularity
+        /// save incomplete granule
+        result.emplace_back(Granule{
+            .start_row = current_row,
+            .rows_to_write = std::min(rows_left_in_block, expected_rows_in_mark),
+            .mark_number = current_mark,
+            .mark_on_start = true,
+            .is_complete = (rows_left_in_block >= expected_rows_in_mark),
+        });
+        current_row += result.back().rows_to_write;
+        ++current_mark;
+    }
+
+    return result;
+}
+
+}
+
 MergeTreeDataPartWriterWide::MergeTreeDataPartWriterWide(
-    const MergeTreeData::DataPartPtr & data_part_,
+    const String & data_part_name_,
+    const String & logger_name_,
+    const SerializationByName & serializations_,
+    MutableDataPartStoragePtr data_part_storage_,
+    const MergeTreeIndexGranularityInfo & index_granularity_info_,
+    const MergeTreeSettingsPtr & storage_settings_,
     const NamesAndTypesList & columns_list_,
     const StorageMetadataPtr & metadata_snapshot_,
     const std::vector<MergeTreeIndexPtr> & indices_to_recalc_,
     const String & marks_file_extension_,
     const CompressionCodecPtr & default_codec_,
     const MergeTreeWriterSettings & settings_,
-    const MergeTreeIndexGranularity & index_granularity_)
-    : MergeTreeDataPartWriterOnDisk(data_part_, columns_list_, metadata_snapshot_,
-           indices_to_recalc_, marks_file_extension_,
-           default_codec_, settings_, index_granularity_)
+    MergeTreeIndexGranularityPtr index_granularity_,
+    WrittenOffsetSubstreams * written_offset_substreams_)
+    : MergeTreeDataPartWriterOnDisk(
+            data_part_name_, logger_name_, serializations_,
+            data_part_storage_, index_granularity_info_, storage_settings_,
+            columns_list_, metadata_snapshot_,
+            indices_to_recalc_, marks_file_extension_,
+            default_codec_, settings_, std::move(index_granularity_),
+            written_offset_substreams_)
 {
-    const auto & columns = metadata_snapshot->getColumns();
-    for (const auto & it : columns_list)
-        addStreams(it.name, *it.type, columns.getCodecOrDefault(it.name, default_codec), settings.estimated_size);
+    if (settings.save_marks_in_cache)
+    {
+        auto columns_vec = getColumnsToPrewarmMarks(*storage_settings, columns_list);
+        columns_to_load_marks = NameSet(columns_vec.begin(), columns_vec.end());
+    }
+}
+
+ISerialization::EnumerateStreamsSettings MergeTreeDataPartWriterWide::getEnumerateSettings(const MergeTreeWriterSettings & settings_)
+{
+    ISerialization::EnumerateStreamsSettings enumerate_settings;
+    enumerate_settings.object_serialization_version = settings_.object_serialization_version;
+    enumerate_settings.object_shared_data_serialization_version = settings_.object_shared_data_serialization_version;
+    enumerate_settings.object_shared_data_buckets = settings_.object_shared_data_buckets;
+    enumerate_settings.max_buckets_in_map = settings_.max_buckets_in_map;
+    enumerate_settings.map_buckets_strategy = settings_.map_buckets_strategy;
+    enumerate_settings.map_buckets_coefficient = settings_.map_buckets_coefficient;
+    enumerate_settings.map_buckets_min_avg_size = settings_.map_buckets_min_avg_size;
+    enumerate_settings.data_part_type = MergeTreeDataPartType::Wide;
+    return enumerate_settings;
 }
 
 void MergeTreeDataPartWriterWide::addStreams(
-    const String & name,
-    const IDataType & type,
-    const CompressionCodecPtr & effective_codec,
-    size_t estimated_size)
+    const NameAndTypePair & name_and_type,
+    const ASTPtr & effective_codec_desc)
 {
-    IDataType::StreamCallback callback = [&] (const IDataType::SubstreamPath & substream_path)
+    ISerialization::StreamCallback callback = [&](const auto & substream_path)
     {
-        String stream_name = IDataType::getFileNameForStream(name, substream_path);
-        /// Shared offsets for Nested type.
-        if (column_streams.count(stream_name))
+        assert(!substream_path.empty());
+
+        /// Don't create streams for ephemeral subcolumns that don't store any real data.
+        if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
             return;
 
-        column_streams[stream_name] = std::make_unique<Stream>(
+        auto full_stream_name = ISerialization::getFileNameForStream(name_and_type, substream_path, ISerialization::StreamFileNameSettings(*storage_settings));
+
+        String stream_name = replaceFileNameToHashIfNeeded(full_stream_name, *storage_settings, data_part_storage.get());
+
+        /// Shared offsets for Nested type.
+        if (column_streams.contains(stream_name))
+            return;
+
+        /// Don't write offsets more than one time for Nested type in case elements of nested had been written separately, i.e. via Vertical merge.
+        if (written_offset_substreams)
+        {
+            bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
+            if (is_offsets && written_offset_substreams->contains(stream_name))
+                return;
+        }
+
+        auto it = stream_name_to_full_name.find(stream_name);
+        if (it != stream_name_to_full_name.end() && it->second != full_stream_name)
+            throw Exception(ErrorCodes::INCORRECT_FILE_NAME,
+                "Stream with name {} already created (full stream name: {}). Current full stream name: {}."
+                " It is a collision between a filename for one column and a hash of filename for another column or a bug",
+                stream_name, it->second, full_stream_name);
+
+        const auto & subtype = substream_path.back().data.type;
+        CompressionCodecPtr compression_codec;
+
+        /// If we can use special codec then just get it
+        if (ISerialization::isSpecialCompressionAllowed(substream_path))
+            compression_codec = CompressionCodecFactory::instance().get(effective_codec_desc, subtype.get(), default_codec);
+        else /// otherwise return only generic codecs and don't use info about the` data_type
+            compression_codec = CompressionCodecFactory::instance().get(effective_codec_desc, nullptr, default_codec, true);
+
+        ParserCodec codec_parser;
+        auto ast = parseQuery(codec_parser, "(" + Poco::toUpper(settings.marks_compression_codec) + ")", 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        CompressionCodecPtr marks_compression_codec = CompressionCodecFactory::instance().get(ast, nullptr);
+
+        const auto column_desc = metadata_snapshot->columns.tryGetColumnDescription(GetColumnsOptions(GetColumnsOptions::AllPhysical), name_and_type.getNameInStorage());
+
+        UInt64 max_compress_block_size = 0;
+        if (column_desc)
+            if (const auto * value = column_desc->settings.tryGet("max_compress_block_size"))
+                max_compress_block_size = value->safeGet<UInt64>();
+        if (!max_compress_block_size)
+            max_compress_block_size = settings.max_compress_block_size;
+
+        WriteSettings query_write_settings = settings.query_write_settings;
+        query_write_settings.use_adaptive_write_buffer =
+            (settings.min_columns_to_activate_adaptive_write_buffer && columns_list.size() >= settings.min_columns_to_activate_adaptive_write_buffer)
+            || (settings.use_adaptive_write_buffer_for_dynamic_subcolumns && ISerialization::isDynamicSubcolumn(substream_path, substream_path.size()));
+        query_write_settings.adaptive_write_buffer_initial_size = settings.adaptive_write_buffer_initial_size;
+
+        fiu_do_on(FailPoints::wide_part_writer_fail_in_add_streams,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED, "Injected failure in Wide part writer addStreams");
+        });
+
+        column_streams.emplace(stream_name, std::make_unique<MergeTreeWriterStream>(
             stream_name,
-            data_part->volume->getDisk(),
-            part_path + stream_name, DATA_FILE_EXTENSION,
-            part_path + stream_name, marks_file_extension,
-            effective_codec,
-            settings.max_compress_block_size,
-            estimated_size,
-            settings.aio_threshold);
+            data_part_storage,
+            stream_name,
+            DATA_FILE_EXTENSION,
+            stream_name,
+            marks_file_extension,
+            compression_codec,
+            max_compress_block_size,
+            marks_compression_codec,
+            settings.marks_compress_block_size,
+            query_write_settings));
+
+        if (columns_to_load_marks.contains(name_and_type.name))
+            cached_marks.emplace(stream_name, std::make_unique<MarksInCompressedFile::PlainArray>());
+
+        full_name_to_stream_name.emplace(full_stream_name, stream_name);
+        stream_name_to_full_name.emplace(stream_name, full_stream_name);
     };
 
-    IDataType::SubstreamPath stream_path;
-    type.enumerateStreams(callback, stream_path);
+    auto serialization = getSerialization(name_and_type.name);
+    auto data = ISerialization::SubstreamData(serialization).withType(name_and_type.type).withColumn(block_sample.getByName(name_and_type.name).column);
+    auto enumerate_settings = getEnumerateSettings(settings);
+    serialization->enumerateStreams(enumerate_settings, callback, data);
 }
 
-
-IDataType::OutputStreamGetter MergeTreeDataPartWriterWide::createStreamGetter(
-        const String & name, WrittenOffsetColumns & offset_columns)
+const String & MergeTreeDataPartWriterWide::getStreamName(
+    const NameAndTypePair & column,
+    const ISerialization::SubstreamPath & substream_path) const
 {
-    return [&, this] (const IDataType::SubstreamPath & substream_path) -> WriteBuffer *
+    auto full_stream_name = ISerialization::getFileNameForStream(column, substream_path, ISerialization::StreamFileNameSettings(*storage_settings));
+    String stream_name = replaceFileNameToHashIfNeeded(full_stream_name, *storage_settings, data_part_storage.get());
+
+    if (written_offset_substreams)
     {
-        bool is_offsets = !substream_path.empty() && substream_path.back().type == IDataType::Substream::ArraySizes;
-
-        String stream_name = IDataType::getFileNameForStream(name, substream_path);
-
-        /// Don't write offsets more than one time for Nested type.
-        if (is_offsets && offset_columns.count(stream_name))
-            return nullptr;
-
-        return &column_streams[stream_name]->compressed;
-    };
-}
-
-void MergeTreeDataPartWriterWide::write(const Block & block,
-    const IColumn::Permutation * permutation,
-    const Block & primary_key_block, const Block & skip_indexes_block)
-{
-    /// Fill index granularity for this block
-    /// if it's unknown (in case of insert data or horizontal merge,
-    /// but not in case of vertical merge)
-    if (compute_granularity)
-    {
-        size_t index_granularity_for_block = computeIndexGranularity(block);
-        fillIndexGranularity(index_granularity_for_block, block.rows());
+        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
+        /// If it has been written already return an empty string placeholder, to avoid writing it again.
+        if (is_offsets && written_offset_substreams->contains(stream_name))
+            return already_written_stream_holder;
     }
 
-    auto offset_columns = written_offset_columns ? *written_offset_columns : WrittenOffsetColumns{};
+    auto it = full_name_to_stream_name.find(full_stream_name);
+    if (it == full_name_to_stream_name.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Stream {} not found", full_stream_name);
+
+    return it->second;
+}
+
+ISerialization::OutputStreamGetter MergeTreeDataPartWriterWide::createStreamGetter(const NameAndTypePair & column,
+    const WrittenOffsetSubstreams & offset_substreams) const
+{
+    return [&, this] (const ISerialization::SubstreamPath & substream_path) -> WriteBuffer *
+    {
+        /// Skip ephemeral subcolumns that don't store any real data.
+        if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
+            return nullptr;
+
+        auto stream_name = getStreamName(column, substream_path);
+        if (stream_name.empty())
+            return nullptr;
+
+        /// Don't write offsets more than one time for Nested type.
+        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
+        if (is_offsets && offset_substreams.contains(stream_name))
+            return nullptr;
+
+        return &column_streams.at(stream_name)->compressed_hashing;
+    };
+}
+
+
+void MergeTreeDataPartWriterWide::shiftCurrentMark(const Granules & granules_written)
+{
+    auto last_granule = granules_written.back();
+    /// If we didn't finished last granule than we will continue to write it from new block
+    if (!last_granule.is_complete)
+    {
+        if (settings.can_use_adaptive_granularity && settings.blocks_are_granules_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Incomplete granules are not allowed while blocks are granules size. "
+                "Mark number {} (rows {}), rows written in last mark {}, rows to write in last mark from block {} (from row {}), "
+                "total marks currently {}", last_granule.mark_number, index_granularity->getMarkRows(last_granule.mark_number),
+                rows_written_in_last_mark, last_granule.rows_to_write, last_granule.start_row, index_granularity->getMarksCount());
+
+        /// Shift forward except last granule
+        setCurrentMark(getCurrentMark() + granules_written.size() - 1);
+        bool still_in_the_same_granule = granules_written.size() == 1;
+        /// We wrote whole block in the same granule, but didn't finished it.
+        /// So add written rows to rows written in last_mark
+        if (still_in_the_same_granule)
+            rows_written_in_last_mark += last_granule.rows_to_write;
+        else
+            rows_written_in_last_mark = last_granule.rows_to_write;
+    }
+    else
+    {
+        setCurrentMark(getCurrentMark() + granules_written.size());
+        rows_written_in_last_mark = 0;
+    }
+}
+
+void MergeTreeDataPartWriterWide::write(const Block & block, const IColumnPermutation * permutation)
+{
+    Block block_to_write = block;
+
+    /// For some columns the set of streams may depend on the actual column data.
+    /// For example: dynamic structure and statistics for JSON, Dynamic and Map (with adaptive number of buckets).
+    /// We must ensure that all blocks will be written in the same set of streams, so we have to make some
+    /// preparations to achieve it.
+    prepareBlockForWriting(block_to_write);
+
+    initStreamsIfNeeded();
+    initColumnsSubstreamsIfNeeded();
+
+    /// Fill index granularity for this block
+    /// if it's unknown (in case of insert data or horizontal merge,
+    /// but not in case of vertical part of vertical merge)
+    if (compute_granularity)
+    {
+        size_t index_granularity_for_block;
+        if (auto constant_granularity = index_granularity->getConstantGranularity())
+            index_granularity_for_block = *constant_granularity;
+        else
+            index_granularity_for_block = computeIndexGranularity(block_to_write);
+
+        if (rows_written_in_last_mark > 0)
+        {
+            size_t rows_left_in_last_mark = index_granularity->getMarkRows(getCurrentMark()) - rows_written_in_last_mark;
+            /// Previous granularity was much bigger than our new block's
+            /// granularity let's adjust it, because we want add new
+            /// heavy-weight blocks into small old granule.
+            if (rows_left_in_last_mark > index_granularity_for_block)
+            {
+                /// We have already written more rows than granularity of our block.
+                /// adjust last mark rows and flush to disk.
+                if (rows_written_in_last_mark >= index_granularity_for_block)
+                    adjustLastMarkIfNeedAndFlushToDisk(rows_written_in_last_mark);
+                else /// We still can write some rows from new block into previous granule. So the granule size will be block granularity size.
+                    adjustLastMarkIfNeedAndFlushToDisk(index_granularity_for_block);
+            }
+        }
+
+        fillIndexGranularity(index_granularity_for_block, block_to_write.rows());
+    }
+
+    auto granules_to_write = getGranulesToWrite(*index_granularity, block_to_write.rows(), getCurrentMark(), rows_written_in_last_mark);
+
+    WrittenOffsetSubstreams offset_substreams = written_offset_substreams ? *written_offset_substreams : WrittenOffsetSubstreams{};
+
+    Block primary_key_block;
+    if (settings.rewrite_primary_key)
+        primary_key_block = getIndexBlockAndPermute(block, metadata_snapshot->getPrimaryKeyColumns(), permutation);
+
+    Block skip_indexes_block = getIndexBlockAndPermute(block, getSkipIndicesColumns(), permutation);
 
     auto it = columns_list.begin();
     for (size_t i = 0; i < columns_list.size(); ++i, ++it)
     {
-        const ColumnWithTypeAndName & column = block.getByName(it->name);
+        auto & column = block_to_write.getByName(it->name);
+
+        if (!ISerialization::hasKind(getSerialization(it->name)->getKindStack(), ISerialization::Kind::SPARSE))
+            column.column = recursiveRemoveSparse(column.column);
 
         if (permutation)
         {
             if (primary_key_block.has(it->name))
             {
                 const auto & primary_column = *primary_key_block.getByName(it->name).column;
-                writeColumn(column.name, *column.type, primary_column, offset_columns);
+                writeColumn(*it, primary_column, offset_substreams, granules_to_write);
             }
             else if (skip_indexes_block.has(it->name))
             {
                 const auto & index_column = *skip_indexes_block.getByName(it->name).column;
-                writeColumn(column.name, *column.type, index_column, offset_columns);
+                writeColumn(*it, index_column, offset_substreams, granules_to_write);
             }
             else
             {
                 /// We rearrange the columns that are not included in the primary key here; Then the result is released - to save RAM.
                 ColumnPtr permuted_column = column.column->permute(*permutation, 0);
-                writeColumn(column.name, *column.type, *permuted_column, offset_columns);
+                writeColumn(*it, *permuted_column, offset_substreams, granules_to_write);
             }
         }
         else
         {
-            writeColumn(column.name, *column.type, *column.column, offset_columns);
+            writeColumn(*it, *column.column, offset_substreams, granules_to_write);
         }
     }
+
+    if (settings.rewrite_primary_key)
+        calculateAndSerializePrimaryIndex(primary_key_block, granules_to_write);
+
+    calculateAndSerializeSkipIndices(skip_indexes_block, granules_to_write);
+
+    shiftCurrentMark(granules_to_write);
 }
 
-void MergeTreeDataPartWriterWide::writeSingleMark(
-    const String & name,
-    const IDataType & type,
-    WrittenOffsetColumns & offset_columns,
-    size_t number_of_rows,
-    DB::IDataType::SubstreamPath & path)
+void MergeTreeDataPartWriterWide::writeSingleMark(const NameAndTypePair & name_and_type,
+    const WrittenOffsetSubstreams & offset_substreams,
+    size_t number_of_rows)
 {
-     type.enumerateStreams([&] (const IDataType::SubstreamPath & substream_path)
-     {
-         bool is_offsets = !substream_path.empty() && substream_path.back().type == IDataType::Substream::ArraySizes;
-
-         String stream_name = IDataType::getFileNameForStream(name, substream_path);
-
-         /// Don't write offsets more than one time for Nested type.
-         if (is_offsets && offset_columns.count(stream_name))
-             return;
-
-         Stream & stream = *column_streams[stream_name];
-
-         /// There could already be enough data to compress into the new block.
-         if (stream.compressed.offset() >= settings.min_compress_block_size)
-             stream.compressed.next();
-
-         writeIntBinary(stream.plain_hashing.count(), stream.marks);
-         writeIntBinary(stream.compressed.offset(), stream.marks);
-         if (settings.can_use_adaptive_granularity)
-             writeIntBinary(number_of_rows, stream.marks);
-     }, path);
+    StreamsWithMarks marks = getCurrentMarksForColumn(name_and_type, offset_substreams);
+    for (const auto & mark : marks)
+        flushMarkToFile(mark, number_of_rows);
 }
 
-size_t MergeTreeDataPartWriterWide::writeSingleGranule(
-    const String & name,
-    const IDataType & type,
-    const IColumn & column,
-    WrittenOffsetColumns & offset_columns,
-    IDataType::SerializeBinaryBulkStatePtr & serialization_state,
-    IDataType::SerializeBinaryBulkSettings & serialize_settings,
-    size_t from_row,
-    size_t number_of_rows,
-    bool write_marks)
+void MergeTreeDataPartWriterWide::flushMarkToFile(const StreamNameAndMark & stream_with_mark, size_t rows_in_mark)
 {
-    if (write_marks)
-        writeSingleMark(name, type, offset_columns, number_of_rows, serialize_settings.path);
+    auto & stream = *column_streams.at(stream_with_mark.stream_name);
+    WriteBuffer & marks_out = stream.compress_marks ? stream.marks_compressed_hashing : stream.marks_hashing;
 
-    type.serializeBinaryBulkWithMultipleStreams(column, from_row, number_of_rows, serialize_settings, serialization_state);
+    writeBinaryLittleEndian(stream_with_mark.mark.offset_in_compressed_file, marks_out);
+    writeBinaryLittleEndian(stream_with_mark.mark.offset_in_decompressed_block, marks_out);
 
-    /// So that instead of the marks pointing to the end of the compressed block, there were marks pointing to the beginning of the next one.
-    type.enumerateStreams([&] (const IDataType::SubstreamPath & substream_path)
+    if (settings.can_use_adaptive_granularity)
+        writeBinaryLittleEndian(rows_in_mark, marks_out);
+
+    if (auto it = cached_marks.find(stream_with_mark.stream_name); it != cached_marks.end())
+        it->second->push_back(stream_with_mark.mark);
+}
+
+StreamsWithMarks MergeTreeDataPartWriterWide::getCurrentMarksForColumn(const NameAndTypePair & name_and_type,
+    const WrittenOffsetSubstreams & offset_substreams)
+{
+    StreamsWithMarks result;
+    const auto column_desc = metadata_snapshot->columns.tryGetColumnDescription(GetColumnsOptions(GetColumnsOptions::AllPhysical), name_and_type.getNameInStorage());
+    UInt64 min_compress_block_size = 0;
+    if (column_desc)
+        if (const auto * value = column_desc->settings.tryGet("min_compress_block_size"))
+            min_compress_block_size = value->safeGet<UInt64>();
+    if (!min_compress_block_size)
+        min_compress_block_size = settings.min_compress_block_size;
+
+    auto callback = [&] (const ISerialization::SubstreamPath & substream_path)
     {
-        bool is_offsets = !substream_path.empty() && substream_path.back().type == IDataType::Substream::ArraySizes;
+        /// Skip ephemeral subcolumns that don't store any real data.
+        if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
+           return;
 
-        String stream_name = IDataType::getFileNameForStream(name, substream_path);
-
-        /// Don't write offsets more than one time for Nested type.
-        if (is_offsets && offset_columns.count(stream_name))
+        auto stream_name = getStreamName(name_and_type, substream_path);
+        if (stream_name.empty())
             return;
 
-        column_streams[stream_name]->compressed.nextIfAtEnd();
-    }, serialize_settings.path);
+        /// Don't write offsets more than one time for Nested type.
+        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
+        if (is_offsets && offset_substreams.contains(stream_name))
+            return;
 
-    return from_row + number_of_rows;
+        auto & stream = *column_streams.at(stream_name);
+
+        /// There could already be enough data to compress into the new block.
+        if (stream.compressed_hashing.offset() >= min_compress_block_size)
+            stream.compressed_hashing.next();
+
+        StreamNameAndMark stream_with_mark;
+        stream_with_mark.stream_name = stream_name;
+        stream_with_mark.mark.offset_in_compressed_file = stream.plain_hashing.count();
+        stream_with_mark.mark.offset_in_decompressed_block = stream.compressed_hashing.offset();
+
+        result.push_back(stream_with_mark);
+    };
+
+    auto serialization = getSerialization(name_and_type.name);
+    auto data = ISerialization::SubstreamData(serialization).withType(name_and_type.type).withColumn(block_sample.getByName(name_and_type.name).column);
+    auto enumerate_settings = getEnumerateSettings(settings);
+    serialization->enumerateStreams(enumerate_settings, callback, data);
+    return result;
+}
+
+void MergeTreeDataPartWriterWide::writeSingleGranule(
+    const NameAndTypePair & name_and_type,
+    const IColumn & column,
+    const WrittenOffsetSubstreams & offset_substreams,
+    ISerialization::SerializeBinaryBulkStatePtr & serialization_state,
+    ISerialization::SerializeBinaryBulkSettings & serialize_settings,
+    const Granule & granule)
+{
+    const auto & serialization = getSerialization(name_and_type.name);
+    serialization->serializeBinaryBulkWithMultipleStreams(column, granule.start_row, granule.rows_to_write, serialize_settings, serialization_state);
+
+    /// So that instead of the marks pointing to the end of the compressed block, there were marks pointing to the beginning of the next one.
+    auto callback = [&] (const ISerialization::SubstreamPath & substream_path)
+    {
+        /// Skip ephemeral subcolumns that don't store any real data.
+        if (ISerialization::isEphemeralSubcolumn(substream_path, substream_path.size()))
+            return;
+
+        auto stream_name = getStreamName(name_and_type, substream_path);
+        if (stream_name.empty())
+            return;
+
+        /// Don't write offsets more than one time for Nested type.
+        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
+        if (is_offsets && offset_substreams.contains(stream_name))
+            return;
+
+        column_streams.at(stream_name)->compressed_hashing.nextIfAtEnd();
+    };
+
+    auto data = ISerialization::SubstreamData(serialization).withType(name_and_type.type).withColumn(block_sample.getByName(name_and_type.name).column);
+    auto enumerate_settings = getEnumerateSettings(settings);
+    serialization->enumerateStreams(enumerate_settings, callback, data);
+}
+
+ISerialization::SerializeBinaryBulkSettings MergeTreeDataPartWriterWide::getSerializationSettings() const
+{
+    ISerialization::SerializeBinaryBulkSettings serialize_settings;
+    serialize_settings.data_part_type = MergeTreeDataPartType::Wide;
+    serialize_settings.use_compact_variant_discriminators_serialization = settings.use_compact_variant_discriminators_serialization;
+    serialize_settings.dynamic_serialization_version = settings.dynamic_serialization_version;
+    serialize_settings.object_serialization_version = settings.object_serialization_version;
+    serialize_settings.object_shared_data_serialization_version = settings.object_shared_data_serialization_version;
+    serialize_settings.object_shared_data_buckets = settings.object_shared_data_buckets;
+    serialize_settings.max_buckets_in_map = settings.max_buckets_in_map;
+    serialize_settings.map_buckets_strategy = settings.map_buckets_strategy;
+    serialize_settings.map_buckets_coefficient = settings.map_buckets_coefficient;
+    serialize_settings.map_buckets_min_avg_size = settings.map_buckets_min_avg_size;
+    serialize_settings.low_cardinality_max_dictionary_size = settings.low_cardinality_max_dictionary_size;
+    serialize_settings.low_cardinality_use_single_dictionary_for_part = settings.low_cardinality_use_single_dictionary_for_part;
+    serialize_settings.write_statistics = ISerialization::SerializeBinaryBulkSettings::StatisticsMode::SUFFIX;
+    return serialize_settings;
 }
 
 /// Column must not be empty. (column.size() !== 0)
 void MergeTreeDataPartWriterWide::writeColumn(
-    const String & name,
-    const IDataType & type,
+    const NameAndTypePair & name_and_type,
     const IColumn & column,
-    WrittenOffsetColumns & offset_columns)
+    WrittenOffsetSubstreams & offset_substreams,
+    const Granules & granules)
 {
+    if (granules.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Empty granules for column {}, current mark {}",
+                        backQuoteIfNeed(name_and_type.name), getCurrentMark());
+
+    const auto & [name, type] = name_and_type;
     auto [it, inserted] = serialization_states.emplace(name, nullptr);
+    auto serialization = getSerialization(name_and_type.name);
+
     if (inserted)
     {
-        IDataType::SerializeBinaryBulkSettings serialize_settings;
-        serialize_settings.getter = createStreamGetter(name, offset_columns);
-        type.serializeBinaryBulkStatePrefix(serialize_settings, it->second);
+        auto serialize_settings = getSerializationSettings();
+        serialize_settings.getter = createStreamGetter(name_and_type, offset_substreams);
+        /// Use the sample column (from block_sample) for the state prefix because
+        /// serializeBinaryBulkStatePrefix only reads column structure and statistics
+        /// (not actual row data) to determine things like the number of Map buckets.
+        /// block_sample always has statistics consistent with what was used in
+        /// enumerateStreams (via addStreams), so using it here guarantees that the
+        /// bucket count written to the prefix matches the streams that were created.
+        serialization->serializeBinaryBulkStatePrefix(*block_sample.getByName(name).column, serialize_settings, it->second);
     }
 
-    const auto & global_settings = storage.global_context.getSettingsRef();
-    IDataType::SerializeBinaryBulkSettings serialize_settings;
-    serialize_settings.getter = createStreamGetter(name, offset_columns);
-    serialize_settings.low_cardinality_max_dictionary_size = global_settings.low_cardinality_max_dictionary_size;
-    serialize_settings.low_cardinality_use_single_dictionary_for_part = global_settings.low_cardinality_use_single_dictionary_for_part != 0;
-
-    size_t total_rows = column.size();
-    size_t current_row = 0;
-    size_t current_column_mark = getCurrentMark();
-    size_t current_index_offset = getIndexOffset();
-    while (current_row < total_rows)
+    auto serialize_settings = getSerializationSettings();
+    serialize_settings.getter = createStreamGetter(name_and_type, offset_substreams);
+    serialize_settings.stream_mark_getter = [&](const ISerialization::SubstreamPath & substream_path) -> MarkInCompressedFile
     {
-        size_t rows_to_write;
-        bool write_marks = true;
+        auto stream_name = getStreamName(name_and_type, substream_path);
+        auto & stream = column_streams.at(stream_name);
+        return {stream->plain_hashing.count(), stream->compressed_hashing.offset()};
+    };
 
-        /// If there is `index_offset`, then the first mark goes not immediately, but after this number of rows.
-        if (current_row == 0 && current_index_offset != 0)
+    for (const auto & granule : granules)
+    {
+        data_written = true;
+
+        if (granule.mark_on_start)
         {
-            write_marks = false;
-            rows_to_write = current_index_offset;
-        }
-        else
-        {
-            if (index_granularity.getMarksCount() <= current_column_mark)
-                throw Exception(
-                    "Incorrect size of index granularity expect mark " + toString(current_column_mark) + " totally have marks " + toString(index_granularity.getMarksCount()),
-                    ErrorCodes::LOGICAL_ERROR);
-
-            rows_to_write = index_granularity.getMarkRows(current_column_mark);
+            if (last_non_written_marks.contains(name))
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                                "We have to add new mark for column, but already have non written mark. "
+                                "Current mark {}, total marks {}, offset {}",
+                                getCurrentMark(), index_granularity->getMarksCount(), rows_written_in_last_mark);
+            last_non_written_marks[name] = getCurrentMarksForColumn(name_and_type, offset_substreams);
         }
 
-        if (rows_to_write != 0)
-            data_written = true;
-
-        current_row = writeSingleGranule(
-            name,
-            type,
+        writeSingleGranule(
+            name_and_type,
             column,
-            offset_columns,
+            offset_substreams,
             it->second,
             serialize_settings,
-            current_row,
-            rows_to_write,
-            write_marks
+            granule
         );
 
-        if (write_marks)
-            current_column_mark++;
+        if (granule.is_complete)
+        {
+            auto marks_it = last_non_written_marks.find(name);
+            if (marks_it == last_non_written_marks.end())
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "No mark was saved for incomplete granule for column {}", backQuoteIfNeed(name));
+
+            for (const auto & mark : marks_it->second)
+                flushMarkToFile(mark, index_granularity->getMarkRows(granule.mark_number));
+            last_non_written_marks.erase(marks_it);
+        }
     }
 
-    type.enumerateStreams([&] (const IDataType::SubstreamPath & substream_path)
+    auto callback = [&](const ISerialization::SubstreamPath & substream_path)
     {
-        bool is_offsets = !substream_path.empty() && substream_path.back().type == IDataType::Substream::ArraySizes;
+        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
         if (is_offsets)
-        {
-            String stream_name = IDataType::getFileNameForStream(name, substream_path);
-            offset_columns.insert(stream_name);
-        }
-    }, serialize_settings.path);
-
-    next_mark = current_column_mark;
-    next_index_offset = current_row - total_rows;
+            offset_substreams.insert(getStreamName(name_and_type, substream_path));
+    };
+    auto data = ISerialization::SubstreamData(serialization).withType(name_and_type.type).withColumn(block_sample.getByName(name_and_type.name).column);
+    auto enumerate_settings = getEnumerateSettings(settings);
+    serialization->enumerateStreams(enumerate_settings, callback, data);
 }
 
-void MergeTreeDataPartWriterWide::finishDataSerialization(IMergeTreeDataPart::Checksums & checksums)
+
+void MergeTreeDataPartWriterWide::validateColumnOfFixedSize(const NameAndTypePair & name_type)
 {
-    const auto & global_settings = storage.global_context.getSettingsRef();
-    IDataType::SerializeBinaryBulkSettings serialize_settings;
-    serialize_settings.low_cardinality_max_dictionary_size = global_settings.low_cardinality_max_dictionary_size;
-    serialize_settings.low_cardinality_use_single_dictionary_for_part = global_settings.low_cardinality_use_single_dictionary_for_part != 0;
-    WrittenOffsetColumns offset_columns;
+    const auto & [name, type] = name_type;
+    const auto & serialization = getSerialization(name_type.name);
 
+    if (!type->isValueRepresentedByNumber() || type->haveSubtypes() || serialization->getKindStack() != ISerialization::KindStack{ISerialization::Kind::DEFAULT})
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot validate column of non fixed type {}", type->getName());
+
+    String stream_name = replaceFileNameToHashIfNeeded(escapeForFileName(name), *storage_settings, data_part_storage.get());
+    String mrk_path = stream_name + marks_file_extension;
+    String bin_path = stream_name + DATA_FILE_EXTENSION;
+
+    /// Some columns may be removed because of ttl. Skip them.
+    if (!getDataPartStorage().existsFile(mrk_path))
+        return;
+
+    auto mrk_file_in = getDataPartStorage().readFile(mrk_path, {}, std::nullopt);
+    std::unique_ptr<ReadBuffer> mrk_in;
+    if (index_granularity_info.mark_type.compressed)
+        mrk_in = std::make_unique<CompressedReadBufferFromFile>(std::move(mrk_file_in));
+    else
+        mrk_in = std::move(mrk_file_in);
+
+    DB::CompressedReadBufferFromFile bin_in(getDataPartStorage().readFile(bin_path, {}, std::nullopt));
+    bool must_be_last = false;
+    UInt64 offset_in_compressed_file = 0;
+    UInt64 offset_in_decompressed_block = 0;
+    UInt64 index_granularity_rows = index_granularity_info.fixed_index_granularity;
+
+    size_t mark_num;
+
+    for (mark_num = 0; !mrk_in->eof(); ++mark_num)
+    {
+        if (mark_num > index_granularity->getMarksCount())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "Incorrect number of marks in memory {}, on disk (at least) {}",
+                            index_granularity->getMarksCount(), mark_num + 1);
+
+        readBinaryLittleEndian(offset_in_compressed_file, *mrk_in);
+        readBinaryLittleEndian(offset_in_decompressed_block, *mrk_in);
+        if (settings.can_use_adaptive_granularity)
+            readBinaryLittleEndian(index_granularity_rows, *mrk_in);
+        else
+            index_granularity_rows = index_granularity_info.fixed_index_granularity;
+
+        if (must_be_last)
+        {
+            if (index_granularity_rows != 0)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                                "We ran out of binary data but still have non empty mark #{} with rows number {}",
+                                mark_num, index_granularity_rows);
+
+            if (!mrk_in->eof())
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Mark #{} must be last, but we still have some to read", mark_num);
+
+            break;
+        }
+
+        if (index_granularity_rows == 0)
+        {
+            auto column = type->createColumn();
+
+            serialization->deserializeBinaryBulk(*column, bin_in, 0, 1000000000, 0.0);
+
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "Still have {} rows in bin stream, last mark #{}"
+                            " index granularity size {}, last rows {}",
+                            column->size(), mark_num, index_granularity->getMarksCount(), index_granularity_rows);
+        }
+
+        if (index_granularity_rows != index_granularity->getMarkRows(mark_num))
+        {
+            throw Exception(
+                            ErrorCodes::LOGICAL_ERROR,
+                            "Incorrect mark rows for part {} for mark #{}"
+                            " (compressed offset {}, decompressed offset {}), in-memory {}, on disk {}, total marks {}",
+                            getDataPartStorage().getFullPath(),
+                            mark_num, offset_in_compressed_file, offset_in_decompressed_block,
+                            index_granularity->getMarkRows(mark_num), index_granularity_rows,
+                            index_granularity->getMarksCount());
+        }
+
+        auto column = type->createColumn();
+
+        serialization->deserializeBinaryBulk(*column, bin_in, 0, index_granularity_rows, 0.0);
+
+        if (bin_in.eof())
+        {
+            must_be_last = true;
+        }
+
+        /// Now they must be equal
+        if (column->size() != index_granularity_rows)
+        {
+
+            if (must_be_last)
+            {
+                /// The only possible mark after bin.eof() is final mark. When we
+                /// cannot use adaptive granularity we cannot have last mark.
+                /// So finish validation.
+                if (!settings.can_use_adaptive_granularity)
+                    break;
+
+                /// If we don't compute granularity then we are not responsible
+                /// for last mark (for example we mutating some column from part
+                /// with fixed granularity where last mark is not adjusted)
+                if (!compute_granularity)
+                    continue;
+            }
+
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR, "Incorrect mark rows for mark #{} (compressed offset {}, decompressed offset {}), "
+                "actually in bin file {}, in mrk file {}, total marks {}",
+                mark_num, offset_in_compressed_file, offset_in_decompressed_block, column->size(),
+                index_granularity->getMarkRows(mark_num), index_granularity->getMarksCount());
+        }
+    }
+
+    if (!mrk_in->eof())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Still have something in marks stream, last mark #{}"
+                        " index granularity size {}, last rows {}",
+                        mark_num, index_granularity->getMarksCount(), index_granularity_rows);
+    if (!bin_in.eof())
+    {
+        auto column = type->createColumn();
+
+        serialization->deserializeBinaryBulk(*column, bin_in, 0, 1000000000, 0.0);
+
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "Still have {} rows in bin stream, last mark #{}"
+                            " index granularity size {}, last rows {}",
+                            column->size(), mark_num, index_granularity->getMarksCount(), index_granularity_rows);
+    }
+}
+
+void MergeTreeDataPartWriterWide::finalizeIndexGranularity()
+{
+    /// If no data was written, streams and columns substreams will be uninitialized, but we need them.
+    initStreamsIfNeeded();
+    initColumnsSubstreamsIfNeeded();
+
+    auto serialize_settings = getSerializationSettings();
+    if (rows_written_in_last_mark > 0)
+    {
+        if (settings.can_use_adaptive_granularity && settings.blocks_are_granules_size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "Incomplete granule is not allowed while blocks are granules size even for last granule. "
+                            "Mark number {} (rows {}), rows written for last mark {}, total marks {}",
+                            getCurrentMark(), index_granularity->getMarkRows(getCurrentMark()),
+                            rows_written_in_last_mark, index_granularity->getMarksCount());
+
+        adjustLastMarkIfNeedAndFlushToDisk(rows_written_in_last_mark);
+    }
+
+    WrittenOffsetSubstreams dummy_offset_substreams;
+    WrittenOffsetSubstreams & offset_substreams = written_offset_substreams ? *written_offset_substreams : dummy_offset_substreams;
     bool write_final_mark = (with_final_mark && data_written);
-
     {
         auto it = columns_list.begin();
         for (size_t i = 0; i < columns_list.size(); ++i, ++it)
         {
             if (!serialization_states.empty())
             {
-                serialize_settings.getter = createStreamGetter(it->name, written_offset_columns ? *written_offset_columns : offset_columns);
-                it->type->serializeBinaryBulkStateSuffix(serialize_settings, serialization_states[it->name]);
+                serialize_settings.getter = createStreamGetter(*it, offset_substreams);
+                getSerialization(it->name)->serializeBinaryBulkStateSuffix(serialize_settings, serialization_states[it->name]);
             }
 
             if (write_final_mark)
-            {
-                writeFinalMark(it->name, it->type, offset_columns, serialize_settings.path);
-            }
+                writeFinalMark(*it, offset_substreams);
         }
     }
+}
 
+void MergeTreeDataPartWriterWide::fillDataChecksums(MergeTreeDataPartChecksums & checksums, NameSet & checksums_to_remove)
+{
+    for (auto & [stream_name, stream] : column_streams)
+    {
+        /// Remove checksums for old stream name if file was
+        /// renamed due to replacing the name to the hash of name.
+        const auto & full_stream_name = stream_name_to_full_name.at(stream_name);
+        if (stream_name != full_stream_name)
+        {
+            checksums_to_remove.insert(full_stream_name + stream->data_file_extension);
+            checksums_to_remove.insert(full_stream_name + stream->marks_file_extension);
+        }
+
+        stream->preFinalize();
+        stream->addToChecksums(checksums, true);
+    }
+}
+
+void MergeTreeDataPartWriterWide::finishDataSerialization(bool sync)
+{
     for (auto & stream : column_streams)
     {
         stream.second->finalize();
-        stream.second->addToChecksums(checksums);
+        if (sync)
+            stream.second->sync();
     }
 
     column_streams.clear();
     serialization_states.clear();
+
+#ifndef NDEBUG
+    /// Heavy weight validation of written data. Checks that we are able to read
+    /// data according to marks. Otherwise throws LOGICAL_ERROR (equal to abort in debug mode)
+    for (const auto & column : columns_list)
+    {
+        if (column.type->isValueRepresentedByNumber()
+            && !column.type->haveSubtypes()
+            && getSerialization(column.name)->getKindStack() == ISerialization::KindStack{ISerialization::Kind::DEFAULT})
+        {
+            validateColumnOfFixedSize(column);
+        }
+    }
+#endif
+
 }
 
-void MergeTreeDataPartWriterWide::writeFinalMark(
-    const std::string & column_name,
-    const DataTypePtr column_type,
-    WrittenOffsetColumns & offset_columns,
-    DB::IDataType::SubstreamPath & path)
+void MergeTreeDataPartWriterWide::fillChecksums(MergeTreeDataPartChecksums & checksums, NameSet & checksums_to_remove)
 {
-    writeSingleMark(column_name, *column_type, offset_columns, 0, path);
-    /// Memoize information about offsets
-    column_type->enumerateStreams([&] (const IDataType::SubstreamPath & substream_path)
+    // If we don't have anything to write, skip finalization.
+    if (!columns_list.empty())
+        fillDataChecksums(checksums, checksums_to_remove);
+
+    if (settings.rewrite_primary_key)
+        fillPrimaryIndexChecksums(checksums);
+
+    fillSkipIndicesChecksums(checksums);
+}
+
+void MergeTreeDataPartWriterWide::finish(bool sync)
+{
+    // If we don't have anything to write, skip finalization.
+    if (!columns_list.empty())
+        finishDataSerialization(sync);
+
+    if (settings.rewrite_primary_key)
+        finishPrimaryIndexSerialization(sync);
+
+    finishSkipIndicesSerialization(sync);
+}
+
+void MergeTreeDataPartWriterWide::cancel() noexcept
+{
+    for (auto & stream : column_streams)
+        if (stream.second)
+            stream.second->cancel();
+
+    column_streams.clear();
+    serialization_states.clear();
+
+    Base::cancel();
+}
+
+void MergeTreeDataPartWriterWide::writeFinalMark(const NameAndTypePair & name_and_type,
+    WrittenOffsetSubstreams & offset_substreams)
+{
+    writeSingleMark(name_and_type, offset_substreams, 0);
+
+    /// Memorize information about offsets
+    auto callback = [&] (const ISerialization::SubstreamPath & substream_path)
     {
-        bool is_offsets = !substream_path.empty() && substream_path.back().type == IDataType::Substream::ArraySizes;
+        bool is_offsets = !substream_path.empty() && substream_path.back().type == ISerialization::Substream::ArraySizes;
         if (is_offsets)
+            offset_substreams.insert(getStreamName(name_and_type, substream_path));
+    };
+    auto serialization = getSerialization(name_and_type.name);
+    auto data = ISerialization::SubstreamData(serialization).withType(name_and_type.type).withColumn(block_sample.getByName(name_and_type.name).column);
+    auto enumerate_settings = getEnumerateSettings(settings);
+    serialization->enumerateStreams(enumerate_settings, callback, data);
+}
+
+static void fillIndexGranularityImpl(
+    MergeTreeIndexGranularity & index_granularity,
+    size_t index_offset,
+    size_t index_granularity_for_block,
+    size_t rows_in_block)
+{
+    for (size_t current_row = index_offset; current_row < rows_in_block; current_row += index_granularity_for_block)
+        index_granularity.appendMark(index_granularity_for_block);
+}
+
+void MergeTreeDataPartWriterWide::fillIndexGranularity(size_t index_granularity_for_block, size_t rows_in_block)
+{
+    if (getCurrentMark() < index_granularity->getMarksCount() && getCurrentMark() != index_granularity->getMarksCount() - 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to add marks, while current mark {}, but total marks {}",
+                        getCurrentMark(), index_granularity->getMarksCount());
+
+    size_t index_offset = 0;
+    if (rows_written_in_last_mark != 0)
+        index_offset = index_granularity->getLastMarkRows() - rows_written_in_last_mark;
+
+    fillIndexGranularityImpl(
+        *index_granularity,
+        index_offset,
+        index_granularity_for_block,
+        rows_in_block);
+}
+
+
+void MergeTreeDataPartWriterWide::adjustLastMarkIfNeedAndFlushToDisk(size_t new_rows_in_last_mark)
+{
+    /// We don't want to split already written granules to smaller
+    if (rows_written_in_last_mark > new_rows_in_last_mark)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Tryin to make mark #{} smaller ({} rows) then it already has {}",
+                        getCurrentMark(), new_rows_in_last_mark, rows_written_in_last_mark);
+
+    /// We can adjust marks only if we computed granularity for blocks.
+    /// Otherwise we cannot change granularity because it will differ from
+    /// other columns
+    if (compute_granularity && settings.can_use_adaptive_granularity)
+    {
+        if (getCurrentMark() != index_granularity->getMarksCount() - 1)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "Non last mark {} (with {} rows) having rows offset {}, total marks {}",
+                            getCurrentMark(), index_granularity->getMarkRows(getCurrentMark()),
+                            rows_written_in_last_mark, index_granularity->getMarksCount());
+
+        index_granularity->adjustLastMark(new_rows_in_last_mark);
+    }
+
+    /// Last mark should be filled, otherwise it's a bug
+    if (last_non_written_marks.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "No saved marks for last mark {} having rows offset {}, total marks {}",
+                        getCurrentMark(), rows_written_in_last_mark, index_granularity->getMarksCount());
+
+    if (rows_written_in_last_mark == new_rows_in_last_mark)
+    {
+        for (const auto & [name, marks] : last_non_written_marks)
         {
-            String stream_name = IDataType::getFileNameForStream(column_name, substream_path);
-            offset_columns.insert(stream_name);
+            for (const auto & mark : marks)
+                flushMarkToFile(mark, index_granularity->getMarkRows(getCurrentMark()));
         }
-    }, path);
+
+        last_non_written_marks.clear();
+
+        if (compute_granularity && settings.can_use_adaptive_granularity)
+        {
+            /// Also we add mark to each skip index because all of them
+            /// already accumulated all rows from current adjusting mark
+            for (size_t i = 0; i < skip_indices.size(); ++i)
+                ++skip_index_accumulated_marks[i];
+
+            /// This mark completed, go further
+            setCurrentMark(getCurrentMark() + 1);
+            /// Without offset
+            rows_written_in_last_mark = 0;
+        }
+    }
 }
 
 }

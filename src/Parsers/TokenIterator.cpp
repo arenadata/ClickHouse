@@ -4,12 +4,14 @@
 namespace DB
 {
 
-UnmatchedParentheses checkUnmatchedParentheses(TokenIterator begin, Token * last)
+UnmatchedParentheses checkUnmatchedParentheses(TokenIterator begin)
 {
     /// We have just two kind of parentheses: () and [].
     UnmatchedParentheses stack;
 
-    for (TokenIterator it = begin; it.isValid() && &it.get() <= last; ++it)
+    /// We have to iterate through all tokens until the end to avoid false positive "Unmatched parentheses" error
+    /// when parser failed in the middle of the query.
+    for (TokenIterator it = begin; it.isValid(); ++it)
     {
         if (it->type == TokenType::OpeningRoundBracket || it->type == TokenType::OpeningSquareBracket)
         {
@@ -23,7 +25,7 @@ UnmatchedParentheses checkUnmatchedParentheses(TokenIterator begin, Token * last
                 stack.push_back(*it);
                 return stack;
             }
-            else if ((stack.back().type == TokenType::OpeningRoundBracket && it->type == TokenType::ClosingRoundBracket)
+            if ((stack.back().type == TokenType::OpeningRoundBracket && it->type == TokenType::ClosingRoundBracket)
                 || (stack.back().type == TokenType::OpeningSquareBracket && it->type == TokenType::ClosingSquareBracket))
             {
                 /// Valid match.

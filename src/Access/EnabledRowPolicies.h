@@ -1,17 +1,32 @@
 #pragma once
 
+#include <Access/Common/RowPolicyDefs.h>
 #include <Access/RowPolicy.h>
-#include <Core/Types.h>
+#include <base/types.h>
 #include <Core/UUID.h>
-#include <boost/smart_ptr/atomic_shared_ptr.hpp>
-#include <unordered_map>
-#include <memory>
+#include <Parsers/IAST_fwd.h>
 
+#include <boost/container/flat_set.hpp>
+#include <boost/smart_ptr/atomic_shared_ptr.hpp>
+
+#include <memory>
+#include <unordered_map>
+#include <vector>
 
 namespace DB
 {
-class IAST;
-using ASTPtr = std::shared_ptr<IAST>;
+
+struct RowPolicyFilter
+{
+    ASTPtr expression;
+    std::shared_ptr<const std::pair<String, String>> database_and_table_name;
+    std::vector<RowPolicyPtr> policies;
+
+    bool isAlwaysTrue() const;
+    bool isAlwaysFalse() const;
+};
+
+using RowPolicyFilterPtr = std::shared_ptr<const RowPolicyFilter>;
 
 
 /// Provides fast access to row policies' conditions for a specific user and tables.
@@ -32,45 +47,39 @@ public:
         friend bool operator >=(const Params & lhs, const Params & rhs) { return !(lhs < rhs); }
     };
 
+    EnabledRowPolicies();
     ~EnabledRowPolicies();
-
-    using ConditionType = RowPolicy::ConditionType;
 
     /// Returns prepared filter for a specific table and operations.
     /// The function can return nullptr, that means there is no filters applied.
     /// The returned filter can be a combination of the filters defined by multiple row policies.
-    ASTPtr getCondition(const String & database, const String & table_name, ConditionType type) const;
-    ASTPtr getCondition(const String & database, const String & table_name, ConditionType type, const ASTPtr & extra_condition) const;
+    RowPolicyFilterPtr getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type) const;
+    RowPolicyFilterPtr getFilter(const String & database, const String & table_name, RowPolicyFilterType filter_type, RowPolicyFilterPtr combine_with_filter) const;
 
 private:
     friend class RowPolicyCache;
-    EnabledRowPolicies(const Params & params_);
+    explicit EnabledRowPolicies(const Params & params_);
 
-    struct MixedConditionKey
+    struct MixedFiltersKey
     {
         std::string_view database;
         std::string_view table_name;
-        ConditionType condition_type;
+        RowPolicyFilterType filter_type;
 
-        auto toTuple() const { return std::tie(database, table_name, condition_type); }
-        friend bool operator==(const MixedConditionKey & left, const MixedConditionKey & right) { return left.toTuple() == right.toTuple(); }
-        friend bool operator!=(const MixedConditionKey & left, const MixedConditionKey & right) { return left.toTuple() != right.toTuple(); }
+        auto toTuple() const { return std::tie(database, table_name, filter_type); }
+        friend bool operator==(const MixedFiltersKey & left, const MixedFiltersKey & right) { return left.toTuple() == right.toTuple(); }
+        friend bool operator!=(const MixedFiltersKey & left, const MixedFiltersKey & right) { return left.toTuple() != right.toTuple(); }
     };
 
     struct Hash
     {
-        size_t operator()(const MixedConditionKey & key) const;
+        size_t operator()(const MixedFiltersKey & key) const;
     };
 
-    struct MixedCondition
-    {
-        ASTPtr ast;
-        std::shared_ptr<const std::pair<String, String>> database_and_table_name;
-    };
-    using MapOfMixedConditions = std::unordered_map<MixedConditionKey, MixedCondition, Hash>;
+    using MixedFiltersMap = std::unordered_map<MixedFiltersKey, RowPolicyFilterPtr, Hash>;
 
     const Params params;
-    mutable boost::atomic_shared_ptr<const MapOfMixedConditions> map_of_mixed_conditions;
+    mutable boost::atomic_shared_ptr<const MixedFiltersMap> mixed_filters;
 };
 
 }

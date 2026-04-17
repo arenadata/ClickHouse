@@ -1,15 +1,26 @@
 #include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Processors/Executors/PipelineExecutor.h>
 #include <Processors/Formats/PullingOutputFormat.h>
-#include <Processors/QueryPipeline.h>
+#include <QueryPipeline/QueryPipeline.h>
+#include <QueryPipeline/ReadProgressCallback.h>
 #include <Processors/Transforms/AggregatingTransform.h>
+#include <Processors/Sources/NullSource.h>
 
 namespace DB
 {
 
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
 PullingPipelineExecutor::PullingPipelineExecutor(QueryPipeline & pipeline_) : pipeline(pipeline_)
 {
-    pulling_format = std::make_shared<PullingOutputFormat>(pipeline.getHeader(), has_data_flag);
-    pipeline.setOutputFormat(pulling_format);
+    if (!pipeline.pulling())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Pipeline for PullingPipelineExecutor must be pulling");
+
+    pulling_format = std::make_shared<PullingOutputFormat>(pipeline.output->getSharedHeader(), has_data_flag);
+    pipeline.complete(pulling_format);
 }
 
 PullingPipelineExecutor::~PullingPipelineExecutor()
@@ -29,10 +40,21 @@ const Block & PullingPipelineExecutor::getHeader() const
     return pulling_format->getPort(IOutputFormat::PortKind::Main).getHeader();
 }
 
+const SharedHeader & PullingPipelineExecutor::getSharedHeader() const
+{
+    return pulling_format->getPort(IOutputFormat::PortKind::Main).getSharedHeader();
+}
+
 bool PullingPipelineExecutor::pull(Chunk & chunk)
 {
     if (!executor)
-        executor = pipeline.execute();
+    {
+        executor = std::make_shared<PipelineExecutor>(pipeline.processors, pipeline.process_list_element);
+        executor->setReadProgressCallback(pipeline.getReadProgressCallback());
+    }
+
+    if (!executor->checkTimeLimitSoft())
+        return false;
 
     if (!executor->executeStep(&has_data_flag))
         return false;
@@ -56,14 +78,11 @@ bool PullingPipelineExecutor::pull(Block & block)
     }
 
     block = pulling_format->getPort(IOutputFormat::PortKind::Main).getHeader().cloneWithColumns(chunk.detachColumns());
-
-    if (auto chunk_info = chunk.getChunkInfo())
+    if (auto agg_info = chunk.getChunkInfos().get<AggregatedChunkInfo>())
     {
-        if (const auto * agg_info = typeid_cast<const AggregatedChunkInfo *>(chunk_info.get()))
-        {
-            block.info.bucket_num = agg_info->bucket_num;
-            block.info.is_overflows = agg_info->is_overflows;
-        }
+        block.info.bucket_num = agg_info->bucket_num;
+        block.info.is_overflows = agg_info->is_overflows;
+        block.info.out_of_order_buckets = agg_info->out_of_order_buckets;
     }
 
     return true;
@@ -108,7 +127,7 @@ Block PullingPipelineExecutor::getExtremesBlock()
     return header.cloneWithColumns(extremes.detachColumns());
 }
 
-BlockStreamProfileInfo & PullingPipelineExecutor::getProfileInfo()
+ProfileInfo & PullingPipelineExecutor::getProfileInfo()
 {
     return pulling_format->getProfileInfo();
 }

@@ -1,23 +1,27 @@
 #pragma once
 
 #include <Core/Field.h>
-#include <Common/SettingsChanges.h>
-#include <common/StringRef.h>
+#include <Common/LoggingFormatStringHelpers.h>
+#include <Common/SettingConstraintWritability.h>
+#include <Common/SettingSource.h>
+
 #include <unordered_map>
 
-
-namespace Poco
-{
-namespace Util
+namespace Poco::Util
 {
     class AbstractConfiguration;
 }
-}
-
 
 namespace DB
 {
 struct Settings;
+struct MergeTreeSettings;
+struct SettingChange;
+class SettingsChanges;
+class AccessControl;
+struct AlterSettingsProfileElements;
+class SettingsProfileElements;
+
 
 /** Checks if specified changes of settings are allowed or not.
   * If the changes are not allowed (i.e. violates some constraints) this class throws an exception.
@@ -37,99 +41,149 @@ struct Settings;
   *               <max>20000000000</max>
   *           </max_memory_usage>
   *           <force_index_by_date>
-  *               <readonly/>
+  *               <const/>
   *           </force_index_by_date>
+  *           <max_threads>
+  *               <changeable_in_readonly/>
+  *           </max_threads>
   *       </constraints>
   *   </user_profile>
   * </profiles>
   *
   * This class also checks that we are not in the read-only mode.
   * If a setting cannot be change due to the read-only mode this class throws an exception.
-  * The value of `readonly` value is understood as follows:
-  * 0 - everything allowed.
-  * 1 - only read queries can be made; you can not change the settings.
-  * 2 - you can only do read queries and you can change the settings, except for the `readonly` setting.
+  * The value of `readonly` is understood as follows:
+  * 0 - not read-only mode, no additional checks.
+  * 1 - only read queries, as well as changing settings with <changeable_in_readonly/> flag.
+  * 2 - only read queries and you can change the settings, except for the `readonly` setting.
+  *
   */
 class SettingsConstraints
 {
 public:
-    SettingsConstraints();
+    explicit SettingsConstraints(const AccessControl & access_control_);
     SettingsConstraints(const SettingsConstraints & src);
-    SettingsConstraints & operator =(const SettingsConstraints & src);
-    SettingsConstraints(SettingsConstraints && src);
-    SettingsConstraints & operator =(SettingsConstraints && src);
+    SettingsConstraints & operator=(const SettingsConstraints & src);
+    SettingsConstraints(SettingsConstraints && src) noexcept;
+    SettingsConstraints & operator=(SettingsConstraints && src) noexcept;
     ~SettingsConstraints();
 
     void clear();
-    bool empty() const { return constraints_by_index.empty(); }
+    bool empty() const { return constraints.empty(); }
 
-    void setMinValue(const StringRef & setting_name, const Field & min_value);
-    void setMinValue(size_t setting_index, const Field & min_value);
-    Field getMinValue(const StringRef & setting_name) const;
-    Field getMinValue(size_t setting_index) const;
-
-    void setMaxValue(const StringRef & setting_name, const Field & max_value);
-    void setMaxValue(size_t setting_index, const Field & max_value);
-    Field getMaxValue(const StringRef & setting_name) const;
-    Field getMaxValue(size_t setting_index) const;
-
-    void setReadOnly(const StringRef & setting_name, bool read_only);
-    void setReadOnly(size_t setting_index, bool read_only);
-    bool isReadOnly(const StringRef & setting_name) const;
-    bool isReadOnly(size_t setting_index) const;
-
-    void set(const StringRef & setting_name, const Field & min_value, const Field & max_value, bool read_only);
-    void set(size_t setting_index, const Field & min_value, const Field & max_value, bool read_only);
-    void get(const StringRef & setting_name, Field & min_value, Field & max_value, bool & read_only) const;
-    void get(size_t setting_index, Field & min_value, Field & max_value, bool & read_only) const;
+    void set(const String & full_name, const Field & min_value, const Field & max_value, const std::vector<Field> & allowed_values, SettingConstraintWritability writability);
+    void get(const Settings & current_settings, std::string_view short_name, Field & min_value, Field & max_value, std::vector<Field> & allowed_values, SettingConstraintWritability & writability) const;
+    void get(const MergeTreeSettings & current_settings, std::string_view short_name, Field & min_value, Field & max_value, std::vector<Field> & allowed_values, SettingConstraintWritability & writability) const;
 
     void merge(const SettingsConstraints & other);
 
-    struct Info
-    {
-        StringRef name;
-        Field min;
-        Field max;
-        bool read_only = false;
-    };
-    using Infos = std::vector<Info>;
-
-    Infos getInfo() const;
-
     /// Checks whether `change` violates these constraints and throws an exception if so.
-    void check(const Settings & current_settings, const SettingChange & change) const;
-    void check(const Settings & current_settings, const SettingsChanges & changes) const;
+    void check(const Settings & current_settings, const SettingChange & change, SettingSource source) const;
+    void check(const Settings & current_settings, const SettingsChanges & changes, SettingSource source) const;
+    void check(const Settings & current_settings, SettingsChanges & changes, SettingSource source) const;
+    void check(const Settings & current_settings, const SettingsProfileElements & profile_elements, SettingSource source) const;
+    void check(const Settings & current_settings, const AlterSettingsProfileElements & profile_elements, SettingSource source) const;
+
+    /// Checks whether `change` violates these constraints and throws an exception if so. (setting short name is expected inside `changes`)
+    void check(const MergeTreeSettings & current_settings, const SettingChange & change) const;
+    void check(const MergeTreeSettings & current_settings, const SettingsChanges & changes) const;
 
     /// Checks whether `change` violates these and clamps the `change` if so.
-    void clamp(const Settings & current_settings, SettingChange & change) const;
-    void clamp(const Settings & current_settings, SettingsChanges & changes) const;
+    void clamp(const Settings & current_settings, SettingsChanges & changes, SettingSource source) const;
 
-    /** Set multiple settings from "profile" (in server configuration file (users.xml), profiles contain groups of multiple settings).
-      * The profile can also be set using the `set` functions, like the profile setting.
-      */
-    void setProfile(const String & profile_name, const Poco::Util::AbstractConfiguration & config);
 
-    /// Loads the constraints from configuration file, at "path" prefix in configuration.
-    void loadFromConfig(const String & path, const Poco::Util::AbstractConfiguration & config);
-
-    friend bool operator ==(const SettingsConstraints & lhs, const SettingsConstraints & rhs);
-    friend bool operator !=(const SettingsConstraints & lhs, const SettingsConstraints & rhs) { return !(lhs == rhs); }
+    friend bool operator ==(const SettingsConstraints & left, const SettingsConstraints & right);
+    friend bool operator !=(const SettingsConstraints & left, const SettingsConstraints & right) { return !(left == right); }
 
 private:
-    struct Constraint
+    enum ReactionOnViolation
     {
-        bool read_only = false;
-        Field min_value;
-        Field max_value;
-
-        bool operator ==(const Constraint & rhs) const;
-        bool operator !=(const Constraint & rhs) const { return !(*this == rhs); }
+        THROW_ON_VIOLATION,
+        CLAMP_ON_VIOLATION,
     };
 
-    Constraint & getConstraintRef(size_t index);
-    const Constraint * tryGetConstraint(size_t) const;
+    struct Constraint
+    {
+        SettingConstraintWritability writability = SettingConstraintWritability::WRITABLE;
+        Field min_value{};
+        Field max_value{};
+        std::vector<Field> disallowed_values{};
 
-    std::unordered_map<size_t, Constraint> constraints_by_index;
+        bool operator ==(const Constraint & other) const;
+        bool operator !=(const Constraint & other) const { return !(*this == other); }
+    };
+
+    struct Checker
+    {
+        Constraint constraint;
+        using NameResolver = std::function<std::string_view(std::string_view)>;
+        NameResolver setting_name_resolver;
+
+        PreformattedMessage explain;
+        int code = 0;
+
+        // Allows everything
+        explicit Checker(NameResolver setting_name_resolver_)
+            : setting_name_resolver(std::move(setting_name_resolver_))
+        {}
+
+        // Forbidden with explanation
+        Checker(const PreformattedMessage & explain_, int code_)
+            : constraint{.writability = SettingConstraintWritability::CONST}
+            , explain(explain_)
+            , code(code_)
+        {}
+
+        // Allow or forbid depending on range defined by constraint, also used to return stored constraint
+        explicit Checker(const Constraint & constraint_, NameResolver setting_name_resolver_)
+            : constraint(constraint_)
+            , setting_name_resolver(std::move(setting_name_resolver_))
+        {}
+
+        // Perform checking
+        bool check(SettingChange & change,
+                   const Field & new_value,
+                   ReactionOnViolation reaction,
+                   SettingSource source) const;
+    };
+
+    struct StringHash
+    {
+        using is_transparent = void;
+        size_t operator()(std::string_view txt) const
+        {
+            return std::hash<std::string_view>{}(txt);
+        }
+    };
+
+    /// Common logic for `check(Settings, SettingsChanges&)` and `clamp`. Both filter out unchanged settings
+    /// (unless `compatibility` is present) and differ only in whether violations throw or get clamped to the nearest bound.
+    void
+    checkOrClamp(const Settings & current_settings, SettingsChanges & changes, ReactionOnViolation reaction, SettingSource source) const;
+
+    bool checkImpl(
+        const Settings & current_settings,
+        SettingChange & change,
+        ReactionOnViolation reaction,
+        SettingSource source,
+        bool ignore_unchanged_settings = false) const;
+
+    bool checkImpl(const MergeTreeSettings & current_settings, SettingChange & change, ReactionOnViolation reaction) const;
+
+    Checker getChecker(const Settings & current_settings, std::string_view setting_name) const;
+    Checker getMergeTreeChecker(std::string_view short_name) const;
+
+    std::string_view resolveSettingNameWithCache(std::string_view name) const;
+
+    // Special container for heterogeneous lookups: to avoid `String` construction during `find(std::string_view)`
+    using Constraints = std::unordered_map<String, Constraint, StringHash, std::equal_to<>>;
+    Constraints constraints;
+    /// to avoid creating new string every time we cache the alias resolution
+    /// we cannot use resolveName from BaseSettings::Traits because MergeTreeSettings have added prefix
+    /// we store only resolved aliases inside the Constraints so to correctly search the container we always need to use resolved name
+    std::unordered_map<std::string, std::string, StringHash, std::equal_to<>> settings_alias_cache;
+
+    const AccessControl * access_control;
 };
 
 }

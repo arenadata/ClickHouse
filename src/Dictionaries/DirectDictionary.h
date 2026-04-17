@@ -1,43 +1,48 @@
 #pragma once
 
 #include <atomic>
-#include <variant>
-#include <vector>
-#include <Columns/ColumnDecimal.h>
-#include <Columns/ColumnString.h>
-#include <Common/Arena.h>
-#include <Core/Block.h>
-#include <ext/range.h>
-#include <ext/size.h>
-#include <Common/HashTable/HashMap.h>
-#include "DictionaryStructure.h"
-#include "IDictionary.h"
-#include "IDictionarySource.h"
+
+#include <Dictionaries/DictionaryHelpers.h>
+#include <Dictionaries/DictionaryStructure.h>
+#include <Dictionaries/IDictionary.h>
+#include <Dictionaries/IDictionarySource.h>
 
 
 namespace DB
 {
-using BlockPtr = std::shared_ptr<Block>;
 
+struct Settings;
+
+template <DictionaryKeyType dictionary_key_type>
 class DirectDictionary final : public IDictionary
 {
 public:
+    using KeyType = std::conditional_t<dictionary_key_type == DictionaryKeyType::Simple, UInt64, std::string_view>;
+
     DirectDictionary(
-        const std::string & database_,
-        const std::string & name_,
+        const StorageID & dict_id_,
         const DictionaryStructure & dict_struct_,
-        DictionarySourcePtr source_ptr_,
-        BlockPtr saved_block_ = nullptr);
+        DictionarySourcePtr source_ptr_);
 
-    const std::string & getDatabase() const override { return database; }
-    const std::string & getName() const override { return name; }
-    const std::string & getFullName() const override { return full_name; }
-
-    std::string getTypeName() const override { return "Direct"; }
+    std::string getTypeName() const override
+    {
+        if constexpr (dictionary_key_type == DictionaryKeyType::Simple)
+            return "Direct";
+        else
+            return "ComplexKeyDirect";
+    }
 
     size_t getBytesAllocated() const override { return 0; }
 
-    size_t getQueryCount() const override { return query_count.load(std::memory_order_relaxed); }
+    size_t getQueryCount() const override { return query_count.load(); }
+
+    double getFoundRate() const override
+    {
+        size_t queries = query_count.load();
+        if (!queries)
+            return 0;
+        return std::min(1.0, static_cast<double>(found_count.load()) / static_cast<double>(queries));
+    }
 
     double getHitRate() const override { return 1.0; }
 
@@ -45,12 +50,12 @@ public:
 
     double getLoadFactor() const override { return 0; }
 
-    std::shared_ptr<const IExternalLoadable> clone() const override
+    std::shared_ptr<IExternalLoadable> clone() const override
     {
-        return std::make_shared<DirectDictionary>(database, name, dict_struct, source_ptr->clone(), saved_block);
+        return std::make_shared<DirectDictionary>(getDictionaryID(), dict_struct, source_ptr->clone());
     }
 
-    const IDictionarySource * getSource() const override { return source_ptr.get(); }
+    DictionarySourcePtr getSource() const override { return source_ptr; }
 
     const DictionaryLifetime & getLifetime() const override { return dict_lifetime; }
 
@@ -58,169 +63,54 @@ public:
 
     bool isInjective(const std::string & attribute_name) const override
     {
-        return dict_struct.attributes[&getAttribute(attribute_name) - attributes.data()].injective;
+        return dict_struct.getAttribute(attribute_name).injective;
     }
 
-    bool hasHierarchy() const override { return hierarchical_attribute; }
+    DictionaryKeyType getKeyType() const override { return dictionary_key_type; }
 
-    void toParent(const PaddedPODArray<Key> & ids, PaddedPODArray<Key> & out) const override;
+    Columns getColumns(
+        const Strings & attribute_names,
+        const DataTypes & attribute_types,
+        const Columns & key_columns,
+        const DataTypes & key_types,
+        DefaultsOrFilter defaults_or_filter) const override;
 
-    void isInVectorVector(
-        const PaddedPODArray<Key> & child_ids, const PaddedPODArray<Key> & ancestor_ids, PaddedPODArray<UInt8> & out) const override;
-    void isInVectorConstant(const PaddedPODArray<Key> & child_ids, const Key ancestor_id, PaddedPODArray<UInt8> & out) const override;
-    void isInConstantVector(const Key child_id, const PaddedPODArray<Key> & ancestor_ids, PaddedPODArray<UInt8> & out) const override;
+    ColumnPtr getColumn(
+        const std::string & attribute_name,
+        const DataTypePtr & attribute_type,
+        const Columns & key_columns,
+        const DataTypes & key_types,
+        DefaultOrFilter default_or_filter) const override;
 
-    template <typename T>
-    using ResultArrayType = std::conditional_t<IsDecimalNumber<T>, DecimalPaddedPODArray<T>, PaddedPODArray<T>>;
+    ColumnUInt8::Ptr hasKeys(const Columns & key_columns, const DataTypes & key_types) const override;
 
-#define DECLARE(TYPE) \
-    void get##TYPE(const std::string & attribute_name, const PaddedPODArray<Key> & ids, ResultArrayType<TYPE> & out) const;
-    DECLARE(UInt8)
-    DECLARE(UInt16)
-    DECLARE(UInt32)
-    DECLARE(UInt64)
-    DECLARE(UInt128)
-    DECLARE(Int8)
-    DECLARE(Int16)
-    DECLARE(Int32)
-    DECLARE(Int64)
-    DECLARE(Float32)
-    DECLARE(Float64)
-    DECLARE(Decimal32)
-    DECLARE(Decimal64)
-    DECLARE(Decimal128)
-#undef DECLARE
+    bool hasHierarchy() const override { return dict_struct.hierarchical_attribute_index.has_value(); }
 
-    void getString(const std::string & attribute_name, const PaddedPODArray<Key> & ids, ColumnString * out) const;
+    ColumnPtr getHierarchy(ColumnPtr key_column, const DataTypePtr & key_type) const override;
 
-#define DECLARE(TYPE) \
-    void get##TYPE( \
-        const std::string & attribute_name, \
-        const PaddedPODArray<Key> & ids, \
-        const PaddedPODArray<TYPE> & def, \
-        ResultArrayType<TYPE> & out) const;
-    DECLARE(UInt8)
-    DECLARE(UInt16)
-    DECLARE(UInt32)
-    DECLARE(UInt64)
-    DECLARE(UInt128)
-    DECLARE(Int8)
-    DECLARE(Int16)
-    DECLARE(Int32)
-    DECLARE(Int64)
-    DECLARE(Float32)
-    DECLARE(Float64)
-    DECLARE(Decimal32)
-    DECLARE(Decimal64)
-    DECLARE(Decimal128)
-#undef DECLARE
+    ColumnUInt8::Ptr isInHierarchy(
+        ColumnPtr key_column,
+        ColumnPtr in_key_column,
+        const DataTypePtr & key_type) const override;
 
-    void
-    getString(const std::string & attribute_name, const PaddedPODArray<Key> & ids, const ColumnString * const def, ColumnString * const out)
-        const;
+    Pipe read(const Names & column_names, size_t max_block_size, size_t num_streams) const override;
 
-#define DECLARE(TYPE) \
-    void get##TYPE(const std::string & attribute_name, const PaddedPODArray<Key> & ids, const TYPE def, ResultArrayType<TYPE> & out) const;
-    DECLARE(UInt8)
-    DECLARE(UInt16)
-    DECLARE(UInt32)
-    DECLARE(UInt64)
-    DECLARE(UInt128)
-    DECLARE(Int8)
-    DECLARE(Int16)
-    DECLARE(Int32)
-    DECLARE(Int64)
-    DECLARE(Float32)
-    DECLARE(Float64)
-    DECLARE(Decimal32)
-    DECLARE(Decimal64)
-    DECLARE(Decimal128)
-#undef DECLARE
-
-    void getString(const std::string & attribute_name, const PaddedPODArray<Key> & ids, const String & def, ColumnString * const out) const;
-
-    void has(const PaddedPODArray<Key> & ids, PaddedPODArray<UInt8> & out) const override;
-
-    BlockInputStreamPtr getBlockInputStream(const Names & column_names, size_t max_block_size) const override;
+    void applySettings(const Settings & settings);
 
 private:
-    struct Attribute final
-    {
-        AttributeUnderlyingType type;
-        std::variant<
-            UInt8,
-            UInt16,
-            UInt32,
-            UInt64,
-            UInt128,
-            Int8,
-            Int16,
-            Int32,
-            Int64,
-            Decimal32,
-            Decimal64,
-            Decimal128,
-            Float32,
-            Float64,
-            StringRef>
-            null_values;
-        std::unique_ptr<Arena> string_arena;
-        std::string name;
-    };
+    BlockIO loadKeys(const PaddedPODArray<KeyType> & requested_keys, const Columns & key_columns) const;
 
-    void createAttributes();
-
-    template <typename T>
-    void addAttributeSize(const Attribute & attribute);
-
-    void calculateBytesAllocated();
-
-    template <typename T>
-    void createAttributeImpl(Attribute & attribute, const Field & null_value);
-
-    Attribute createAttributeWithType(const AttributeUnderlyingType type, const Field & null_value, const std::string & name);
-
-    template <typename AttributeType, typename OutputType, typename ValueSetter, typename DefaultGetter>
-    void getItemsStringImpl(
-        const Attribute & attribute, const PaddedPODArray<Key> & ids, ValueSetter && set_value, DefaultGetter && get_default) const;
-
-    template <typename AttributeType, typename OutputType, typename ValueSetter, typename DefaultGetter>
-    void getItemsImpl(
-        const Attribute & attribute, const PaddedPODArray<Key> & ids, ValueSetter && set_value, DefaultGetter && get_default) const;
-
-    template <typename T>
-    void resize(Attribute & attribute, const Key id);
-
-    template <typename T>
-    void setAttributeValueImpl(Attribute & attribute, const Key id, const T & value);
-
-    void setAttributeValue(Attribute & attribute, const Key id, const Field & value);
-
-    const Attribute & getAttribute(const std::string & attribute_name) const;
-
-    template <typename T>
-    void has(const Attribute & attribute, const PaddedPODArray<Key> & ids, PaddedPODArray<UInt8> & out) const;
-
-    Key getValueOrNullByKey(const Key & to_find) const;
-
-    template <typename ChildType, typename AncestorType>
-    void isInImpl(const ChildType & child_ids, const AncestorType & ancestor_ids, PaddedPODArray<UInt8> & out) const;
-
-    const std::string database;
-    const std::string name;
-    const std::string full_name;
     const DictionaryStructure dict_struct;
     const DictionarySourcePtr source_ptr;
     const DictionaryLifetime dict_lifetime;
 
-    std::map<std::string, size_t> attribute_index_by_name;
-    std::map<size_t, std::string> attribute_name_by_index;
-    std::vector<Attribute> attributes;
-    const Attribute * hierarchical_attribute = nullptr;
+    bool use_async_executor = false;
 
     mutable std::atomic<size_t> query_count{0};
-
-    BlockPtr saved_block;
+    mutable std::atomic<size_t> found_count{0};
 };
+
+extern template class DirectDictionary<DictionaryKeyType::Simple>;
+extern template class DirectDictionary<DictionaryKeyType::Complex>;
 
 }

@@ -1,10 +1,7 @@
 #pragma once
-#include <DataTypes/DataTypeString.h>
-#include <Storages/ColumnsDescription.h>
-#include <Storages/IStorage.h>
-#include <ext/shared_ptr_helper.h>
-#include <Processors/Sources/SourceFromSingleChunk.h>
-#include <Processors/Pipe.h>
+
+#include <Storages/StorageWithCommonVirtualColumns.h>
+#include <Interpreters/ActionsDAG.h>
 
 namespace DB
 {
@@ -12,45 +9,58 @@ namespace DB
 class Context;
 
 
-/** Base class for system tables whose all columns have String type.
+/** IStorageSystemOneBlock is base class for system tables whose all columns can be synchronously fetched.
+  *
+  * Client class need to provide columns_description.
+  * IStorageSystemOneBlock during read will create result columns in same order as in columns_description
+  * and pass it with fillData method.
+  *
+  * Client also must override fillData and fill result columns.
+  *
+  * If subclass want to support virtual columns, it should override getVirtuals method of IStorage interface.
+  * IStorageSystemOneBlock will add virtuals columns at the end of result columns of fillData method.
   */
-template <typename Self>
-class IStorageSystemOneBlock : public IStorage
+class IStorageSystemOneBlock : public StorageWithCommonVirtualColumns
 {
 protected:
-    virtual void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo & query_info) const = 0;
+    /// If this method uses `predicate`, getFilterSampleBlock() must list all columns to which
+    /// it's applied. (Otherwise there'll be a LOGICAL_ERROR "Not-ready Set is passed" on subqueries.)
+    virtual void fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node * predicate, std::vector<UInt8> columns_mask) const = 0;
+
+    /// Columns to which fillData() applies the `predicate`.
+    virtual Block getFilterSampleBlock() const
+    {
+        return {};
+    }
+
+    virtual bool supportsColumnsMask() const { return false; }
+
+    friend class ReadFromSystemOneBlock;
 
 public:
-    IStorageSystemOneBlock(const String & name_) : IStorage({"system", name_})
+    explicit IStorageSystemOneBlock(const StorageID & table_id_, ColumnsDescription columns_description) : StorageWithCommonVirtualColumns(table_id_)
     {
-        StorageInMemoryMetadata metadata_;
-        metadata_.setColumns(ColumnsDescription(Self::getNamesAndTypes()));
-        setInMemoryMetadata(metadata_);
+        StorageInMemoryMetadata storage_metadata;
+        storage_metadata.setColumns(std::move(columns_description));
+        storage_metadata.setVirtuals(createVirtuals());
+        setInMemoryMetadata(storage_metadata);
     }
 
-    Pipes read(
+    static VirtualColumnsDescription createVirtuals();
+
+    void readImpl(
+        QueryPlan & query_plan,
         const Names & column_names,
-        const StorageMetadataPtr & metadata_snapshot,
-        const SelectQueryInfo & query_info,
-        const Context & context,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
         QueryProcessingStage::Enum /*processed_stage*/,
         size_t /*max_block_size*/,
-        unsigned /*num_streams*/) override
-    {
-        metadata_snapshot->check(column_names, getVirtuals(), getStorageID());
+        size_t /*num_streams*/) override;
 
-        Block sample_block = metadata_snapshot->getSampleBlock();
-        MutableColumns res_columns = sample_block.cloneEmptyColumns();
-        fillData(res_columns, context, query_info);
+    bool isSystemStorage() const override { return true; }
 
-        UInt64 num_rows = res_columns.at(0)->size();
-        Chunk chunk(std::move(res_columns), num_rows);
-
-        Pipes pipes;
-        pipes.emplace_back(std::make_shared<SourceFromSingleChunk>(sample_block, std::move(chunk)));
-
-        return pipes;
-    }
+    static NamesAndAliases getNamesAndAliases() { return {}; }
 };
 
 }

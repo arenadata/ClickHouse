@@ -1,4 +1,4 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/Context.h>
 #include <DataTypes/DataTypeString.h>
@@ -7,6 +7,8 @@
 
 namespace DB
 {
+namespace
+{
 
 class FunctionCurrentUser : public IFunction
 {
@@ -14,9 +16,9 @@ class FunctionCurrentUser : public IFunction
 
 public:
     static constexpr auto name = "currentUser";
-    static FunctionPtr create(const Context & context)
+    static FunctionPtr create(ContextPtr context)
     {
-        return std::make_shared<FunctionCurrentUser>(context.getClientInfo().initial_user);
+        return std::make_shared<FunctionCurrentUser>(context->getClientInfo().initial_user);
     }
 
     explicit FunctionCurrentUser(const String & user_name_) : user_name{user_name_}
@@ -39,17 +41,54 @@ public:
 
     bool isDeterministic() const override { return false; }
 
-    void executeImpl(Block & block, const ColumnNumbers &, size_t result, size_t input_rows_count) override
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
+    bool allowsOmittingParentheses() const override { return true; }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
     {
-        block.getByPosition(result).column = DataTypeString().createColumnConst(input_rows_count, user_name);
+        return DataTypeString().createColumnConst(input_rows_count, user_name);
     }
 };
 
+}
 
-void registerFunctionCurrentUser(FunctionFactory & factory)
+REGISTER_FUNCTION(CurrentUser)
 {
-    factory.registerFunction<FunctionCurrentUser>();
-    factory.registerAlias("user", FunctionCurrentUser::name, FunctionFactory::CaseInsensitive);
+    FunctionDocumentation::Description description = R"(
+Returns the name of the current user.
+In case of a distributed query, the name of the user who initiated the query is returned.
+    )";
+    FunctionDocumentation::Syntax syntax = "currentUser()";
+    FunctionDocumentation::Arguments arguments = {};
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the name of the current user, otherwise the login of the user who initiated the query.", {"String"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example", R"(
+SELECT currentUser()
+        )",
+        R"(
+┌─currentUser()─┐
+│ default       │
+└───────────────┘
+        )"
+    },
+        {"SQL standard syntax without parentheses", R"(
+SELECT CURRENT_USER
+        )",
+        R"(
+┌─CURRENT_USER─┐
+│ default      │
+└──────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionCurrentUser>(documentation);
+    factory.registerAlias("user", FunctionCurrentUser::name, FunctionFactory::Case::Insensitive);
+    factory.registerAlias("current_user", FunctionCurrentUser::name, FunctionFactory::Case::Insensitive);
 }
 
 }

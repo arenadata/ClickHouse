@@ -1,6 +1,8 @@
 #pragma once
-#include <memory>
+
+#include <Core/Block_fwd.h>
 #include <atomic>
+#include <memory>
 
 namespace DB
 {
@@ -10,7 +12,7 @@ class Chunk;
 class QueryPipeline;
 class PipelineExecutor;
 class PullingOutputFormat;
-struct BlockStreamProfileInfo;
+struct ProfileInfo;
 
 using PipelineExecutorPtr = std::shared_ptr<PipelineExecutor>;
 
@@ -28,6 +30,7 @@ public:
 
     /// Get structure of returned block or chunk.
     const Block & getHeader() const;
+    const SharedHeader & getSharedHeader() const;
 
     /// Methods return false if query is finished.
     /// You can use any pull method.
@@ -46,7 +49,7 @@ public:
     Block getExtremesBlock();
 
     /// Get query profile info.
-    BlockStreamProfileInfo & getProfileInfo();
+    ProfileInfo & getProfileInfo();
 
 private:
     std::atomic_bool has_data_flag = false;

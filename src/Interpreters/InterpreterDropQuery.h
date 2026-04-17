@@ -10,27 +10,40 @@ namespace DB
 {
 class Context;
 using DatabaseAndTable = std::pair<DatabasePtr, StoragePtr>;
+class AccessRightsElements;
 
 /** Allow to either drop table with all its data (DROP),
   * or remove information about table (just forget) from server (DETACH),
   * or just clear all data in table (TRUNCATE).
   */
-class InterpreterDropQuery : public IInterpreter
+class InterpreterDropQuery : public IInterpreter, WithMutableContext
 {
 public:
-    InterpreterDropQuery(const ASTPtr & query_ptr_, Context & context_);
+    InterpreterDropQuery(const ASTPtr & query_ptr_, ContextMutablePtr context_);
 
     /// Drop table or database.
     BlockIO execute() override;
 
+    static void executeDropQuery(ASTDropQuery::Kind kind, ContextPtr global_context, ContextPtr current_context,
+                                 const StorageID & target_table_id, bool sync, bool ignore_sync_setting = false, bool need_ddl_guard = false);
+
+    bool supportsTransactions() const override;
+
+    void extendQueryLogElemImpl(QueryLogElement & elem, const ASTPtr & ast, ContextPtr context_) const override;
+
 private:
     AccessRightsElements getRequiredAccessForDDLOnCluster() const;
     ASTPtr query_ptr;
-    Context & context;
+    ASTPtr current_query_ptr;
 
-    BlockIO executeToDatabase(const String & database_name, ASTDropQuery::Kind kind, bool if_exists);
+    BlockIO executeSingleDropQuery(const ASTPtr & drop_query_ptr);
+    BlockIO executeToDatabase(const ASTDropQuery & query);
+    BlockIO executeToDatabaseImpl(const ASTDropQuery & query, DatabasePtr & database, std::vector<UUID> & uuids_to_wait);
 
-    BlockIO executeToTable(const StorageID & table_id, const ASTDropQuery & query);
+    BlockIO executeToTable(ASTDropQuery & query);
+    BlockIO executeToTableImpl(const ContextPtr& context_, ASTDropQuery & query, DatabasePtr & db, UUID & uuid_to_wait);
+
+    static void waitForTableToBeActuallyDroppedOrDetached(const ASTDropQuery & query, const DatabasePtr & db, const UUID & uuid_to_wait, ContextPtr context_);
 
     BlockIO executeToDictionary(const String & database_name, const String & dictionary_name, ASTDropQuery::Kind kind, bool if_exists, bool is_temporary, bool no_ddl_lock);
 

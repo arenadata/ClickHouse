@@ -1,45 +1,51 @@
 #pragma once
 
-#include <Core/Block.h>
-#include <IO/WriteBuffer.h>
-#include <Processors/Formats/IRowOutputFormat.h>
+#include <Processors/Formats/OutputFormatWithUTF8ValidationAdaptor.h>
+#include <Processors/Formats/RowOutputFormatWithExceptionHandlerAdaptor.h>
 #include <Formats/FormatSettings.h>
 
 
 namespace DB
 {
 
-/** The stream for outputting data in JSON format, by object per line.
-  * Does not validate UTF-8.
+class Block;
+class WriteBuffer;
+
+/** The stream for outputting data in JSON format, by JSON array per line.
   */
-class JSONCompactEachRowRowOutputFormat : public IRowOutputFormat
+class JSONCompactEachRowRowOutputFormat : public RowOutputFormatWithExceptionHandlerAdaptor<RowOutputFormatWithUTF8ValidationAdaptor, bool>
 {
 public:
-    JSONCompactEachRowRowOutputFormat(WriteBuffer & out_, const Block & header_, FormatFactory::WriteCallback callback, const FormatSettings & settings_, bool with_names);
+    JSONCompactEachRowRowOutputFormat(
+        WriteBuffer & out_,
+        SharedHeader header_,
+        const FormatSettings & settings_,
+        bool with_names_,
+        bool with_types_);
 
     String getName() const override { return "JSONCompactEachRowRowOutputFormat"; }
 
+    bool supportsSpecialSerializationKinds() const override { return settings.allow_special_serialization_kinds; }
+
+protected:
     void writePrefix() override;
 
-    void writeBeforeTotals() override {}
     void writeTotals(const Columns & columns, size_t row_num) override;
-    void writeAfterTotals() override {}
 
-    void writeField(const IColumn & column, const IDataType & type, size_t row_num) override;
+    void writeField(const IColumn & column, const ISerialization & serialization, size_t row_num) override;
     void writeFieldDelimiter() override;
     void writeRowStartDelimiter() override;
     void writeRowEndDelimiter() override;
+    void writeSuffix() override;
 
-protected:
-    void consumeTotals(Chunk) override;
-    /// No extremes.
-    void consumeExtremes(Chunk) override {}
+    void resetFormatterImpl() override;
 
-private:
+    void writeLine(const std::vector<String> & values);
+
     FormatSettings settings;
-
-    NamesAndTypes fields;
-
     bool with_names;
+    bool with_types;
+    WriteBuffer * ostr;
 };
+
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Core/Block_fwd.h>
+#include <Processors/Chunk.h>
 #include <Processors/IProcessor.h>
 
 
@@ -18,6 +20,7 @@ protected:
 
     Chunk current_input_chunk;
     Chunk current_output_chunk;
+    Chunk totals;
     bool has_input = false;
     bool finished_input = false;
     bool finished_generate = false;
@@ -30,7 +33,7 @@ protected:
     void finishConsume() { finished_input = true; }
 
 public:
-    IAccumulatingTransform(Block input_header, Block output_header);
+    IAccumulatingTransform(SharedHeader input_header, SharedHeader output_header);
 
     Status prepare() override;
     void work() override;

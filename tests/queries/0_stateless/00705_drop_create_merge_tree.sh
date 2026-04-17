@@ -1,26 +1,14 @@
 #!/usr/bin/env bash
-set -e
+# Tags: no-fasttest, no-msan, no-flaky-check, no-parallel
+# msan: too slow
+# no-parallel: thread starvation leads to flakiness
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
-function stress()
-{
-    while true; do
-        ${CLICKHOUSE_CLIENT} --query "CREATE TABLE IF NOT EXISTS table (x UInt8) ENGINE = MergeTree ORDER BY tuple()" 2>/dev/null
-        ${CLICKHOUSE_CLIENT} --query "DROP TABLE table" 2>/dev/null
-    done
-}
-
-# https://stackoverflow.com/questions/9954794/execute-a-shell-function-with-timeout
-export -f stress
-
-for thread in {1..5}; do
-    # Ten seconds are just barely enough to reproduce the issue in most of runs.
-    timeout 10 bash -c stress &
-done
-
+yes 'CREATE TABLE IF NOT EXISTS table (x UInt8) ENGINE = MergeTree ORDER BY tuple();' | head -n 1000 | $CLICKHOUSE_CLIENT &
+yes 'DROP TABLE IF EXISTS table;' | head -n 1000 | $CLICKHOUSE_CLIENT &
 wait
-echo
 
-${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS table";
+${CLICKHOUSE_CLIENT} --query "DROP TABLE IF EXISTS table"

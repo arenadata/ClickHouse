@@ -1,41 +1,52 @@
 ---
-toc_priority: 70
-toc_title: Third-Party Libraries Used
+description: 'Page describing ClickHouse third-party usage and how to add and maintain
+  third-party libraries.'
+sidebar_label: 'Third-Party Libraries'
+sidebar_position: 60
+slug: /development/contrib
+title: 'Third-Party Libraries'
+doc_type: 'reference'
 ---
 
-# Third-Party Libraries Used {#third-party-libraries-used}
+# Third-Party Libraries
 
-| Library             | License                                                                                                                                      |
-|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
-| base64              | [BSD 2-Clause License](https://github.com/aklomp/base64/blob/a27c565d1b6c676beaf297fe503c4518185666f7/LICENSE)                               |
-| boost               | [Boost Software License 1.0](https://github.com/ClickHouse-Extras/boost-extra/blob/6883b40449f378019aec792f9983ce3afc7ff16e/LICENSE_1_0.txt) |
-| brotli              | [MIT](https://github.com/google/brotli/blob/master/LICENSE)                                                                                  |
-| capnproto           | [MIT](https://github.com/capnproto/capnproto/blob/master/LICENSE)                                                                            |
-| cctz                | [Apache License 2.0](https://github.com/google/cctz/blob/4f9776a310f4952454636363def82c2bf6641d5f/LICENSE.txt)                               |
-| double-conversion   | [BSD 3-Clause License](https://github.com/google/double-conversion/blob/cf2f0f3d547dc73b4612028a155b80536902ba02/LICENSE)                    |
-| FastMemcpy          | [MIT](https://github.com/ClickHouse/ClickHouse/blob/master/libs/libmemcpy/impl/LICENSE)                                                      |
-| googletest          | [BSD 3-Clause License](https://github.com/google/googletest/blob/master/LICENSE)                                                             |
-| h3                  | [Apache License 2.0](https://github.com/uber/h3/blob/master/LICENSE)                                                                         |
-| hyperscan           | [BSD 3-Clause License](https://github.com/intel/hyperscan/blob/master/LICENSE)                                                               |
-| libbtrie            | [BSD 2-Clause License](https://github.com/ClickHouse/ClickHouse/blob/master/contrib/libbtrie/LICENSE)                                        |
-| libcxxabi           | [BSD + MIT](https://github.com/ClickHouse/ClickHouse/blob/master/libs/libglibc-compatibility/libcxxabi/LICENSE.TXT)                          |
-| libdivide           | [Zlib License](https://github.com/ClickHouse/ClickHouse/blob/master/contrib/libdivide/LICENSE.txt)                                           |
-| libgsasl            | [LGPL v2.1](https://github.com/ClickHouse-Extras/libgsasl/blob/3b8948a4042e34fb00b4fb987535dc9e02e39040/LICENSE)                             |
-| libhdfs3            | [Apache License 2.0](https://github.com/ClickHouse-Extras/libhdfs3/blob/bd6505cbb0c130b0db695305b9a38546fa880e5a/LICENSE.txt)                |
-| libmetrohash        | [Apache License 2.0](https://github.com/ClickHouse/ClickHouse/blob/master/contrib/libmetrohash/LICENSE)                                      |
-| libpcg-random       | [Apache License 2.0](https://github.com/ClickHouse/ClickHouse/blob/master/contrib/libpcg-random/LICENSE-APACHE.txt)                          |
-| libressl            | [OpenSSL License](https://github.com/ClickHouse-Extras/ssl/blob/master/COPYING)                                                              |
-| librdkafka          | [BSD 2-Clause License](https://github.com/edenhill/librdkafka/blob/363dcad5a23dc29381cc626620e68ae418b3af19/LICENSE)                         |
-| libwidechar\_width  | [CC0 1.0 Universal](https://github.com/ClickHouse/ClickHouse/blob/master/libs/libwidechar_width/LICENSE)                                     |
-| llvm                | [BSD 3-Clause License](https://github.com/ClickHouse-Extras/llvm/blob/163def217817c90fb982a6daf384744d8472b92b/llvm/LICENSE.TXT)             |
-| lz4                 | [BSD 2-Clause License](https://github.com/lz4/lz4/blob/c10863b98e1503af90616ae99725ecd120265dfb/LICENSE)                                     |
-| mariadb-connector-c | [LGPL v2.1](https://github.com/ClickHouse-Extras/mariadb-connector-c/blob/3.1/COPYING.LIB)                                                   |
-| murmurhash          | [Public Domain](https://github.com/ClickHouse/ClickHouse/blob/master/contrib/murmurhash/LICENSE)                                             |
-| pdqsort             | [Zlib License](https://github.com/ClickHouse/ClickHouse/blob/master/contrib/pdqsort/license.txt)                                             |
-| poco                | [Boost Software License - Version 1.0](https://github.com/ClickHouse-Extras/poco/blob/fe5505e56c27b6ecb0dcbc40c49dc2caf4e9637f/LICENSE)      |
-| protobuf            | [BSD 3-Clause License](https://github.com/ClickHouse-Extras/protobuf/blob/12735370922a35f03999afff478e1c6d7aa917a4/LICENSE)                  |
-| re2                 | [BSD 3-Clause License](https://github.com/google/re2/blob/7cf8b88e8f70f97fd4926b56aa87e7f53b2717e0/LICENSE)                                  |
-| sentry-native       | [MIT License](https://github.com/getsentry/sentry-native/blob/master/LICENSE)                                                                 |
-| UnixODBC            | [LGPL v2.1](https://github.com/ClickHouse-Extras/UnixODBC/tree/b0ad30f7f6289c12b76f04bfb9d466374bb32168)                                     |
-| zlib-ng             | [Zlib License](https://github.com/ClickHouse-Extras/zlib-ng/blob/develop/LICENSE.md)                                                         |
-| zstd                | [BSD 3-Clause License](https://github.com/facebook/zstd/blob/dev/LICENSE)                                                                    |
+ClickHouse utilizes third-party libraries for different purposes, e.g., to connect to other databases, to decode/encode data during load/save from/to disk, or to implement certain specialized SQL functions.
+To be independent of the available libraries in the target system, each third-party library is imported as a Git submodule into ClickHouse's source tree and compiled and linked with ClickHouse.
+A list of third-party libraries and their licenses can be obtained by the following query:
+
+```sql
+SELECT library_name, license_type, license_path FROM system.licenses ORDER BY library_name COLLATE 'en';
+```
+
+Note that the listed libraries are the ones located in the `contrib/` directory of the ClickHouse repository.
+Depending on the build options, some of the libraries may have not been compiled, and, as a result, their functionality may not be available at runtime.
+
+[Example](https://sql.clickhouse.com?query_id=478GCPU7LRTSZJBNY3EJT3)
+
+## Adding and maintaining third-party libraries {#adding-and-maintaining-third-party-libraries}
+
+Each third-party library must reside in a dedicated directory under the `contrib/` directory of the ClickHouse repository.
+Avoid dumping copies of external code into the library directory.
+Instead create a Git submodule to pull third-party code from an external upstream repository.
+
+All submodules used by ClickHouse are listed in the `.gitmodule` file.
+- If the library can be used as-is (the default case), you can reference the upstream repository directly.
+- If the library needs patching, create a fork of the upstream repository in the [ClickHouse organization on GitHub](https://github.com/ClickHouse).
+
+In the latter case, we aim to isolate custom patches as much as possible from upstream commits.
+To that end, create a branch with prefix `ClickHouse/` from the branch or tag you want to integrate, e.g. `ClickHouse/2024_2` (for branch `2024_2`) or `ClickHouse/release/vX.Y.Z` (for tag `release/vX.Y.Z`).
+Avoid following upstream development branches `master`/ `main` / `dev` (i.e., prefix branches `ClickHouse/master` / `ClickHouse/main` / `ClickHouse/dev` in the fork repository).
+Such branches are moving targets which make proper versioning harder.
+"Prefix branches" ensure that pulls from the upstream repository into the fork will leave custom `ClickHouse/` branches unaffected.
+Submodules in `contrib/` must only track `ClickHouse/` branches of forked third-party repositories.
+
+Patches are only applied against `ClickHouse/` branches of external libraries.
+
+There are two ways to do that:
+- you like to make a new fix against a `ClickHouse/`-prefix branch in the forked repository, e.g. a sanitizer fix. In that case, push the fix as a branch with `ClickHouse/` prefix, e.g. `ClickHouse/fix-sanitizer-disaster`. Then create a PR from the new branch against the custom tracking branch, e.g. `ClickHouse/2024_2 <-- ClickHouse/fix-sanitizer-disaster` and merge the PR.
+- you update the submodule and need to re-apply earlier patches. In this case, re-creating old PRs is overkill. Instead, simply cherry-pick older commits into the new `ClickHouse/` branch (corresponding to the new version). Feel free to squash commits of PRs that had multiple commits. In the best case, we did contribute custom patches back to upstream and can omit patches in the new version.
+
+Once the submodule has been updated, bump the submodule in ClickHouse to point to the new hash in the fork.
+
+Create patches of third-party libraries with the official repository in mind and consider contributing the patch back to the upstream repository.
+This makes sure that others will also benefit from the patch and it will not be a maintenance burden for the ClickHouse team.

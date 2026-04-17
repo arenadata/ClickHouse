@@ -1,5 +1,4 @@
-#include <Functions/IFunctionImpl.h>
-#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
 #include <Functions/castTypeToEither.h>
 #include <Functions/FunctionFactory.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -10,12 +9,14 @@
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int ILLEGAL_COLUMN;
 }
+
+namespace
+{
 
 /// Returns 1 if argument is zero or NULL.
 /// It can be used to negate filter in WHERE condition.
@@ -25,7 +26,7 @@ class FunctionIsZeroOrNull : public IFunction
 public:
     static constexpr auto name = "isZeroOrNull";
 
-    static FunctionPtr create(const Context &)
+    static FunctionPtr create(ContextPtr)
     {
         return std::make_shared<FunctionIsZeroOrNull>();
     }
@@ -38,20 +39,26 @@ public:
     size_t getNumberOfArguments() const override { return 1; }
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     ColumnNumbers getArgumentsThatDontImplyNullableReturnType(size_t /*number_of_arguments*/) const override { return {0}; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & types) const override
     {
-        if (!isNumber(removeNullable(types.at(0))))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The argument of function {} must have simple numeric type, possibly Nullable", name);
+        if (!isNumber(removeNullable(types.at(0))) && !isNothing(removeNullable(types.at(0))))
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS, "The argument of function {} must have simple numeric type, possibly Nullable or Null", name);
 
         return std::make_shared<DataTypeUInt8>();
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        const ColumnPtr & input_column = block.getByPosition(arguments[0]).column;
+        if (isNothing(removeNullable(arguments[0].type)))
+            return DataTypeUInt8{}.createColumnConst(input_rows_count, 1);
 
+        const ColumnPtr & input_column = arguments[0].column;
+
+        ColumnPtr res;
         if (const ColumnNullable * input_column_nullable = checkAndGetColumn<ColumnNullable>(input_column.get()))
         {
             const NullMap & null_map = input_column_nullable->getNullMapData();
@@ -63,13 +70,16 @@ public:
                 ColumnFloat32, ColumnFloat64>(
                 nested_column, [&](const auto & column)
                 {
-                    auto res = ColumnUInt8::create(input_rows_count);
-                    processNullable(column.getData(), null_map, res->getData(), input_rows_count);
-                    block.getByPosition(result).column = std::move(res);
+                    auto col = ColumnUInt8::create(input_rows_count);
+                    processNullable(column.getData(), null_map, col->getData(), input_rows_count);
+                    res = std::move(col);
                     return true;
                 }))
             {
-                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "The argument of function {} must have simple numeric type, possibly Nullable", name);
+                throw Exception(
+                    ErrorCodes::ILLEGAL_COLUMN,
+                    "The argument of function {} must have simple numeric type, possibly Nullable or Null",
+                    name);
             }
         }
         else
@@ -80,39 +90,80 @@ public:
                 ColumnFloat32, ColumnFloat64>(
                 input_column.get(), [&](const auto & column)
                 {
-                    auto res = ColumnUInt8::create(input_rows_count);
-                    processNotNullable(column.getData(), res->getData(), input_rows_count);
-                    block.getByPosition(result).column = std::move(res);
+                    auto col = ColumnUInt8::create(input_rows_count);
+                    processNotNullable(column.getData(), col->getData(), input_rows_count);
+                    res = std::move(col);
                     return true;
                 }))
             {
-                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "The argument of function {} must have simple numeric type, possibly Nullable", name);
+                throw Exception(
+                    ErrorCodes::ILLEGAL_COLUMN,
+                    "The argument of function {} must have simple numeric type, possibly Nullable or Null",
+                    name);
             }
         }
+
+        return res;
     }
 
 private:
     template <typename InputData>
-    void processNotNullable(const InputData & input_data, ColumnUInt8::Container & result_data, size_t input_rows_count)
+    void processNotNullable(const InputData & input_data, ColumnUInt8::Container & result_data, size_t input_rows_count) const
     {
         for (size_t i = 0; i < input_rows_count; ++i)
-            result_data[i] = !input_data[i];
+            result_data[i] = input_data[i] == 0;
     }
 
     template <typename InputData>
     void processNullable(const InputData & input_data, const NullMap & input_null_map,
-        ColumnUInt8::Container & result_data, size_t input_rows_count)
+        ColumnUInt8::Container & result_data, size_t input_rows_count) const
     {
         for (size_t i = 0; i < input_rows_count; ++i)
-            result_data[i] = input_null_map[i] || !input_data[i];
+            result_data[i] = input_null_map[i] || input_data[i] == 0;
     }
 };
 
+}
 
-void registerFunctionIsZeroOrNull(FunctionFactory & factory)
+REGISTER_FUNCTION(IsZeroOrNull)
 {
-    factory.registerFunction<FunctionIsZeroOrNull>();
+    FunctionDocumentation::Description description = R"(
+Checks if the argument is either zero (`0`) or `NULL`.
+    )";
+    FunctionDocumentation::Syntax syntax = "isZeroOrNull(x)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "A numeric value.", {"UInt"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `1` if `x` is `NULL` or equal to zero, otherwise `0`.", {"UInt8/16/32/64", "Float32/Float64"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+CREATE TABLE t_null
+(
+  x Int32,
+  y Nullable(Int32)
+)
+ENGINE = MergeTree
+ORDER BY tuple();
+
+INSERT INTO t_null VALUES (1, NULL), (2, 0), (3, 3);
+
+SELECT x FROM t_null WHERE isZeroOrNull(y);
+        )",
+        R"(
+┌─x─┐
+│ 1 │
+│ 2 │
+└───┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 3};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Null;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionIsZeroOrNull>(documentation);
 }
 
 }
-

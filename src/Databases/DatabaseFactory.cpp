@@ -1,30 +1,29 @@
-#include <Databases/DatabaseAtomic.h>
-#include <Databases/DatabaseDictionary.h>
+#include <filesystem>
+
+#include <Core/Settings.h>
 #include <Databases/DatabaseFactory.h>
-#include <Databases/DatabaseLazy.h>
-#include <Databases/DatabaseMemory.h>
-#include <Databases/DatabaseOrdinary.h>
-#include <Parsers/ASTLiteral.h>
-#include <Parsers/ASTIdentifier.h>
-#include <Parsers/formatAST.h>
+#include <Databases/DatabaseReplicated.h>
+
+#if CLICKHOUSE_CLOUD
+#include <Databases/DatabaseShared.h>
+#endif
+
+#include <Interpreters/Context.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
-#include <Common/parseAddress.h>
-#include "DatabaseFactory.h"
-#include <Poco/File.h>
+#include <Parsers/ASTLiteral.h>
+#include <Common/Macros.h>
+#include <Common/filesystemHelpers.h>
 
-#if !defined(ARCADIA_BUILD)
-#    include "config_core.h"
-#endif
 
-#if USE_MYSQL
-#    include <Databases/DatabaseMySQL.h>
-#    include <Interpreters/evaluateConstantExpression.h>
-#endif
-
+namespace fs = std::filesystem;
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool log_queries;
+}
 
 namespace ErrorCodes
 {
@@ -32,113 +31,144 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int UNKNOWN_DATABASE_ENGINE;
     extern const int CANNOT_CREATE_DATABASE;
+    extern const int LOGICAL_ERROR;
 }
 
-DatabasePtr DatabaseFactory::get(
-    const String & database_name, const String & metadata_path, const ASTStorage * engine_define, Context & context)
+void cckMetadataPathForOrdinary(const ASTCreateQuery & create, const String & metadata_path)
 {
-    bool created = false;
+    auto default_db_disk = Context::getGlobalContextInstance()->getDatabaseDisk();
 
-    try
-    {
-        created = Poco::File(metadata_path).createDirectory();
-        return getImpl(database_name, metadata_path, engine_define, context);
-    }
-    catch (...)
-    {
-        Poco::File metadata_dir(metadata_path);
+    if (!default_db_disk->isSymlinkSupported())
+        return;
 
-        if (created && metadata_dir.exists())
-            metadata_dir.remove(true);
+    const String & engine_name = create.storage->engine->name;
+    const String & database_name = create.getDatabase();
 
-        throw;
-    }
+    if (engine_name != "Ordinary")
+        return;
+
+    if (!default_db_disk->isSymlink(metadata_path))
+        return;
+
+    String target_path = default_db_disk->readSymlink(metadata_path);
+    fs::path path_to_remove = metadata_path;
+    if (path_to_remove.filename().empty())
+        path_to_remove = path_to_remove.parent_path();
+
+    /// Before 20.7 metadata/db_name.sql file might absent and Ordinary database was attached if there's metadata/db_name/ dir.
+    /// Between 20.7 and 22.7 metadata/db_name.sql was created in this case as well.
+    /// Since 20.7 `default` database is created with Atomic engine on the very first server run.
+    /// The problem is that if server crashed during the very first run and metadata/db_name/ -> store/whatever symlink was created
+    /// then it's considered as Ordinary database. And it even works somehow
+    /// until background task tries to remove unused dir from store/...
+    throw Exception(ErrorCodes::CANNOT_CREATE_DATABASE,
+                    "Metadata directory {} for Ordinary database {} is a symbolic link to {}. "
+                    "It may be a result of manual intervention, crash on very first server start or a bug. "
+                    "Database cannot be attached (it's kind of protection from potential data loss). "
+                    "Metadata directory must not be a symlink and must contain tables metadata files itself. "
+                    "You have to resolve this manually. It can be done like this: rm {}; sudo -u clickhouse mv {} {};",
+                    metadata_path, database_name, target_path,
+                    quoteString(path_to_remove.string()), quoteString(target_path), quoteString(path_to_remove.string()));
+
 }
 
-template <typename ValueType>
-static inline ValueType safeGetLiteralValue(const ASTPtr &ast, const String &engine_name)
+void DatabaseFactory::validate(const ASTCreateQuery & create_query) const
 {
-    if (!ast || !ast->as<ASTLiteral>())
-        throw Exception("Database engine " + engine_name + " requested literal argument.", ErrorCodes::BAD_ARGUMENTS);
+    auto * storage = create_query.storage;
 
-    return ast->as<ASTLiteral>()->value.safeGet<ValueType>();
+    const String & engine_name = storage->engine->name;
+    const EngineFeatures & engine_features = database_engines.at(engine_name).features;
+
+    /// Check engine may have arguments
+    if (storage->engine->arguments && !engine_features.supports_arguments)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Database engine `{}` cannot have arguments", engine_name);
+
+    /// Check engine may have settings
+    bool has_unexpected_element = storage->engine->parameters || storage->partition_by ||
+        storage->primary_key || storage->order_by ||
+        storage->sample_by;
+    if (has_unexpected_element || (!engine_features.supports_settings && storage->settings))
+        throw Exception(ErrorCodes::UNKNOWN_ELEMENT_IN_AST,
+                        "Database engine `{}` cannot have parameters, primary_key, order_by, sample_by, settings", engine_name);
+
+    /// Check engine with table overrides
+    if (create_query.table_overrides && !engine_features.supports_table_overrides)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Database engine `{}` cannot have table overrides", engine_name);
 }
 
-DatabasePtr DatabaseFactory::getImpl(
-    const String & database_name, const String & metadata_path, const ASTStorage * engine_define, Context & context)
+DatabasePtr DatabaseFactory::get(const ASTCreateQuery & create, const String & metadata_path, ContextPtr context)
 {
-    String engine_name = engine_define->engine->name;
-
-    if (engine_name != "MySQL" && engine_name != "Lazy" && engine_define->engine->arguments)
-        throw Exception("Database engine " + engine_name + " cannot have arguments", ErrorCodes::BAD_ARGUMENTS);
-
-    if (engine_define->engine->parameters || engine_define->partition_by || engine_define->primary_key || engine_define->order_by ||
-        engine_define->sample_by || engine_define->settings)
-        throw Exception("Database engine " + engine_name + " cannot have parameters, primary_key, order_by, sample_by, settings",
-                        ErrorCodes::UNKNOWN_ELEMENT_IN_AST);
-
-    if (engine_name == "Ordinary")
-        return std::make_shared<DatabaseOrdinary>(database_name, metadata_path, context);
-    else if (engine_name == "Atomic")
-        return std::make_shared<DatabaseAtomic>(database_name, metadata_path, context);
-    else if (engine_name == "Memory")
-        return std::make_shared<DatabaseMemory>(database_name, context);
-    else if (engine_name == "Dictionary")
-        return std::make_shared<DatabaseDictionary>(database_name, context);
-
-#if USE_MYSQL
-
-    else if (engine_name == "MySQL")
+    const auto engine_name = create.storage->engine->name;
+    /// check if the database engine is a valid one before proceeding
+    if (!database_engines.contains(engine_name))
     {
-        const ASTFunction * engine = engine_define->engine;
-
-        if (!engine->arguments || engine->arguments->children.size() != 4)
-            throw Exception("MySQL Database require mysql_hostname, mysql_database_name, mysql_username, mysql_password arguments.",
-                            ErrorCodes::BAD_ARGUMENTS);
-
-
-        ASTs & arguments = engine->arguments->children;
-        arguments[1] = evaluateConstantExpressionOrIdentifierAsLiteral(arguments[1], context);
-
-        const auto & host_name_and_port = safeGetLiteralValue<String>(arguments[0], "MySQL");
-        const auto & database_name_in_mysql = safeGetLiteralValue<String>(arguments[1], "MySQL");
-        const auto & mysql_user_name = safeGetLiteralValue<String>(arguments[2], "MySQL");
-        const auto & mysql_user_password = safeGetLiteralValue<String>(arguments[3], "MySQL");
-
-        try
-        {
-            const auto & [remote_host_name, remote_port] = parseAddress(host_name_and_port, 3306);
-            auto mysql_pool = mysqlxx::Pool(database_name_in_mysql, remote_host_name, mysql_user_name, mysql_user_password, remote_port);
-
-            auto mysql_database = std::make_shared<DatabaseMySQL>(
-                context, database_name, metadata_path, engine_define, database_name_in_mysql, std::move(mysql_pool));
-
-            mysql_database->empty(); /// test database is works fine.
-            return mysql_database;
-        }
-        catch (...)
-        {
-            const auto & exception_message = getCurrentExceptionMessage(true);
-            throw Exception("Cannot create MySQL database, because " + exception_message, ErrorCodes::CANNOT_CREATE_DATABASE);
-        }
+        auto hints = getHints(engine_name);
+        if (!hints.empty())
+            throw Exception(ErrorCodes::UNKNOWN_DATABASE_ENGINE, "Unknown database engine {}. Maybe you meant: {}", engine_name, toString(hints));
+        throw Exception(ErrorCodes::UNKNOWN_DATABASE_ENGINE, "Unknown database engine: {}", create.storage->engine->name);
     }
 
-#endif
+    /// if the engine is found (i.e. registered with the factory instance), then validate if the
+    /// supplied engine arguments, settings and table overrides are valid for the engine.
+    validate(create);
+    cckMetadataPathForOrdinary(create, metadata_path);
 
-    else if (engine_name == "Lazy")
-    {
-        const ASTFunction * engine = engine_define->engine;
+    DatabasePtr impl = getImpl(create, metadata_path, context);
 
-        if (!engine->arguments || engine->arguments->children.size() != 1)
-            throw Exception("Lazy database require cache_expiration_time_seconds argument", ErrorCodes::BAD_ARGUMENTS);
+    if (impl && context->hasQueryContext() && context->getSettingsRef()[Setting::log_queries])
+        context->getQueryContext()->addQueryFactoriesInfo(Context::QueryLogFactories::Database, impl->getEngineName());
 
-        const auto & arguments = engine->arguments->children;
+    /// Attach database metadata
+    if (impl && create.comment)
+        impl->setDatabaseComment(create.comment->as<ASTLiteral>()->value.safeGet<String>());
 
-        const auto cache_expiration_time_seconds = safeGetLiteralValue<UInt64>(arguments[0], "Lazy");
-        return std::make_shared<DatabaseLazy>(database_name, metadata_path, cache_expiration_time_seconds, context);
-    }
+    return impl;
+}
 
-    throw Exception("Unknown database engine: " + engine_name, ErrorCodes::UNKNOWN_DATABASE_ENGINE);
+void DatabaseFactory::registerDatabase(const std::string & name, CreatorFn creator_fn, EngineFeatures features)
+{
+    if (!database_engines.emplace(name, Creator{std::move(creator_fn), features}).second)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "DatabaseFactory: the database engine name '{}' is not unique", name);
+}
+
+DatabaseFactory & DatabaseFactory::instance()
+{
+    static DatabaseFactory db_fact;
+    return db_fact;
+}
+
+bool DatabaseFactory::isDatabaseExternal(const String & engine_name) const
+{
+    auto it = database_engines.find(engine_name);
+    if (it == database_engines.end())
+        return false;
+    return it->second.features.is_external;
+}
+
+DatabasePtr DatabaseFactory::getImpl(const ASTCreateQuery & create, const String & metadata_path, ContextPtr context)
+{
+    auto * storage = create.storage;
+    const String & database_name = create.getDatabase();
+    const String & engine_name = storage->engine->name;
+
+    bool has_engine_args = false;
+    if (storage->engine->arguments)
+        has_engine_args = true;
+
+    ASTs empty_engine_args;
+    Arguments arguments{
+        .engine_name = engine_name,
+        .engine_args = has_engine_args ? storage->engine->arguments->children : empty_engine_args,
+        .create_query = create,
+        .database_name = database_name,
+        .metadata_path = metadata_path,
+        .uuid = create.uuid,
+        .context = context};
+
+    // creator_fn creates and returns a DatabasePtr with the supplied arguments
+    auto creator_fn = database_engines.at(engine_name).creator_fn;
+
+    return creator_fn(arguments);
 }
 
 }

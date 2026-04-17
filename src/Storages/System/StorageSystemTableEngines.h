@@ -1,18 +1,14 @@
 #pragma once
 
-#include <DataTypes/DataTypeString.h>
 #include <Storages/System/IStorageSystemOneBlock.h>
-#include <ext/shared_ptr_helper.h>
 
 namespace DB
 {
 
-class StorageSystemTableEngines final : public ext::shared_ptr_helper<StorageSystemTableEngines>,
-                                  public IStorageSystemOneBlock<StorageSystemTableEngines>
+class StorageSystemTableEngines final : public IStorageSystemOneBlock
 {
-    friend struct ext::shared_ptr_helper<StorageSystemTableEngines>;
 protected:
-    void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo & query_info) const override;
+    void fillData(MutableColumns & res_columns, ContextPtr, const ActionsDAG::Node *, std::vector<UInt8>) const override;
 
     using IStorageSystemOneBlock::IStorageSystemOneBlock;
 
@@ -22,7 +18,7 @@ public:
         return "SystemTableEngines";
     }
 
-    static NamesAndTypesList getNamesAndTypes();
+    static ColumnsDescription getColumnsDescription();
 };
 
 }

@@ -5,9 +5,9 @@
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnsNumber.h>
 
-#include "IValueSource.h"
-#include "IArraySource.h"
-#include "IArraySink.h"
+#include <Functions/GatherUtils/IValueSource.h>
+#include <Functions/GatherUtils/IArraySource.h>
+#include <Functions/GatherUtils/IArraySink.h>
 
 /** These methods are intended for implementation of functions, that
   *  copy ranges from one or more columns to another column.
@@ -30,35 +30,44 @@
 namespace DB::GatherUtils
 {
 
-enum class ArraySearchType
+enum class ArraySearchType : uint8_t
 {
-  Any, // Corresponds to the hasAny array function
-  All, // Corresponds to the hasAll array function
-  Substr // Corresponds to the hasSubstr array function
+    Any, // Corresponds to the hasAny array function
+    All, // Corresponds to the hasAll array function
+    Substr, // Corresponds to the hasSubstr array function
+    StartsWith,
+    EndsWith
 };
 
 std::unique_ptr<IArraySource> createArraySource(const ColumnArray & col, bool is_const, size_t total_rows);
 std::unique_ptr<IValueSource> createValueSource(const IColumn & col, bool is_const, size_t total_rows);
 std::unique_ptr<IArraySink> createArraySink(ColumnArray & col, size_t column_size);
 
-void concat(const std::vector<std::unique_ptr<IArraySource>> & sources, IArraySink & sink);
+ColumnArray::MutablePtr concat(const std::vector<std::unique_ptr<IArraySource>> & sources);
 
-void sliceFromLeftConstantOffsetUnbounded(IArraySource & src, IArraySink & sink, size_t offset);
-void sliceFromLeftConstantOffsetBounded(IArraySource & src, IArraySink & sink, size_t offset, ssize_t length);
+ColumnArray::MutablePtr sliceFromLeftConstantOffsetUnbounded(IArraySource & src, size_t offset);
+ColumnArray::MutablePtr sliceFromLeftConstantOffsetBounded(IArraySource & src, size_t offset, ssize_t length);
 
-void sliceFromRightConstantOffsetUnbounded(IArraySource & src, IArraySink & sink, size_t offset);
-void sliceFromRightConstantOffsetBounded(IArraySource & src, IArraySink & sink, size_t offset, ssize_t length);
+ColumnArray::MutablePtr sliceFromRightConstantOffsetUnbounded(IArraySource & src, size_t offset);
+ColumnArray::MutablePtr sliceFromRightConstantOffsetBounded(IArraySource & src, size_t offset, ssize_t length);
 
-void sliceDynamicOffsetUnbounded(IArraySource & src, IArraySink & sink, const IColumn & offset_column);
-void sliceDynamicOffsetBounded(IArraySource & src, IArraySink & sink, const IColumn & offset_column, const IColumn & length_column);
+ColumnArray::MutablePtr sliceDynamicOffsetUnbounded(IArraySource & src, const IColumn & offset_column);
+ColumnArray::MutablePtr sliceDynamicOffsetBounded(IArraySource & src, const IColumn & offset_column, const IColumn & length_column);
 
-void sliceHas(IArraySource & first, IArraySource & second, ArraySearchType & search_type, ColumnUInt8 & result);
+ColumnArray::MutablePtr sliceFromLeftDynamicLength(IArraySource & src, const IColumn & length_column);
+ColumnArray::MutablePtr sliceFromRightDynamicLength(IArraySource & src, const IColumn & length_column);
+
+void sliceHasAny(IArraySource & first, IArraySource & second, ColumnUInt8 & result);
+void sliceHasAll(IArraySource & first, IArraySource & second, ColumnUInt8 & result);
+void sliceHasSubstr(IArraySource & first, IArraySource & second, ColumnUInt8 & result);
+void sliceHasStartsWith(IArraySource & first, IArraySource & second, ColumnUInt8 & result);
+void sliceHasEndsWith(IArraySource & first, IArraySource & second, ColumnUInt8 & result);
+
+void sliceHas(IArraySource & first, IArraySource & second, ArraySearchType search_type, ColumnUInt8 & result);
 
 void push(IArraySource & array_source, IValueSource & value_source, IArraySink & sink, bool push_front);
 
 void resizeDynamicSize(IArraySource & array_source, IValueSource & value_source, IArraySink & sink, const IColumn & size_column);
-
 void resizeConstantSize(IArraySource & array_source, IValueSource & value_source, IArraySink & sink, ssize_t size);
 
 }
-

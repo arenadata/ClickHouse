@@ -1,5 +1,5 @@
 #include <iostream>
-#include <Core/Types.h>
+#include <base/types.h>
 #include <Common/ShellCommand.h>
 #include <IO/copyData.h>
 #include <IO/WriteBufferFromFileDescriptor.h>
@@ -28,7 +28,9 @@ TEST(ShellCommand, Execute)
 
 TEST(ShellCommand, ExecuteDirect)
 {
-    auto command = ShellCommand::executeDirect("/bin/echo", {"Hello, world!"});
+    ShellCommand::Config config("/bin/echo");
+    config.arguments = {"Hello, world!"};
+    auto command = ShellCommand::executeDirect(config);
 
     std::string res;
     readStringUntilEOF(res, command->out);
@@ -51,17 +53,4 @@ TEST(ShellCommand, ExecuteWithInput)
     command->wait();
 
     EXPECT_EQ(res, "Hello, world!\n");
-}
-
-TEST(ShellCommand, AutoWait)
-{
-    // <defunct> hunting:
-    for (int i = 0; i < 1000; ++i)
-    {
-        auto command = ShellCommand::execute("echo " + std::to_string(i));
-        //command->wait(); // now automatic
-    }
-
-    // std::cerr << "inspect me: ps auxwwf\n";
-    // std::this_thread::sleep_for(std::chrono::seconds(100));
 }

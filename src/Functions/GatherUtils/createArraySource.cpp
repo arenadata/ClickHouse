@@ -1,11 +1,14 @@
-#include "GatherUtils.h"
-#include "Sinks.h"
-#include "Sources.h"
-#include <Core/TypeListNumber.h>
+#include <Functions/GatherUtils/GatherUtils.h>
+#include <Functions/GatherUtils/Sinks.h>
+#include <Functions/GatherUtils/Sources.h>
+#include <base/TypeLists.h>
 
 namespace DB::GatherUtils
 {
 /// Creates IArraySource from ColumnArray
+
+namespace
+{
 
 template <typename... Types>
 struct ArraySourceCreator;
@@ -15,7 +18,7 @@ struct ArraySourceCreator<Type, Types...>
 {
     static std::unique_ptr<IArraySource> create(const ColumnArray & col, const NullMap * null_map, bool is_const, size_t total_rows)
     {
-        using ColVecType = std::conditional_t<IsDecimalNumber<Type>, ColumnDecimal<Type>, ColumnVector<Type>>;
+        using ColVecType = ColumnVectorOrDecimal<Type>;
 
         if (typeid_cast<const ColVecType *>(&col.getData()))
         {
@@ -51,9 +54,11 @@ struct ArraySourceCreator<>
     }
 };
 
+}
+
 std::unique_ptr<IArraySource> createArraySource(const ColumnArray & col, bool is_const, size_t total_rows)
 {
-    using Creator = typename ApplyTypeListForClass<ArraySourceCreator, TypeListNumbers>::Type;
+    using Creator = TypeListChangeRoot<ArraySourceCreator, TypeListNumberWithUUID>;
     if (const auto * column_nullable = typeid_cast<const ColumnNullable *>(&col.getData()))
     {
         auto column = ColumnArray::create(column_nullable->getNestedColumnPtr(), col.getOffsetsPtr());

@@ -1,55 +1,68 @@
 #pragma once
 
 #include <Access/IAccessStorage.h>
+#include <base/defines.h>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <boost/container/flat_set.hpp>
 
 
 namespace DB
 {
+class AccessChangesNotifier;
+
 /// Implementation of IAccessStorage which keeps all data in memory.
 class MemoryAccessStorage : public IAccessStorage
 {
 public:
-    MemoryAccessStorage(const String & storage_name_ = "memory");
+    static constexpr char STORAGE_TYPE[] = "memory";
+
+    explicit MemoryAccessStorage(const String & storage_name_, AccessChangesNotifier & changes_notifier_, bool allow_backup_);
+
+    const char * getStorageType() const override { return STORAGE_TYPE; }
+
+    /// Removes all entities except the specified list `ids_to_keep`.
+    /// The function skips IDs not contained in the storage.
+    void removeAllExcept(const std::vector<UUID> & ids_to_keep);
 
     /// Sets all entities at once.
     void setAll(const std::vector<AccessEntityPtr> & all_entities);
     void setAll(const std::vector<std::pair<UUID, AccessEntityPtr>> & all_entities);
+    void setAll(const std::vector<std::pair<UUID, AccessEntityPtr>> & all_entities, bool notify);
+
+    bool exists(const UUID & id) const override;
+
+    bool isBackupAllowed() const override { return backup_allowed; }
+
+    bool isEphemeral() const override { return true; }
 
 private:
-    std::optional<UUID> findImpl(EntityType type, const String & name) const override;
-    std::vector<UUID> findAllImpl(EntityType type) const override;
-    bool existsImpl(const UUID & id) const override;
-    AccessEntityPtr readImpl(const UUID & id) const override;
-    String readNameImpl(const UUID & id) const override;
-    bool canInsertImpl(const AccessEntityPtr &) const override { return true; }
-    UUID insertImpl(const AccessEntityPtr & entity, bool replace_if_exists) override;
-    void removeImpl(const UUID & id) override;
-    void updateImpl(const UUID & id, const UpdateFunc & update_func) override;
-    ext::scope_guard subscribeForChangesImpl(const UUID & id, const OnChangedHandler & handler) const override;
-    ext::scope_guard subscribeForChangesImpl(EntityType type, const OnChangedHandler & handler) const override;
-    bool hasSubscriptionImpl(const UUID & id) const override;
-    bool hasSubscriptionImpl(EntityType type) const override;
+    std::optional<UUID> findImpl(AccessEntityType type, const String & name) const override;
+    std::vector<UUID> findAllImpl(AccessEntityType type) const override;
+    AccessEntityPtr readImpl(const UUID & id, bool throw_if_not_exists) const override;
+    bool insertImpl(const UUID & id, const AccessEntityPtr & entity, bool replace_if_exists, bool throw_if_exists, UUID * conflicting_id) override;
+    bool removeImpl(const UUID & id, bool throw_if_not_exists) override;
+    bool updateImpl(const UUID & id, const UpdateFunc & update_func, bool throw_if_not_exists) override;
+
+    bool insertNoLock(const UUID & id, const AccessEntityPtr & entity, bool replace_if_exists, bool throw_if_exists, UUID * conflicting_id, bool notify = true);
+    bool removeNoLock(const UUID & id, bool throw_if_not_exists, bool notify = true);
+    bool updateNoLock(const UUID & id, const UpdateFunc & update_func, bool throw_if_not_exists, bool notify = true);
+
+    void removeAllExceptNoLock(const std::vector<UUID> & ids_to_keep);
+    void removeAllExceptNoLock(const boost::container::flat_set<UUID> & ids_to_keep);
 
     struct Entry
     {
         UUID id;
         AccessEntityPtr entity;
-        mutable std::list<OnChangedHandler> handlers_by_id;
     };
 
-    void insertNoLock(const UUID & id, const AccessEntityPtr & entity, bool replace_if_exists, Notifications & notifications);
-    void removeNoLock(const UUID & id, Notifications & notifications);
-    void updateNoLock(const UUID & id, const UpdateFunc & update_func, Notifications & notifications);
-    void setAllNoLock(const std::vector<std::pair<UUID, AccessEntityPtr>> & all_entities, Notifications & notifications);
-    void prepareNotifications(const Entry & entry, bool remove, Notifications & notifications) const;
-
-    mutable std::mutex mutex;
+    mutable std::recursive_mutex mutex; // Note: Reentrace possible via LDAPAccessStorage
     std::unordered_map<UUID, Entry> entries_by_id; /// We want to search entries both by ID and by the pair of name and type.
-    std::unordered_map<String, Entry *> entries_by_name_and_type[static_cast<size_t>(EntityType::MAX)];
-    mutable std::list<OnChangedHandler> handlers_by_type[static_cast<size_t>(EntityType::MAX)];
+    std::unordered_map<String, Entry *> entries_by_name_and_type[static_cast<size_t>(AccessEntityType::MAX)];
+    AccessChangesNotifier & changes_notifier;
+    const bool backup_allowed = false;
 };
 }

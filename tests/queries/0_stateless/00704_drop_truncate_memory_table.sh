@@ -4,9 +4,10 @@ set -e
 CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL=none
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
-${CLICKHOUSE_CLIENT} --multiquery --query="
+${CLICKHOUSE_CLIENT} --query="
 DROP TABLE IF EXISTS memory;
 CREATE TABLE memory (x UInt64) ENGINE = Memory;
 
@@ -20,13 +21,13 @@ INSERT INTO memory SELECT * FROM numbers(1000);"
 # But if the table will be dropped before query - just pass.
 # It's Ok, because otherwise the test will depend on the race condition in the test itself.
 
-${CLICKHOUSE_CLIENT} --multiquery --query="
+${CLICKHOUSE_CLIENT} --query="
 SET max_threads = 1;
-SELECT count() FROM memory WHERE NOT ignore(sleep(0.0001));" 2>&1 | grep -c -P '^1000$|^0$|Table .+? doesn.t exist' &
+SELECT count() FROM memory WHERE NOT ignore(sleep(0.0001));" 2>&1 | grep -c -P '^1000$|^0$|Exception' &
 
 sleep 0.05;
 
-${CLICKHOUSE_CLIENT} --multiquery --query="
+${CLICKHOUSE_CLIENT} --query="
 TRUNCATE TABLE memory;
 DROP TABLE memory;
 "

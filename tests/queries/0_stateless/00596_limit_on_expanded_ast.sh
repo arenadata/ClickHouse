@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Tags: no-parallel, long
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
 exception_pattern="too big"
 

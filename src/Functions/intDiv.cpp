@@ -1,11 +1,7 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionBinaryArithmetic.h>
 
-#if defined(__SSE2__)
-#    define LIBDIVIDE_SSE2 1
-#endif
-
-#include <libdivide.h>
+#include <Functions/divide/divide.h>
 
 
 namespace DB
@@ -15,74 +11,106 @@ namespace ErrorCodes
     extern const int ILLEGAL_DIVISION;
 }
 
+namespace
+{
+
 /// Optimizations for integer division by a constant.
 
 template <typename A, typename B>
 struct DivideIntegralByConstantImpl
-    : BinaryOperationImplBase<A, B, DivideIntegralImpl<A, B>>
+    : BinaryOperation<A, B, DivideIntegralImpl<A, B>>
 {
-    using ResultType = typename DivideIntegralImpl<A, B>::ResultType;
+    using Op = DivideIntegralImpl<A, B>;
+    using ResultType = typename Op::ResultType;
     static const constexpr bool allow_fixed_string = false;
+    static const constexpr bool allow_string_integer = false;
 
-    static NO_INLINE void vectorConstant(const A * __restrict a_pos, B b, ResultType * __restrict c_pos, size_t size)
+    template <OpCase op_case>
+    static void NO_INLINE process(const A * __restrict a, const B * __restrict b, ResultType * __restrict c, size_t size, const NullMap * right_nullmap)
     {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
-
-        /// Division by -1. By the way, we avoid FPE by division of the largest negative number by -1.
-        /// And signed integer overflow is well defined in C++20.
-        if (unlikely(is_signed_v<B> && b == -1))
+        if constexpr (op_case == OpCase::RightConstant)
         {
-            for (size_t i = 0; i < size; ++i)
-                c_pos[i] = -a_pos[i];
-            return;
+            if (right_nullmap && (*right_nullmap)[0])
+                return;
+
+            vectorConstant(a, *b, c, size);
+        }
+        else
+        {
+            if (right_nullmap)
+            {
+                for (size_t i = 0; i < size; ++i)
+                    if ((*right_nullmap)[i])
+                        c[i] = ResultType();
+                    else
+                        apply<op_case>(a, b, c, i);
+            }
+            else
+                for (size_t i = 0; i < size; ++i)
+                    apply<op_case>(a, b, c, i);
+        }
+    }
+
+    static ResultType process(A a, B b) { return Op::template apply<ResultType>(a, b); }
+
+    static void NO_INLINE NO_SANITIZE_UNDEFINED vectorConstant(const A * __restrict a_pos, B b, ResultType * __restrict c_pos, size_t size)
+    {
+        /// Division by -1. By the way, we avoid FPE by division of the largest negative number by -1.
+        if constexpr (is_signed_v<B>)
+        {
+            if (b == -1) [[unlikely]]
+            {
+                for (size_t i = 0; i < size; ++i)
+                    c_pos[i] = -make_unsigned_t<A>(a_pos[i]);   /// Avoid UBSan report in signed integer overflow.
+                return;
+            }
         }
 
         /// Division with too large divisor.
-        if (unlikely(b > std::numeric_limits<A>::max()
-            || (std::is_signed_v<A> && std::is_signed_v<B> && b < std::numeric_limits<A>::lowest())))
+        if (b > std::numeric_limits<A>::max()) [[unlikely]]
         {
             for (size_t i = 0; i < size; ++i)
                 c_pos[i] = 0;
             return;
         }
-
-#pragma GCC diagnostic pop
-
-        if (unlikely(static_cast<A>(b) == 0))
-            throw Exception("Division by zero", ErrorCodes::ILLEGAL_DIVISION);
-
-        libdivide::divider<A> divider(b);
-
-        const A * a_end = a_pos + size;
-
-#if defined(__SSE2__)
-        static constexpr size_t values_per_sse_register = 16 / sizeof(A);
-        const A * a_end_sse = a_pos + size / values_per_sse_register * values_per_sse_register;
-
-        while (a_pos < a_end_sse)
+        else
         {
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(c_pos),
-                _mm_loadu_si128(reinterpret_cast<const __m128i *>(a_pos)) / divider);
-
-            a_pos += values_per_sse_register;
-            c_pos += values_per_sse_register;
+            if constexpr (std::is_signed_v<A> && std::is_signed_v<B>)
+            {
+                if (b < std::numeric_limits<A>::lowest()) [[unlikely]]
+                {
+                    for (size_t i = 0; i < size; ++i)
+                        c_pos[i] = 0;
+                    return;
+                }
+            }
         }
-#endif
 
-        while (a_pos < a_end)
-        {
-            *c_pos = *a_pos / divider;
-            ++a_pos;
-            ++c_pos;
-        }
+        if (static_cast<A>(b) == 0) [[unlikely]]
+            throw Exception(ErrorCodes::ILLEGAL_DIVISION, "Division by zero");
+
+        divideImpl(a_pos, b, c_pos, size);
+    }
+
+private:
+    template <OpCase op_case>
+    static void apply(const A * __restrict a, const B * __restrict b, ResultType * __restrict c, size_t i)
+    {
+        if constexpr (op_case == OpCase::Vector)
+            c[i] = Op::template apply<ResultType>(a[i], b[i]);
+        else
+            c[i] = Op::template apply<ResultType>(*a, b[i]);
     }
 };
 
-/** Specializations are specified for dividing numbers of the type UInt64 and UInt32 by the numbers of the same sign.
+/** Specializations are specified for dividing numbers of the type UInt64, UInt32, Int64, Int32 by the numbers of the same sign.
   * Can be expanded to all possible combinations, but more code is needed.
   */
 
+}
+
+namespace impl_
+{
 template <> struct BinaryOperationImpl<UInt64, UInt8, DivideIntegralImpl<UInt64, UInt8>> : DivideIntegralByConstantImpl<UInt64, UInt8> {};
 template <> struct BinaryOperationImpl<UInt64, UInt16, DivideIntegralImpl<UInt64, UInt16>> : DivideIntegralByConstantImpl<UInt64, UInt16> {};
 template <> struct BinaryOperationImpl<UInt64, UInt32, DivideIntegralImpl<UInt64, UInt32>> : DivideIntegralByConstantImpl<UInt64, UInt32> {};
@@ -102,14 +130,80 @@ template <> struct BinaryOperationImpl<Int32, Int8, DivideIntegralImpl<Int32, In
 template <> struct BinaryOperationImpl<Int32, Int16, DivideIntegralImpl<Int32, Int16>> : DivideIntegralByConstantImpl<Int32, Int16> {};
 template <> struct BinaryOperationImpl<Int32, Int32, DivideIntegralImpl<Int32, Int32>> : DivideIntegralByConstantImpl<Int32, Int32> {};
 template <> struct BinaryOperationImpl<Int32, Int64, DivideIntegralImpl<Int32, Int64>> : DivideIntegralByConstantImpl<Int32, Int64> {};
-
-
-struct NameIntDiv { static constexpr auto name = "intDiv"; };
-using FunctionIntDiv = FunctionBinaryArithmetic<DivideIntegralImpl, NameIntDiv, false>;
-
-void registerFunctionIntDiv(FunctionFactory & factory)
-{
-    factory.registerFunction<FunctionIntDiv>();
 }
 
+struct NameIntDiv { static constexpr auto name = "intDiv"; };
+using FunctionIntDiv = BinaryArithmeticOverloadResolver<DivideIntegralImpl, NameIntDiv, false>;
+
+REGISTER_FUNCTION(IntDiv)
+{
+    FunctionDocumentation::Description description = R"(
+Performs an integer division of two values `x` by `y`. In other words it
+computes the quotient rounded down to the next smallest integer.
+
+The result has the same width as the dividend (the first parameter).
+
+An exception is thrown when dividing by zero, when the quotient does not fit
+in the range of the dividend, or when dividing a minimal negative number by minus one.
+    )";
+    FunctionDocumentation::Syntax syntax = "intDiv(x, y)";
+    FunctionDocumentation::Argument argument1 = {"x", "Left hand operand."};
+    FunctionDocumentation::Argument argument2 = {"y", "Right hand operand."};
+    FunctionDocumentation::Arguments arguments = {argument1, argument2};
+    FunctionDocumentation::ReturnedValue returned_value = {"Result of integer division of `x` and `y`"};
+    FunctionDocumentation::Example example1 = {"Integer division of two floats", "SELECT intDiv(toFloat64(1), 0.001) AS res, toTypeName(res)", R"(
+┌──res─┬─toTypeName(intDiv(toFloat64(1), 0.001))─┐
+│ 1000 │ Int64                                   │
+└──────┴─────────────────────────────────────────┘
+    )"};
+    FunctionDocumentation::Example example2 = {
+        "Quotient does not fit in the range of the dividend",
+        R"(
+SELECT
+intDiv(1, 0.001) AS res,
+toTypeName(res)
+        )",
+        R"(
+Received exception from server (version 23.2.1):
+Code: 153. DB::Exception: Received from localhost:9000. DB::Exception:
+Cannot perform integer division, because it will produce infinite or too
+large number: While processing intDiv(1, 0.001) AS res, toTypeName(res).
+(ILLEGAL_DIVISION)
+        )"
+    };
+    FunctionDocumentation::Examples examples = {example1, example2};
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Arithmetic;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionIntDiv>(documentation);
+}
+
+struct NameIntDivOrNull { static constexpr auto name = "intDivOrNull"; };
+using FunctionIntDivOrNull = BinaryArithmeticOverloadResolver<DivideIntegralOrNullImpl, NameIntDivOrNull, false>;
+
+REGISTER_FUNCTION(IntDivOrNull)
+{
+    FunctionDocumentation::Description description = R"(
+Same as `intDiv` but returns NULL when dividing by zero or when dividing a
+minimal negative number by minus one.
+    )";
+    FunctionDocumentation::Syntax syntax = "intDivOrNull(x, y)";
+    FunctionDocumentation::Arguments arguments =
+    {
+        {"x", "Left hand operand.", {"(U)Int*"}},
+        {"y", "Right hand operand.", {"(U)Int*"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Result of integer division of `x` and `y`, or NULL."};
+    FunctionDocumentation::Examples examples =
+    {
+        {"Integer division by zero", "SELECT intDivOrNull(1, 0)", "\\N"},
+        {"Dividing a minimal negative number by minus 1", "SELECT intDivOrNull(-9223372036854775808, -1)", "\\N"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {25, 5};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Arithmetic;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionIntDivOrNull>(documentation);
+}
 }

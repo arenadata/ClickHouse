@@ -1,6 +1,6 @@
 ## The bare minimum ClickHouse Docker image.
 
-It is intented as a showcase to check the amount of implicit dependencies of ClickHouse from the OS in addition to the OS kernel.
+It is intended as a showcase to check the amount of implicit dependencies of ClickHouse from the OS in addition to the OS kernel.
 
 Example usage:
 
@@ -34,4 +34,5 @@ sudo chroot . /clickhouse server
 
 - creation of `clickhouse` user to run the server;
 - VOLUME for server;
-- most of the details, see other docker images for comparison.
+- CA Certificates;
+- most of the details, see other docker images for comparison;

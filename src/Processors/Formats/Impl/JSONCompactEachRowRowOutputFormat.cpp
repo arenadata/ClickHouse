@@ -1,113 +1,143 @@
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferValidUTF8.h>
 #include <Processors/Formats/Impl/JSONCompactEachRowRowOutputFormat.h>
+#include <Processors/Port.h>
 #include <Formats/FormatFactory.h>
-
+#include <Formats/registerWithNamesAndTypes.h>
+#include <Formats/JSONUtils.h>
 
 namespace DB
 {
 
 
 JSONCompactEachRowRowOutputFormat::JSONCompactEachRowRowOutputFormat(WriteBuffer & out_,
-        const Block & header_,
-        FormatFactory::WriteCallback callback,
+        SharedHeader header_,
         const FormatSettings & settings_,
-        bool with_names_)
-        : IRowOutputFormat(header_, out_, callback), settings(settings_), with_names(with_names_)
+        bool with_names_,
+        bool with_types_)
+    : RowOutputFormatWithExceptionHandlerAdaptor<RowOutputFormatWithUTF8ValidationAdaptor, bool>(header_, out_, settings_.json.valid_output_on_exception, settings_.json.validate_utf8)
+    , settings(settings_)
+    , with_names(with_names_)
+    , with_types(with_types_)
 {
-            const auto & sample = getPort(PortKind::Main).getHeader();
-            NamesAndTypesList columns(sample.getNamesAndTypesList());
-            fields.assign(columns.begin(), columns.end());
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
 }
 
 
-void JSONCompactEachRowRowOutputFormat::writeField(const IColumn & column, const IDataType & type, size_t row_num)
+void JSONCompactEachRowRowOutputFormat::writeField(const IColumn & column, const ISerialization & serialization, size_t row_num)
 {
-    type.serializeAsTextJSON(column, row_num, out, settings);
+    if (settings.json.serialize_as_strings)
+    {
+        WriteBufferFromOwnString buf;
+
+        serialization.serializeText(column, row_num, buf, settings);
+        writeJSONString(buf.str(), *ostr, settings);
+    }
+    else
+        serialization.serializeTextJSON(column, row_num, *ostr, settings);
 }
 
 
 void JSONCompactEachRowRowOutputFormat::writeFieldDelimiter()
 {
-    writeCString(", ", out);
+    writeCString(", ", *ostr);
 }
 
 
 void JSONCompactEachRowRowOutputFormat::writeRowStartDelimiter()
 {
-    writeChar('[', out);
+    writeChar('[', *ostr);
 }
 
 
 void JSONCompactEachRowRowOutputFormat::writeRowEndDelimiter()
 {
-    writeCString("]\n", out);
+    writeCString("]\n", *ostr);
 }
 
 void JSONCompactEachRowRowOutputFormat::writeTotals(const Columns & columns, size_t row_num)
 {
-    writeChar('\n', out);
-    size_t num_columns = columns.size();
-    writeChar('[', out);
-    for (size_t i = 0; i < num_columns; ++i)
+    writeChar('\n', *ostr);
+    size_t columns_size = columns.size();
+    writeRowStartDelimiter();
+    for (size_t i = 0; i < columns_size; ++i)
     {
         if (i != 0)
-            JSONCompactEachRowRowOutputFormat::writeFieldDelimiter();
+            writeFieldDelimiter();
 
-        JSONCompactEachRowRowOutputFormat::writeField(*columns[i], *types[i], row_num);
+        writeField(*columns[i], *serializations[i], row_num);
     }
-    writeCString("]\n", out);
+    writeRowEndDelimiter();
+}
+
+void JSONCompactEachRowRowOutputFormat::writeLine(const std::vector<String> & values)
+{
+    JSONUtils::makeNamesValidJSONStrings(values, settings, settings.json.validate_utf8);
+    writeRowStartDelimiter();
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        writeChar('\"', *ostr);
+        writeString(values[i], *ostr);
+        writeChar('\"', *ostr);
+        if (i + 1 != values.size())
+            writeFieldDelimiter();
+    }
+    writeRowEndDelimiter();
 }
 
 void JSONCompactEachRowRowOutputFormat::writePrefix()
 {
+    const auto & header = getPort(PortKind::Main).getHeader();
+
     if (with_names)
+        writeLine(JSONUtils::makeNamesValidJSONStrings(header.getNames(), settings, settings.json.validate_utf8));
+
+    if (with_types)
+        writeLine(JSONUtils::makeNamesValidJSONStrings(header.getDataTypeNames(), settings, settings.json.validate_utf8));
+}
+
+void JSONCompactEachRowRowOutputFormat::writeSuffix()
+{
+    if (!exception_message.empty())
     {
-        writeChar('[', out);
-        for (size_t i = 0; i < fields.size(); ++i)
-        {
-            writeChar('\"', out);
-            writeString(fields[i].name, out);
-            writeChar('\"', out);
-            if (i != fields.size() - 1)
-                writeCString(", ", out);
-        }
-        writeCString("]\n[", out);
-        for (size_t i = 0; i < fields.size(); ++i)
-        {
-            writeJSONString(fields[i].type->getName(), out, settings);
-            if (i != fields.size() - 1)
-                writeCString(", ", out);
-        }
-        writeCString("]\n", out);
+        if (haveWrittenData())
+            writeRowBetweenDelimiter();
+
+        writeRowStartDelimiter();
+        writeJSONString(exception_message, *ostr, settings);
+        writeRowEndDelimiter();
     }
 }
 
-void JSONCompactEachRowRowOutputFormat::consumeTotals(DB::Chunk chunk)
+void JSONCompactEachRowRowOutputFormat::resetFormatterImpl()
 {
-    if (with_names)
-        IRowOutputFormat::consumeTotals(std::move(chunk));
+    RowOutputFormatWithExceptionHandlerAdaptor::resetFormatterImpl();
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
 }
 
-void registerOutputFormatProcessorJSONCompactEachRow(FormatFactory & factory)
+void registerOutputFormatJSONCompactEachRow(FormatFactory & factory)
 {
-    factory.registerOutputFormatProcessor("JSONCompactEachRow", [](
-            WriteBuffer & buf,
-            const Block & sample,
-            FormatFactory::WriteCallback callback,
-            const FormatSettings & format_settings)
+    for (bool yield_strings : {false, true})
     {
-        return std::make_shared<JSONCompactEachRowRowOutputFormat>(buf, sample, callback, format_settings, false);
-    });
+        auto register_func = [&](const String & format_name, bool with_names, bool with_types)
+        {
+            factory.registerOutputFormat(format_name, [yield_strings, with_names, with_types](
+                WriteBuffer & buf,
+                const Block & sample,
+                const FormatSettings & format_settings,
+                FormatFilterInfoPtr /*format_filter_info*/)
+            {
+                FormatSettings settings = format_settings;
+                settings.json.serialize_as_strings = yield_strings;
 
-    factory.registerOutputFormatProcessor("JSONCompactEachRowWithNamesAndTypes", [](
-            WriteBuffer &buf,
-            const Block &sample,
-            FormatFactory::WriteCallback callback,
-            const FormatSettings &format_settings)
-    {
-        return std::make_shared<JSONCompactEachRowRowOutputFormat>(buf, sample, callback, format_settings, true);
-    });
+                return std::make_shared<JSONCompactEachRowRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings, with_names, with_types);
+            });
+
+            factory.markOutputFormatSupportsParallelFormatting(format_name);
+        };
+
+        registerWithNamesAndTypes(yield_strings ? "JSONCompactStringsEachRow" : "JSONCompactEachRow", register_func);
+    }
 }
 
 

@@ -1,4 +1,4 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/replicate.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeArray.h>
@@ -7,67 +7,79 @@
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int ILLEGAL_COLUMN;
 }
 
-/** Creates an array, multiplying the column (the first argument) by the number of elements in the array (the second argument).
-  */
-class FunctionReplicate : public IFunction
+DataTypePtr FunctionReplicate::getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const
 {
-public:
-    static constexpr auto name = "replicate";
+    FunctionArgumentDescriptors mandatory_args{
+        {"value", nullptr, nullptr, "Any"},
+        {"array", &isArray, nullptr, "Array"}
+    };
+    FunctionArgumentDescriptor variadic_args{"arrays", &isArray, nullptr, "Array"};
 
-    static FunctionPtr create(const Context &)
+    validateFunctionArgumentsWithVariadics(*this, arguments, mandatory_args, variadic_args);
+
+    return std::make_shared<DataTypeArray>(arguments[0].type);
+}
+
+ColumnPtr FunctionReplicate::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t) const
+{
+    ColumnPtr first_column = arguments[0].column;
+    ColumnPtr offsets;
+
+    for (size_t i = 1; i < arguments.size(); ++i)
     {
-        return std::make_shared<FunctionReplicate>();
-    }
-
-    String getName() const override
-    {
-        return name;
-    }
-
-    size_t getNumberOfArguments() const override
-    {
-        return 2;
-    }
-
-    bool useDefaultImplementationForNulls() const override { return false; }
-
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
-    {
-        const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[1].get());
-        if (!array_type)
-            throw Exception("Second argument for function " + getName() + " must be array.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-        return std::make_shared<DataTypeArray>(arguments[0]);
-    }
-
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t) override
-    {
-        ColumnPtr first_column = block.getByPosition(arguments[0]).column;
-        const ColumnArray * array_column = checkAndGetColumn<ColumnArray>(block.getByPosition(arguments[1]).column.get());
+        const ColumnArray * array_column = checkAndGetColumn<ColumnArray>(arguments[i].column.get());
         ColumnPtr temp_column;
         if (!array_column)
         {
-            const auto * const_array_column = checkAndGetColumnConst<ColumnArray>(block.getByPosition(arguments[1]).column.get());
+            const auto * const_array_column = checkAndGetColumnConst<ColumnArray>(arguments[i].column.get());
             if (!const_array_column)
-                throw Exception("Unexpected column for replicate", ErrorCodes::ILLEGAL_COLUMN);
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Unexpected column for replicate");
             temp_column = const_array_column->convertToFullColumn();
             array_column = checkAndGetColumn<ColumnArray>(temp_column.get());
         }
-        block.getByPosition(result).column
-            = ColumnArray::create(first_column->replicate(array_column->getOffsets())->convertToFullColumnIfConst(), array_column->getOffsetsPtr());
+
+        if (!offsets || offsets->empty())
+            offsets = array_column->getOffsetsPtr();
     }
-};
 
+    const auto & offsets_data = assert_cast<const ColumnArray::ColumnOffsets &>(*offsets).getData(); /// NOLINT
+    return ColumnArray::create(first_column->replicate(offsets_data)->convertToFullColumnIfConst(), offsets);
+}
 
-void registerFunctionReplicate(FunctionFactory & factory)
+REGISTER_FUNCTION(Replicate)
 {
-    factory.registerFunction<FunctionReplicate>();
+    FunctionDocumentation::Description description = R"(
+Creates an array with a single value.
+)";
+    FunctionDocumentation::Syntax syntax = "replicate(x, arr)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "The value to fill the result array with.", {"Any"}},
+        {"arr", "An array.", {"Array(T)"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns an array of the same length as `arr` filled with value `x`.", {"Array(T)"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+SELECT replicate(1, ['a', 'b', 'c']);
+        )",
+        R"(
+┌─replicate(1, ['a', 'b', 'c'])───┐
+│ [1, 1, 1]                       │
+└─────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionReplicate>(documentation);
 }
 
 }

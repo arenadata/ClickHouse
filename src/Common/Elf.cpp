@@ -1,10 +1,8 @@
-#if defined(__ELF__) && !defined(__FreeBSD__)
-
 #include <Common/Elf.h>
 #include <Common/Exception.h>
-#include <common/unaligned.h>
+#include <base/unaligned.h>
 
-#include <string.h>
+#include <cstring>
 
 
 namespace DB
@@ -16,61 +14,73 @@ namespace ErrorCodes
 }
 
 
-Elf::Elf(const std::string & path)
-    : in(path, 0)
+Elf::Elf(const std::string & path_)
 {
+    in.emplace(path_, 0);
+    init(in->buffer().begin(), in->buffer().size(), path_);
+}
+
+Elf::Elf(const char * data, size_t size, const std::string & path_)
+{
+    init(data, size, path_);
+}
+
+void Elf::init(const char * data, size_t size, const std::string & path_)
+{
+    path = path_;
+    mapped = data;
+    elf_size = size;
+
     /// Check if it's an elf.
-    elf_size = in.buffer().size();
-    if (elf_size < sizeof(ElfEhdr))
-        throw Exception("The size of supposedly ELF file is too small", ErrorCodes::CANNOT_PARSE_ELF);
+    if (elf_size < sizeof(ElfHeader))
+        throw Exception(ErrorCodes::CANNOT_PARSE_ELF, "The size of supposedly ELF file '{}' is too small", path);
 
-    mapped = in.buffer().begin();
-    header = reinterpret_cast<const ElfEhdr *>(mapped);
+    header = reinterpret_cast<const ElfHeader *>(mapped);
 
-    if (memcmp(header->e_ident, "\x7F""ELF", 4) != 0)
-        throw Exception("The file is not ELF according to magic", ErrorCodes::CANNOT_PARSE_ELF);
+    if (memcmp(header->ident, "\x7F""ELF", 4) != 0)
+        throw Exception(ErrorCodes::CANNOT_PARSE_ELF, "The file '{}' is not ELF according to magic", path);
 
     /// Get section header.
-    ElfOff section_header_offset = header->e_shoff;
-    uint16_t section_header_num_entries = header->e_shnum;
+    uint64_t section_header_offset = header->shoff;
+    uint16_t section_header_num_entries = header->shnum;
 
     if (!section_header_offset
         || !section_header_num_entries
-        || section_header_offset + section_header_num_entries * sizeof(ElfShdr) > elf_size)
-        throw Exception("The ELF is truncated (section header points after end of file)", ErrorCodes::CANNOT_PARSE_ELF);
+        || section_header_offset + section_header_num_entries * sizeof(ElfSectionHeader) > elf_size)
+        throw Exception(ErrorCodes::CANNOT_PARSE_ELF, "The ELF '{}' is truncated (section header points after end of file)", path);
 
-    section_headers = reinterpret_cast<const ElfShdr *>(mapped + section_header_offset);
+    section_headers = reinterpret_cast<const ElfSectionHeader *>(mapped + section_header_offset);
 
     /// The string table with section names.
     auto section_names_strtab = findSection([&](const Section & section, size_t idx)
     {
-        return section.header.sh_type == SHT_STRTAB && header->e_shstrndx == idx;
+        return section.header.type == SectionHeaderType::STRTAB && header->shstrndx == idx;
     });
 
     if (!section_names_strtab)
-        throw Exception("The ELF doesn't have string table with section names", ErrorCodes::CANNOT_PARSE_ELF);
+        throw Exception(ErrorCodes::CANNOT_PARSE_ELF, "The ELF '{}' doesn't have string table with section names", path);
 
-    ElfOff section_names_offset = section_names_strtab->header.sh_offset;
+    uint64_t section_names_offset = section_names_strtab->header.offset;
     if (section_names_offset >= elf_size)
-        throw Exception("The ELF is truncated (section names string table points after end of file)", ErrorCodes::CANNOT_PARSE_ELF);
+        throw Exception(ErrorCodes::CANNOT_PARSE_ELF, "The ELF '{}' is truncated (section names string table points after end of file)", path);
 
     section_names = reinterpret_cast<const char *>(mapped + section_names_offset);
 
     /// Get program headers
 
-    ElfOff program_header_offset = header->e_phoff;
-    uint16_t program_header_num_entries = header->e_phnum;
+    uint64_t program_header_offset = header->phoff;
+    uint16_t program_header_num_entries = header->phnum;
 
     if (!program_header_offset
         || !program_header_num_entries
-        || program_header_offset + program_header_num_entries * sizeof(ElfPhdr) > elf_size)
-        throw Exception("The ELF is truncated (program header points after end of file)", ErrorCodes::CANNOT_PARSE_ELF);
+        || program_header_offset + program_header_num_entries * sizeof(ElfProgramHeader) > elf_size)
+        throw Exception(ErrorCodes::CANNOT_PARSE_ELF, "The ELF '{}' is truncated (program header points after end of file)", path);
 
-    program_headers = reinterpret_cast<const ElfPhdr *>(mapped + program_header_offset);
+    program_headers = reinterpret_cast<const ElfProgramHeader *>(mapped + program_header_offset);
 }
 
 
-Elf::Section::Section(const ElfShdr & header_, const Elf & elf_)
+Elf::Section::Section(const ElfSectionHeader & header_, const Elf & elf_)
     : header(header_), elf(elf_)
 {
 }
@@ -78,12 +88,12 @@ Elf::Section::Section(const ElfShdr & header_, const Elf & elf_)
 
 bool Elf::iterateSections(std::function<bool(const Section & section, size_t idx)> && pred) const
 {
-    for (size_t idx = 0; idx < header->e_shnum; ++idx)
+    for (size_t idx = 0; idx < header->shnum; ++idx)
     {
         Section section(section_headers[idx], *this);
 
         /// Sections spans after end of file.
-        if (section.header.sh_offset + section.header.sh_size > elf_size)
+        if (section.header.offset + section.header.size > elf_size)
             continue;
 
         if (pred(section, idx))
@@ -119,16 +129,34 @@ std::optional<Elf::Section> Elf::findSectionByName(const char * name) const
 
 String Elf::getBuildID() const
 {
-    for (size_t idx = 0; idx < header->e_phnum; ++idx)
+    /// Section headers are the first choice for a debuginfo file
+    if (String build_id; iterateSections([&build_id](const Section & section, size_t)
     {
-        const ElfPhdr & phdr = program_headers[idx];
-
-        if (phdr.p_type == PT_NOTE)
-            return getBuildID(mapped + phdr.p_offset, phdr.p_filesz);
+        if (section.header.type == SectionHeaderType::NOTE)
+        {
+            build_id = Elf::getBuildID(section.begin(), section.size());
+            if (!build_id.empty())
+            {
+                return true;
+            }
+        }
+        return false;
+    }))
+    {
+        return build_id;
     }
+
+    /// fallback to PHDR
+    for (size_t idx = 0; idx < header->phnum; ++idx)
+    {
+        const ElfProgramHeader & phdr = program_headers[idx];
+
+        if (phdr.type == ProgramHeaderType::NOTE)
+            return getBuildID(mapped + phdr.offset, phdr.filesz);
+    }
+
     return {};
 }
-
 
 String Elf::getBuildID(const char * nhdr_pos, size_t size)
 {
@@ -136,17 +164,25 @@ String Elf::getBuildID(const char * nhdr_pos, size_t size)
 
     while (nhdr_pos < nhdr_end)
     {
-        ElfNhdr nhdr = unalignedLoad<ElfNhdr>(nhdr_pos);
+        ElfNameHeader nhdr = unalignedLoad<ElfNameHeader>(nhdr_pos);
 
-        nhdr_pos += sizeof(ElfNhdr) + nhdr.n_namesz;
-        if (nhdr.n_type == NT_GNU_BUILD_ID)
+        nhdr_pos += sizeof(ElfNameHeader) + nhdr.namesz;
+        if (nhdr.type == NameHeaderType::GNU_BUILD_ID)
         {
             const char * build_id = nhdr_pos;
-            return {build_id, nhdr.n_descsz};
+            return {build_id, nhdr.descsz};
         }
-        nhdr_pos += nhdr.n_descsz;
+        nhdr_pos += nhdr.descsz;
     }
 
+    return {};
+}
+
+
+String Elf::getStoredBinaryHash() const
+{
+    if (auto section = findSectionByName(".clickhouse.hash"))
+        return {section->begin(), section->end()};
     return {};
 }
 
@@ -154,16 +190,16 @@ String Elf::getBuildID(const char * nhdr_pos, size_t size)
 const char * Elf::Section::name() const
 {
     if (!elf.section_names)
-        throw Exception("Section names are not initialized", ErrorCodes::CANNOT_PARSE_ELF);
+        throw Exception(ErrorCodes::CANNOT_PARSE_ELF, "Section names are not initialized");
 
     /// TODO buffer overflow is possible, we may need to check strlen.
-    return elf.section_names + header.sh_name;
+    return elf.section_names + header.name;
 }
 
 
 const char * Elf::Section::begin() const
 {
-    return elf.mapped + header.sh_offset;
+    return elf.mapped + header.offset;
 }
 
 const char * Elf::Section::end() const
@@ -173,9 +209,7 @@ const char * Elf::Section::end() const
 
 size_t Elf::Section::size() const
 {
-    return header.sh_size;
+    return header.size;
 }
 
 }
-
-#endif

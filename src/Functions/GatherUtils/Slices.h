@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Columns/IColumn.h>
+#include <Columns/IColumn_fwd.h>
 
 namespace DB::GatherUtils
 {
@@ -25,7 +25,7 @@ struct NullableSlice : public Slice
     const UInt8 * null_map = nullptr;
 
     NullableSlice() = default;
-    NullableSlice(const Slice & base) : Slice(base) {}
+    NullableSlice(const Slice & base) : Slice(base) {} /// NOLINT
 };
 
 template <typename T>

@@ -1,46 +1,48 @@
 #pragma once
 
 #include <Dictionaries/CassandraHelpers.h>
+#include <QueryPipeline/BlockIO.h>
 
 #if USE_CASSANDRA
 
-#include "DictionaryStructure.h"
-#include "IDictionarySource.h"
-#include "ExternalQueryBuilder.h"
-#include <Core/Block.h>
-#include <Poco/Logger.h>
+#include <Dictionaries/DictionaryStructure.h>
+#include <Dictionaries/IDictionarySource.h>
+#include <Dictionaries/ExternalQueryBuilder.h>
+#include <Interpreters/Context_fwd.h>
 #include <mutex>
 
 namespace DB
 {
 
-struct CassandraSettings
-{
-    String host;
-    UInt16 port;
-    String user;
-    String password;
-    String db;
-    String table;
-
-    CassConsistency consistency;
-    bool allow_filtering;
-    /// TODO get information about key from the driver
-    size_t partition_key_prefix;
-    size_t max_threads;
-    String where;
-
-    CassandraSettings(const Poco::Util::AbstractConfiguration & config, const String & config_prefix);
-
-    void setConsistency(const String & config_str);
-};
-
 class CassandraDictionarySource final : public IDictionarySource
 {
 public:
+
+    struct Configuration
+    {
+        String host;
+        UInt16 port;
+        String user;
+        String password;
+        String db;
+        String table;
+        String query;
+
+        CassConsistency consistency;
+        bool allow_filtering;
+        /// TODO get information about key from the driver
+        size_t partition_key_prefix;
+        size_t max_threads;
+        String where;
+
+        Configuration(const Poco::Util::AbstractConfiguration & config, const String & config_prefix);
+
+        void setConsistency(const String & config_str);
+    };
+
     CassandraDictionarySource(
         const DictionaryStructure & dict_struct,
-        const CassandraSettings & settings_,
+        const Configuration & configuration,
         const Block & sample_block);
 
     CassandraDictionarySource(
@@ -49,7 +51,7 @@ public:
             const String & config_prefix,
             Block & sample_block);
 
-    BlockInputStreamPtr loadAll() override;
+    BlockIO loadAll() override;
 
     bool supportsSelectiveLoad() const override { return true; }
 
@@ -59,14 +61,14 @@ public:
 
     DictionarySourcePtr clone() const override
     {
-        return std::make_unique<CassandraDictionarySource>(dict_struct, settings, sample_block);
+        return std::make_shared<CassandraDictionarySource>(dict_struct, configuration, *sample_block);
     }
 
-    BlockInputStreamPtr loadIds(const std::vector<UInt64> & ids) override;
+    BlockIO loadIds(const VectorWithMemoryTracking<UInt64> & ids) override;
 
-    BlockInputStreamPtr loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows) override;
+    BlockIO loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows) override;
 
-    BlockInputStreamPtr loadUpdatedAll() override;
+    BlockIO loadUpdatedAll() override;
 
     String toString() const override;
 
@@ -74,15 +76,16 @@ private:
     void maybeAllowFiltering(String & query) const;
     CassSessionShared getSession();
 
-    Poco::Logger * log;
+    LoggerPtr log;
     const DictionaryStructure dict_struct;
-    const CassandraSettings settings;
-    Block sample_block;
+    const Configuration configuration;
+    SharedHeader sample_block;
     ExternalQueryBuilder query_builder;
 
-    std::mutex connect_mutex;
     CassClusterPtr cluster;
-    CassSessionWeak maybe_session;
+
+    std::mutex connect_mutex;
+    CassSessionWeak maybe_session TSA_GUARDED_BY(connect_mutex);
 };
 }
 

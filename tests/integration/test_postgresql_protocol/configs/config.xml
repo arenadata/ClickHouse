@@ -1,5 +1,4 @@
-<?xml version="1.0"?>
- <yandex>
+ <clickhouse>
      <logger>
          <level>trace</level>
          <log>/var/log/clickhouse-server/clickhouse-server.log</log>
@@ -19,7 +18,7 @@
              <verificationMode>none</verificationMode>
              <loadDefaultCAFile>true</loadDefaultCAFile>
              <cacheSessions>true</cacheSessions>
-             <disableProtocols>sslv2,sslv3</disableProtocols>
+             <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1,tlsv1_2</disableProtocols>
              <preferServerCiphers>true</preferServerCiphers>
          </server>
      </openSSL>
@@ -29,7 +28,6 @@
      <listen_host>127.0.0.1</listen_host>
 
      <max_concurrent_queries>500</max_concurrent_queries>
-     <mark_cache_size>5368709120</mark_cache_size>
      <path>./clickhouse/</path>
      <users_config>users.xml</users_config>
- </yandex>
+ </clickhouse>

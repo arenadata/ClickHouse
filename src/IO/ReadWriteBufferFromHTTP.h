@@ -1,309 +1,254 @@
 #pragma once
 
 #include <functional>
-#include <Core/Types.h>
+#include <Core/Field.h>
 #include <IO/ConnectionTimeouts.h>
 #include <IO/HTTPCommon.h>
+#include <IO/ParallelReadBuffer.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ReadBufferFromIStream.h>
+#include <IO/ReadHelpers.h>
+#include <IO/ReadSettings.h>
+#include <IO/WithFileName.h>
+#include <IO/HTTPHeaderEntries.h>
+#include <Common/logger_useful.h>
+#include <base/sleep.h>
+#include <base/types.h>
 #include <Poco/Any.h>
 #include <Poco/Net/HTTPBasicCredentials.h>
 #include <Poco/Net/HTTPClientSession.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/URI.h>
-#include <Poco/Version.h>
-#include <Common/DNSResolver.h>
-#include <Common/RemoteHostFilter.h>
-#include <common/logger_useful.h>
 #include <Poco/URIStreamFactory.h>
+#include <Common/RemoteHostFilter.h>
+#include "config.h"
+#include <Common/config_version.h>
 
-#if !defined(ARCADIA_BUILD)
-#    include <Common/config.h>
-#endif
-
-
-#define DEFAULT_HTTP_READ_BUFFER_TIMEOUT 1800
-#define DEFAULT_HTTP_READ_BUFFER_CONNECTION_TIMEOUT 1
+#include <filesystem>
 
 namespace DB
 {
-/** Perform HTTP POST request and provide response to read.
-  */
 
-namespace ErrorCodes
+class ReadWriteBufferFromHTTP : public SeekableReadBuffer, public WithFileName, public WithFileSize
 {
-    extern const int TOO_MANY_REDIRECTS;
-}
-
-template <typename SessionPtr>
-class UpdatableSessionBase
-{
-protected:
-    SessionPtr session;
-    UInt64 redirects { 0 };
-    Poco::URI initial_uri;
-    const ConnectionTimeouts & timeouts;
-    SettingUInt64 max_redirects;
-
+    friend class BuilderRWBufferFromHTTP;
 public:
-    virtual void buildNewSession(const Poco::URI & uri) = 0;
-
-    explicit UpdatableSessionBase(const Poco::URI uri,
-        const ConnectionTimeouts & timeouts_,
-        SettingUInt64 max_redirects_)
-        : initial_uri { uri }
-        , timeouts { timeouts_ }
-        , max_redirects { max_redirects_ }
+    /// Information from HTTP response header.
+    struct HTTPFileInfo
     {
-    }
-
-    SessionPtr getSession()
-    {
-        return session;
-    }
-
-    void updateSession(const Poco::URI & uri)
-    {
-        ++redirects;
-        if (redirects <= max_redirects)
-        {
-            buildNewSession(uri);
-        }
-        else
-        {
-            std::stringstream error_message;
-            error_message << "Too many redirects while trying to access " << initial_uri.toString();
-
-            throw Exception(error_message.str(), ErrorCodes::TOO_MANY_REDIRECTS);
-        }
-    }
-
-    virtual ~UpdatableSessionBase()
-    {
-    }
-};
-
-
-namespace detail
-{
-    template <typename UpdatableSessionPtr>
-    class ReadWriteBufferFromHTTPBase : public ReadBuffer
-    {
-    public:
-        using HTTPHeaderEntry = std::tuple<std::string, std::string>;
-        using HTTPHeaderEntries = std::vector<HTTPHeaderEntry>;
-
-    protected:
-        Poco::URI uri;
-        std::string method;
-
-        UpdatableSessionPtr session;
-        std::istream * istr; /// owned by session
-        std::unique_ptr<ReadBuffer> impl;
-        std::function<void(std::ostream &)> out_stream_callback;
-        const Poco::Net::HTTPBasicCredentials & credentials;
-        std::vector<Poco::Net::HTTPCookie> cookies;
-        HTTPHeaderEntries http_header_entries;
-        RemoteHostFilter remote_host_filter;
-
-        std::istream * call(const Poco::URI uri_, Poco::Net::HTTPResponse & response)
-        {
-            // With empty path poco will send "POST  HTTP/1.1" its bug.
-            if (uri.getPath().empty())
-                uri.setPath("/");
-
-            Poco::Net::HTTPRequest request(method, uri_.getPathAndQuery(), Poco::Net::HTTPRequest::HTTP_1_1);
-            request.setHost(uri_.getHost()); // use original, not resolved host name in header
-
-            if (out_stream_callback)
-                request.setChunkedTransferEncoding(true);
-
-            for (auto & http_header_entry: http_header_entries)
-            {
-                request.set(std::get<0>(http_header_entry), std::get<1>(http_header_entry));
-            }
-
-            if (!credentials.getUsername().empty())
-                credentials.authenticate(request);
-
-            LOG_TRACE((&Poco::Logger::get("ReadWriteBufferFromHTTP")), "Sending request to {}", uri.toString());
-
-            auto sess = session->getSession();
-
-            try
-            {
-                auto & stream_out = sess->sendRequest(request);
-
-                if (out_stream_callback)
-                    out_stream_callback(stream_out);
-
-                istr = receiveResponse(*sess, request, response, true);
-                response.getCookies(cookies);
-
-                return istr;
-
-            }
-            catch (const Poco::Exception & e)
-            {
-                /// We use session data storage as storage for exception text
-                /// Depend on it we can deduce to reconnect session or reresolve session host
-                sess->attachSessionData(e.message());
-                throw;
-            }
-        }
-
-    public:
-        using OutStreamCallback = std::function<void(std::ostream &)>;
-
-        explicit ReadWriteBufferFromHTTPBase(
-            UpdatableSessionPtr session_,
-            Poco::URI uri_,
-            const std::string & method_ = {},
-            OutStreamCallback out_stream_callback_ = {},
-            const Poco::Net::HTTPBasicCredentials & credentials_ = {},
-            size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE,
-            HTTPHeaderEntries http_header_entries_ = {},
-            const RemoteHostFilter & remote_host_filter_ = {})
-            : ReadBuffer(nullptr, 0)
-            , uri {uri_}
-            , method {!method_.empty() ? method_ : out_stream_callback_ ? Poco::Net::HTTPRequest::HTTP_POST : Poco::Net::HTTPRequest::HTTP_GET}
-            , session {session_}
-            , out_stream_callback {out_stream_callback_}
-            , credentials {credentials_}
-            , http_header_entries {http_header_entries_}
-            , remote_host_filter {remote_host_filter_}
-        {
-            Poco::Net::HTTPResponse response;
-
-            istr = call(uri, response);
-
-            while (isRedirect(response.getStatus()))
-            {
-                Poco::URI uri_redirect(response.get("Location"));
-                remote_host_filter.checkURL(uri_redirect);
-
-                session->updateSession(uri_redirect);
-
-                istr = call(uri_redirect,response);
-            }
-
-            try
-            {
-                impl = std::make_unique<ReadBufferFromIStream>(*istr, buffer_size_);
-            }
-            catch (const Poco::Exception & e)
-            {
-                /// We use session data storage as storage for exception text
-                /// Depend on it we can deduce to reconnect session or reresolve session host
-                auto sess = session->getSession();
-                sess->attachSessionData(e.message());
-                throw;
-            }
-        }
-
-        bool nextImpl() override
-        {
-            if (!impl->next())
-                return false;
-            internal_buffer = impl->buffer();
-            working_buffer = internal_buffer;
-            return true;
-        }
-
-        std::string getResponseCookie(const std::string & name, const std::string & def) const
-        {
-            for (const auto & cookie : cookies)
-                if (cookie.getName() == name)
-                    return cookie.getValue();
-            return def;
-        }
+        // nullopt if the server doesn't report it.
+        std::optional<size_t> file_size;
+        std::optional<time_t> last_modified;
+        bool seekable = false;
     };
-}
 
-class UpdatableSession : public UpdatableSessionBase<HTTPSessionPtr>
-{
-    using Parent = UpdatableSessionBase<HTTPSessionPtr>;
-
-public:
-    explicit UpdatableSession(const Poco::URI uri,
-        const ConnectionTimeouts & timeouts_,
-        const SettingUInt64 max_redirects_)
-        : Parent(uri, timeouts_, max_redirects_)
-    {
-        session = makeHTTPSession(initial_uri, timeouts);
-    }
-
-    void buildNewSession(const Poco::URI & uri) override
-    {
-        session = makeHTTPSession(uri, timeouts);
-    }
-};
-
-class ReadWriteBufferFromHTTP : public detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatableSession>>
-{
-    using Parent = detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatableSession>>;
-
-public:
-    explicit ReadWriteBufferFromHTTP(Poco::URI uri_,
-        const std::string & method_,
-        OutStreamCallback out_stream_callback_,
-        const ConnectionTimeouts & timeouts,
-        const SettingUInt64 max_redirects = 0,
-        const Poco::Net::HTTPBasicCredentials & credentials_ = {},
-        size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE,
-        const HTTPHeaderEntries & http_header_entries_ = {},
-        const RemoteHostFilter & remote_host_filter_ = {})
-        : Parent(std::make_shared<UpdatableSession>(uri_, timeouts, max_redirects), uri_, method_, out_stream_callback_, credentials_, buffer_size_, http_header_entries_, remote_host_filter_)
-    {
-    }
-};
-
-class UpdatablePooledSession : public UpdatableSessionBase<PooledHTTPSessionPtr>
-{
-    using Parent = UpdatableSessionBase<PooledHTTPSessionPtr>;
+    using OutStreamCallback = std::function<void(std::ostream &)>;
+    using NextCallback = std::function<void(size_t)>;
 
 private:
-    size_t per_endpoint_pool_size;
+    /// Byte range, including right bound [begin, end].
+    struct HTTPRange
+    {
+        std::optional<size_t> begin;
+        std::optional<size_t> end;
+    };
+
+    struct CallResult
+    {
+        HTTPSessionPtr session;
+        std::istream * response_stream = nullptr;
+
+        CallResult(HTTPSessionPtr && session_, std::istream & response_stream_)
+            : session(session_)
+            , response_stream(&response_stream_)
+        {}
+        CallResult(CallResult &&) = default;
+        CallResult & operator= (CallResult &&) = default;
+
+        std::unique_ptr<ReadBuffer> transformToReadBuffer(size_t buf_size) &&;
+    };
+
+    const HTTPConnectionGroupType connection_group;
+    const Poco::URI initial_uri;
+    const std::string method;
+    const ProxyConfiguration proxy_config;
+    const ReadSettings read_settings;
+    const ConnectionTimeouts timeouts;
+
+    const Poco::Net::HTTPBasicCredentials & credentials;
+    const RemoteHostFilter * remote_host_filter;
+
+    const size_t buffer_size;
+    const size_t max_redirects;
+    const bool enable_url_encoding;
+
+    const bool use_external_buffer;
+    const bool http_skip_not_found_url;
+    bool has_not_found_url = false;
+
+    std::function<void(std::ostream &)> out_stream_callback;
+
+    Poco::URI current_uri;
+    size_t redirects = 0;
+
+    std::string content_encoding;
+    std::unique_ptr<ReadBuffer> impl;
+
+    std::vector<Poco::Net::HTTPCookie> cookies;
+
+    std::map<String, String> response_headers;
+
+    HTTPHeaderEntries http_header_entries;
+    std::function<void(size_t)> next_callback;
+
+    size_t offset_from_begin_pos = 0;
+    HTTPRange read_range;
+    std::optional<HTTPFileInfo> file_info;
+
+    LoggerPtr log;
+
+    bool withPartialContent() const;
+
+    void prepareRequest(Poco::Net::HTTPRequest & request, std::optional<HTTPRange> range) const;
+
+    void doWithRetries(std::function<void()> && callable, std::function<void()> on_retry = nullptr, bool mute_logging = false) const;
+
+    CallResult  callImpl(
+        Poco::Net::HTTPResponse & response,
+        const std::string & method_,
+        const std::optional<HTTPRange> & range,
+        bool allow_redirects) const;
+
+    CallResult  callWithRedirects(
+        Poco::Net::HTTPResponse & response,
+        const String & method_,
+        const std::optional<HTTPRange> & range);
+
+    std::unique_ptr<ReadBuffer> initialize();
+
+    std::optional<size_t> tryGetFileSize() override;
+
+    bool supportsReadAt() override;
+
+    bool checkIfActuallySeekable() override;
+
+    String getFileName() const override;
+
+    void getHeadResponse(Poco::Net::HTTPResponse & response);
+
+    void setupExternalBuffer();
+
+    size_t getOffset() const;
+
+    // If true, if we destroy impl now, no work was wasted. Just for metrics.
+    bool atEndOfRequestedRangeGuess();
+
+    ReadWriteBufferFromHTTP(
+        const HTTPConnectionGroupType & connection_group_,
+        const Poco::URI & uri_,
+        const std::string & method_,
+        ProxyConfiguration proxy_config_,
+        ReadSettings read_settings_,
+        ConnectionTimeouts timeouts_,
+        const Poco::Net::HTTPBasicCredentials & credentials_,
+        const RemoteHostFilter * remote_host_filter_,
+        size_t buffer_size_,
+        size_t max_redirects_,
+        bool enable_url_encoding_,
+        OutStreamCallback out_stream_callback_,
+        bool use_external_buffer_,
+        bool http_skip_not_found_url_,
+        HTTPHeaderEntries http_header_entries_,
+        bool delay_initialization,
+        std::optional<HTTPFileInfo> file_info_);
 
 public:
-    explicit UpdatablePooledSession(const Poco::URI uri,
-        const ConnectionTimeouts & timeouts_,
-        const SettingUInt64 max_redirects_,
-        size_t per_endpoint_pool_size_)
-        : Parent(uri, timeouts_, max_redirects_)
-        , per_endpoint_pool_size { per_endpoint_pool_size_ }
-    {
-        session = makePooledHTTPSession(initial_uri, timeouts, per_endpoint_pool_size);
-    }
+    bool nextImpl() override;
 
-    void buildNewSession(const Poco::URI & uri) override
-    {
-       session = makePooledHTTPSession(uri, timeouts, per_endpoint_pool_size);
-    }
+    size_t readBigAt(char * to, size_t n, size_t offset, const std::function<bool(size_t)> & progress_callback) const override;
+
+    off_t seek(off_t offset_, int whence) override;
+
+    void setReadUntilPosition(size_t until) override;
+
+    void setReadUntilEnd() override;
+
+    bool supportsRightBoundedReads() const override;
+
+    off_t getPosition() override;
+
+    std::string getResponseCookie(const std::string & name, const std::string & def) const;
+
+    /// Set function to call on each nextImpl, useful when you need to track
+    /// progress.
+    /// NOTE: parameter on each call is not incremental -- it's all bytes count
+    /// passed through the buffer
+    void setNextCallback(NextCallback next_callback_);
+
+    const std::string & getCompressionMethod() const;
+
+    std::optional<time_t> tryGetLastModificationTime();
+
+    bool hasNotFoundURL() const { return has_not_found_url; }
+
+    HTTPFileInfo getFileInfo();
+    static HTTPFileInfo parseFileInfo(const Poco::Net::HTTPResponse & response, size_t requested_range_begin);
+
+    Map getResponseHeaders() const;
 };
 
-class PooledReadWriteBufferFromHTTP : public detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatablePooledSession>>
+using ReadWriteBufferFromHTTPPtr = std::unique_ptr<ReadWriteBufferFromHTTP>;
+
+class BuilderRWBufferFromHTTP
 {
-    using Parent = detail::ReadWriteBufferFromHTTPBase<std::shared_ptr<UpdatablePooledSession>>;
+    Poco::URI uri;
+    std::string method = Poco::Net::HTTPRequest::HTTP_GET;
+    HTTPConnectionGroupType connection_group = HTTPConnectionGroupType::HTTP;
+    bool bypass_proxy = false;
+    ReadSettings read_settings{};
+    ConnectionTimeouts timeouts{};
+    const RemoteHostFilter * remote_host_filter = nullptr;
+    size_t buffer_size = DBMS_DEFAULT_BUFFER_SIZE;
+    size_t max_redirects = 0;
+    bool enable_url_encoding = false;
+    ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback = nullptr;
+    bool use_external_buffer = false;
+    bool http_skip_not_found_url = false;
+    HTTPHeaderEntries http_header_entries{};
+    bool delay_initialization = true;
 
 public:
-    explicit PooledReadWriteBufferFromHTTP(Poco::URI uri_,
-        const std::string & method_ = {},
-        OutStreamCallback out_stream_callback_ = {},
-        const ConnectionTimeouts & timeouts_ = {},
-        const Poco::Net::HTTPBasicCredentials & credentials_ = {},
-        size_t buffer_size_ = DBMS_DEFAULT_BUFFER_SIZE,
-        const SettingUInt64 max_redirects = 0,
-        size_t max_connections_per_endpoint = DEFAULT_COUNT_OF_HTTP_CONNECTIONS_PER_ENDPOINT)
-        : Parent(std::make_shared<UpdatablePooledSession>(uri_, timeouts_, max_redirects, max_connections_per_endpoint),
-              uri_,
-              method_,
-              out_stream_callback_,
-              credentials_,
-              buffer_size_)
-    {
+    explicit BuilderRWBufferFromHTTP(Poco::URI uri_)
+        : uri(uri_)
+    {}
+
+/// NOLINTBEGIN(bugprone-macro-parentheses)
+#define setterMember(name, member) \
+    BuilderRWBufferFromHTTP & name(decltype(BuilderRWBufferFromHTTP::member) arg_##member) \
+    { \
+        member = std::move(arg_##member); \
+        return *this; \
     }
+
+    setterMember(withConnectionGroup, connection_group)
+    setterMember(withMethod, method)
+    setterMember(withBypassProxy, bypass_proxy)
+    setterMember(withSettings, read_settings)
+    setterMember(withTimeouts, timeouts)
+    setterMember(withHostFilter, remote_host_filter)
+    setterMember(withBufSize, buffer_size)
+    setterMember(withRedirects, max_redirects)
+    setterMember(withEnableUrlEncoding, enable_url_encoding)
+    setterMember(withOutCallback, out_stream_callback)
+    setterMember(withHeaders, http_header_entries)
+    setterMember(withExternalBuf, use_external_buffer)
+    setterMember(withDelayInit, delay_initialization)
+    setterMember(withSkipNotFound, http_skip_not_found_url)
+#undef setterMember
+/// NOLINTEND(bugprone-macro-parentheses)
+
+    ReadWriteBufferFromHTTPPtr create(const Poco::Net::HTTPBasicCredentials & credentials_);
 };
 
 }

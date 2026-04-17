@@ -1,6 +1,10 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
+#if defined(OS_SUNOS)
+#  include <sys/termios.h>
+#endif
 #include <Common/Exception.h>
+#include <Common/ErrnoException.h>
 #include <Common/TerminalSize.h>
 #include <boost/program_options.hpp>
 
@@ -10,18 +14,26 @@ namespace DB::ErrorCodes
     extern const int SYSTEM_ERROR;
 }
 
-uint16_t getTerminalWidth()
+std::pair<uint16_t, uint16_t> getTerminalSize(int in_fd, int err_fd)
 {
-    if (isatty(STDIN_FILENO))
+    struct winsize terminal_size {};
+    if (isatty(in_fd))
     {
-        winsize terminal_size {};
-
-        if (ioctl(STDIN_FILENO, TIOCGWINSZ, &terminal_size))
-            DB::throwFromErrno("Cannot obtain terminal window size (ioctl TIOCGWINSZ)", DB::ErrorCodes::SYSTEM_ERROR);
-
-        return terminal_size.ws_col;
+        if (ioctl(in_fd, TIOCGWINSZ, &terminal_size))
+            throw DB::ErrnoException(DB::ErrorCodes::SYSTEM_ERROR, "Cannot obtain terminal window size (ioctl TIOCGWINSZ)");
     }
-    return 0;
+    else if (isatty(err_fd))
+    {
+        if (ioctl(err_fd, TIOCGWINSZ, &terminal_size))
+            throw DB::ErrnoException(DB::ErrorCodes::SYSTEM_ERROR, "Cannot obtain terminal window size (ioctl TIOCGWINSZ)");
+    }
+    /// Default - 0.
+    return {terminal_size.ws_col, terminal_size.ws_row};
+}
+
+uint16_t getTerminalWidth(int in_fd, int err_fd)
+{
+    return getTerminalSize(in_fd, err_fd).first;
 }
 
 po::options_description createOptionsDescription(const std::string & caption, uint16_t terminal_width)

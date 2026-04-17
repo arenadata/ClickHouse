@@ -1,3 +1,5 @@
+SET optimize_on_insert = 0;
+
 DROP TABLE IF EXISTS data_01285;
 
 SET max_threads=1;
@@ -17,9 +19,9 @@ SELECT * FROM data_01285;
 SELECT * FROM data_01285 WHERE assumeNotNull(value) = 1;
 SELECT 'INSERT';
 INSERT INTO data_01285 SELECT 1, number FROM numbers(4);
-SELECT * FROM data_01285;
-SELECT * FROM data_01285 WHERE assumeNotNull(value) = 1;
-SELECT * FROM data_01285 WHERE assumeNotNull(value) = 3;
+SELECT * FROM data_01285 ORDER BY ALL;
+SELECT * FROM data_01285 WHERE assumeNotNull(value) = 1 ORDER BY ALL;
+SELECT * FROM data_01285 WHERE assumeNotNull(value) = 3 ORDER BY ALL;
 SELECT 'OPTIMIZE';
 OPTIMIZE TABLE data_01285 FINAL;
 SELECT * FROM data_01285;
@@ -32,3 +34,5 @@ OPTIMIZE TABLE data_01285 FINAL;
 SELECT * FROM data_01285;
 -- and this passes even without fix.
 SELECT * FROM data_01285 WHERE assumeNotNull(value) = 3;
+
+DROP TABLE data_01285;

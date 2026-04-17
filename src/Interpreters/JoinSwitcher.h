@@ -6,6 +6,7 @@
 #include <Interpreters/IJoin.h>
 #include <Interpreters/TableJoin.h>
 
+
 namespace DB
 {
 
@@ -15,31 +16,34 @@ namespace DB
 class JoinSwitcher : public IJoin
 {
 public:
-    JoinSwitcher(std::shared_ptr<TableJoin> table_join_, const Block & right_sample_block_);
+    JoinSwitcher(std::shared_ptr<TableJoin> table_join_, SharedHeader right_sample_block_);
+
+    std::string getName() const override { return "JoinSwitcher"; }
+    const TableJoin & getTableJoin() const override { return *table_join; }
 
     /// Add block of data from right hand of JOIN into current join object.
     /// If join-in-memory memory limit exceeded switches to join-on-disk and continue with it.
     /// @returns false, if join-on-disk disk limit exceeded
-    bool addJoinedBlock(const Block & block, bool check_limits) override;
+    bool addBlockToJoin(const Block & block, bool check_limits) override;
 
-    void joinBlock(Block & block, std::shared_ptr<ExtraBlock> & not_processed) override
+    void checkTypesOfKeys(const Block & block) const override
     {
-        join->joinBlock(block, not_processed);
+        join->checkTypesOfKeys(block);
     }
 
-    bool hasTotals() const override
+    JoinResultPtr joinBlock(Block block) override
     {
-        return join->hasTotals();
+        return join->joinBlock(block);
+    }
+
+    const Block & getTotals() const override
+    {
+        return join->getTotals();
     }
 
     void setTotals(const Block & block) override
     {
         join->setTotals(block);
-    }
-
-    void joinTotals(Block & block) const override
-    {
-        join->joinTotals(block);
     }
 
     size_t getTotalRowCount() const override
@@ -57,10 +61,27 @@ public:
         return join->alwaysReturnsEmptySet();
     }
 
-    BlockInputStreamPtr createStreamWithNonJoinedRows(const Block & block, UInt64 max_block_size) const override
+    IBlocksStreamPtr
+    getNonJoinedBlocks(const Block & left_sample_block, const Block & result_sample_block, UInt64 max_block_size) const override
     {
-        return join->createStreamWithNonJoinedRows(block, max_block_size);
+        return join->getNonJoinedBlocks(left_sample_block, result_sample_block, max_block_size);
     }
+
+    IBlocksStreamPtr getDelayedBlocks() override
+    {
+        return join->getDelayedBlocks();
+    }
+
+    bool hasDelayedBlocks() const override
+    {
+        return join->hasDelayedBlocks();
+    }
+
+    void onBuildPhaseFinish() override { join->onBuildPhaseFinish(); }
+
+    bool hasPostBuildPhase() const override { return join->hasPostBuildPhase(); }
+
+    void runPostBuildPhase() override { join->runPostBuildPhase(); }
 
 private:
     JoinPtr join;
@@ -72,7 +93,7 @@ private:
 
     /// Change join-in-memory to join-on-disk moving right hand JOIN data from one to another.
     /// Throws an error if join-on-disk do not support JOIN kind or strictness.
-    void switchJoin();
+    bool switchJoin();
 };
 
 }

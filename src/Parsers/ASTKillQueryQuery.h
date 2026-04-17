@@ -1,3 +1,4 @@
+#pragma once
 #include <Parsers/IAST.h>
 #include <Parsers/ASTQueryWithOutput.h>
 #include <Parsers/ASTQueryWithOnCluster.h>
@@ -8,10 +9,12 @@ namespace DB
 class ASTKillQueryQuery : public ASTQueryWithOutput, public ASTQueryWithOnCluster
 {
 public:
-    enum class Type
+    enum class Type : uint8_t
     {
         Query,      /// KILL QUERY
         Mutation,   /// KILL MUTATION
+        PartMoveToShard, /// KILL PART_MOVE_TO_SHARD
+        Transaction,     /// KILL TRANSACTION
     };
 
     Type type = Type::Query;
@@ -21,7 +24,7 @@ public:
 
     ASTPtr clone() const override
     {
-        auto clone = std::make_shared<ASTKillQueryQuery>(*this);
+        auto clone = make_intrusive<ASTKillQueryQuery>(*this);
         if (where_expression)
         {
             clone->where_expression = where_expression->clone();
@@ -33,12 +36,14 @@ public:
 
     String getID(char) const override;
 
-    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void formatQueryImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 
-    ASTPtr getRewrittenASTWithoutOnCluster(const std::string &) const override
+    ASTPtr getRewrittenASTWithoutOnCluster(const WithoutOnClusterASTRewriteParams &) const override
     {
         return removeOnCluster<ASTKillQueryQuery>(clone());
     }
+
+    QueryKind getQueryKind() const override { return QueryKind::KillQuery; }
 };
 
 }

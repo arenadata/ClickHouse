@@ -1,9 +1,15 @@
 #pragma once
-#include <Poco/Logger.h>
-#include <Processors/IProcessor.h>
-#include <Interpreters/SubqueryForSet.h>
+
+#include <QueryPipeline/SizeLimits.h>
+#include <Interpreters/Context_fwd.h>
+#include <Processors/IAccumulatingTransform.h>
+#include <QueryPipeline/Chain.h>
+#include <QueryPipeline/QueryPipeline.h>
+#include <Interpreters/PreparedSets.h>
+#include <Common/Logger.h>
 #include <Common/Stopwatch.h>
-#include <DataStreams/SizeLimits.h>
+
+#include <Poco/Logger.h>
 
 namespace DB
 {
@@ -12,55 +18,57 @@ class QueryStatus;
 struct Progress;
 using ProgressCallback = std::function<void(const Progress & progress)>;
 
-/// This processor creates sets during execution.
+class PushingPipelineExecutor;
+
+/// This processor creates set during execution.
 /// Don't return any data. Sets are created when Finish status is returned.
 /// In general, several work() methods need to be called to finish.
-/// TODO: several independent processors can be created for each subquery. Make subquery a piece of pipeline.
-class CreatingSetsTransform : public IProcessor
+/// Independent processors is created for each subquery.
+class CreatingSetsTransform : public IAccumulatingTransform
 {
 public:
     CreatingSetsTransform(
-        Block out_header_,
-        SubqueriesForSets subqueries_for_sets_,
+        SharedHeader in_header_,
+        SharedHeader out_header_,
+        SetAndKeyPtr set_and_key_,
         SizeLimits network_transfer_limits_,
-        const Context & context_);
+        PreparedSetsCachePtr prepared_sets_cache_);
+
+    ~CreatingSetsTransform() override;
 
     String getName() const override { return "CreatingSetsTransform"; }
-    Status prepare() override;
+
     void work() override;
-
-    void setProgressCallback(const ProgressCallback & callback);
-    void setProcessListElement(QueryStatus * status);
-
-protected:
-    bool finished = false;
+    void consume(Chunk chunk) override;
+    Chunk generate() override;
 
 private:
-    SubqueriesForSets subqueries_for_sets;
-    SubqueriesForSets::iterator cur_subquery;
+    SetAndKeyPtr set_and_key;
+    std::optional<std::promise<SetPtr>> promise_to_build;
 
-    bool started_cur_subquery = false;
-    BlockOutputStreamPtr table_out;
-    UInt64 elapsed_nanoseconds = 0;
+    QueryPipeline table_out;
+    std::unique_ptr<PushingPipelineExecutor> executor;
+    UInt64 read_rows = 0;
+    bool set_from_cache = false;
+    Stopwatch watch;
 
     bool done_with_set = true;
-    bool done_with_join = true;
     bool done_with_table = true;
 
     SizeLimits network_transfer_limits;
-    const Context & context;
+    PreparedSetsCachePtr prepared_sets_cache;
 
     size_t rows_to_transfer = 0;
     size_t bytes_to_transfer = 0;
 
     using Logger = Poco::Logger;
-    Poco::Logger * log = &Poco::Logger::get("CreatingSetsBlockInputStream");
+    LoggerPtr log = getLogger("CreatingSetsTransform");
 
     bool is_initialized = false;
 
     void init();
-    void startSubquery(SubqueryForSet & subquery);
-    void finishSubquery(SubqueryForSet & subquery);
+    void startSubquery();
+    void finishSubquery();
 };
 
 }

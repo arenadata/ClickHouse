@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
-$CLICKHOUSE_CLIENT --multiquery --query "
+$CLICKHOUSE_CLIENT --query "
 DROP TABLE IF EXISTS NmSubj;
 DROP TABLE IF EXISTS events;
 
@@ -51,7 +52,7 @@ create table events
 insert into NmSubj values (1, 1), (2, 2), (3, 3);
 "
 
-$CLICKHOUSE_CLIENT --query "INSERT INTO events FORMAT TSV" < ${CURDIR}/01285_engine_join_donmikel.tsv
+$CLICKHOUSE_CLIENT --query "INSERT INTO events FORMAT TSV" < "${CURDIR}"/01285_engine_join_donmikel.tsv
 
 $CLICKHOUSE_CLIENT --query "
 SELECT toInt32(count() / 24) as Count
@@ -59,7 +60,7 @@ FROM events as e INNER JOIN NmSubj as ns
 ON ns.NmId = toUInt32(e.Param1)
 WHERE e.EventDate = today() - 7 AND e.EventId = 'GCO' AND ns.SubjectId = 2073"
 
-$CLICKHOUSE_CLIENT --multiquery --query "
+$CLICKHOUSE_CLIENT --query "
 DROP TABLE NmSubj;
 DROP TABLE events;
 "

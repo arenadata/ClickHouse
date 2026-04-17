@@ -1,8 +1,5 @@
 #pragma once
 
-#include <cstddef>
-
-
 namespace DB
 {
 
@@ -17,7 +14,12 @@ struct LazyPipeFDs
     void open();
     void close();
 
-    void setNonBlocking();
+    /// Set O_NONBLOCK to different ends of pipe preserving existing flags.
+    /// Throws an exception if fcntl was not successful.
+    void setNonBlockingWrite();
+    void setNonBlockingRead();
+    void setNonBlockingReadWrite();
+
     void tryIncreaseSize(int desired_size);
 
     ~LazyPipeFDs();

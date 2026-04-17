@@ -1,38 +1,71 @@
+#include <Processors/Port.h>
 #include <Processors/QueryPlan/OffsetStep.h>
+#include <Processors/QueryPlan/QueryPlanStepRegistry.h>
+#include <Processors/QueryPlan/Serialization.h>
 #include <Processors/OffsetTransform.h>
-#include <Processors/QueryPipeline.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 #include <IO/Operators.h>
+#include <Common/JSONBuilder.h>
 
 namespace DB
 {
 
-static ITransformingStep::DataStreamTraits getTraits()
+static ITransformingStep::Traits getTraits()
 {
-    return ITransformingStep::DataStreamTraits
+    return ITransformingStep::Traits
     {
-            .preserves_distinct_columns = true,
+        {
             .returns_single_stream = false,
             .preserves_number_of_streams = true,
+            .preserves_sorting = true,
+        },
+        {
+            .preserves_number_of_rows = false,
+        }
     };
 }
 
-OffsetStep::OffsetStep(const DataStream & input_stream_, size_t offset_)
-    : ITransformingStep(input_stream_, input_stream_.header, getTraits())
+OffsetStep::OffsetStep(const SharedHeader & input_header_, size_t offset_)
+    : ITransformingStep(input_header_, input_header_, getTraits())
     , offset(offset_)
 {
 }
 
-void OffsetStep::transformPipeline(QueryPipeline & pipeline)
+void OffsetStep::transformPipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
     auto transform = std::make_shared<OffsetTransform>(
             pipeline.getHeader(), offset, pipeline.getNumStreams());
 
-    pipeline.addPipe({std::move(transform)});
+    pipeline.addTransform(std::move(transform));
 }
 
 void OffsetStep::describeActions(FormatSettings & settings) const
 {
-    settings.out << String(settings.offset, ' ') << "Offset " << offset << '\n';
+    const auto & prefix = settings.detail_prefix;
+    settings.out << prefix << "Offset " << offset << '\n';
+}
+
+void OffsetStep::describeActions(JSONBuilder::JSONMap & map) const
+{
+    map.add("Offset", offset);
+}
+
+void OffsetStep::serialize(Serialization & ctx) const
+{
+    writeVarUInt(offset, ctx.out);
+}
+
+QueryPlanStepPtr OffsetStep::deserialize(Deserialization & ctx)
+{
+    UInt64 offset;
+    readVarUInt(offset, ctx.in);
+
+    return std::make_unique<OffsetStep>(ctx.input_headers.front(), offset);
+}
+
+void registerOffsetStep(QueryPlanStepRegistry & registry)
+{
+    registry.registerStep("Offset", OffsetStep::deserialize);
 }
 
 }

@@ -1,3 +1,7 @@
+-- Tags: distributed
+
+set distributed_foreground_insert = 1;
+
 DROP TABLE IF EXISTS visits;
 DROP TABLE IF EXISTS visits_dist;
 

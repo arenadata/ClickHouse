@@ -1,4 +1,4 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -9,6 +9,8 @@
 
 namespace DB
 {
+namespace
+{
 
 /// Implements the function nullIf which takes 2 arguments and returns
 /// NULL if both arguments have the same value. Otherwise it returns the
@@ -16,16 +18,16 @@ namespace DB
 class FunctionNullIf : public IFunction
 {
 private:
-    const Context & context;
+    ContextPtr context;
 public:
     static constexpr auto name = "nullIf";
 
-    static FunctionPtr create(const Context & context)
+    static FunctionPtr create(ContextPtr context)
     {
         return std::make_shared<FunctionNullIf>(context);
     }
 
-    explicit FunctionNullIf(const Context & context_) : context(context_) {}
+    explicit FunctionNullIf(ContextPtr context_) : context(context_) {}
 
     std::string getName() const override
     {
@@ -35,50 +37,63 @@ public:
     size_t getNumberOfArguments() const override { return 2; }
     bool useDefaultImplementationForNulls() const override { return false; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         return makeNullable(arguments[0]);
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
     {
         /// nullIf(col1, col2) == if(col1 = col2, NULL, col1)
 
-        Block temp_block = block;
+        auto equals_func = FunctionFactory::instance().get("equals", context)->build(arguments);
+        auto eq_res = equals_func->execute(arguments, equals_func->getResultType(), input_rows_count, /* dry_run = */ false);
 
-        auto equals_func = FunctionFactory::instance().get("equals", context)->build(
-            {temp_block.getByPosition(arguments[0]), temp_block.getByPosition(arguments[1])});
+        ColumnsWithTypeAndName if_columns
+        {
+            {eq_res, equals_func->getResultType(), ""},
+            {result_type->createColumnConstWithDefaultValue(input_rows_count), result_type, "NULL"},
+            arguments[0],
+        };
 
-        size_t equals_res_pos = temp_block.columns();
-        temp_block.insert({nullptr, equals_func->getReturnType(), ""});
+        auto func_if = FunctionFactory::instance().get("if", context)->build(if_columns);
+        auto if_res = func_if->execute(if_columns, result_type, input_rows_count, /* dry_run = */ false);
 
-        equals_func->execute(temp_block, {arguments[0], arguments[1]}, equals_res_pos, input_rows_count);
-
-        /// Argument corresponding to the NULL value.
-        size_t null_pos = temp_block.columns();
-
-        /// Append a NULL column.
-        ColumnWithTypeAndName null_elem;
-        null_elem.type = block.getByPosition(result).type;
-        null_elem.column = null_elem.type->createColumnConstWithDefaultValue(input_rows_count);
-        null_elem.name = "NULL";
-
-        temp_block.insert(null_elem);
-
-        auto func_if = FunctionFactory::instance().get("if", context)->build(
-            {temp_block.getByPosition(equals_res_pos), temp_block.getByPosition(null_pos), temp_block.getByPosition(arguments[0])});
-        func_if->execute(temp_block, {equals_res_pos, null_pos, arguments[0]}, result, input_rows_count);
-
-        block.getByPosition(result).column = makeNullable(std::move(temp_block.getByPosition(result).column));
+        return makeNullable(if_res);
     }
 };
 
+}
 
-void registerFunctionNullIf(FunctionFactory & factory)
+REGISTER_FUNCTION(NullIf)
 {
-    factory.registerFunction<FunctionNullIf>(FunctionFactory::CaseInsensitive);
+    FunctionDocumentation::Description description = R"(
+Returns `NULL` if both arguments are equal.
+    )";
+    FunctionDocumentation::Syntax syntax = "nullIf(x, y)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "The first value.", {"Any"}},
+        {"y", "The second value.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `NULL` if both arguments are equal, otherwise returns the first argument.", {"NULL", "Nullable(x)"}};
+    FunctionDocumentation::Examples examples = {
+        {"Usage example",
+         R"(
+SELECT nullIf(1, 1), nullIf(1, 2);
+        )",
+         R"(
+┌─nullIf(1, 1)─┬─nullIf(1, 2)─┐
+│         ᴺᵁᴸᴸ │            1 │
+└──────────────┴──────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in{1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Null;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionNullIf>(documentation, FunctionFactory::Case::Insensitive);
 }
 
 }
-

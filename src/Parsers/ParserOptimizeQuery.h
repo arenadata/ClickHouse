@@ -7,7 +7,14 @@
 namespace DB
 {
 
-/** Query OPTIMIZE TABLE [db.]name [PARTITION partition] [FINAL] [DEDUPLICATE]
+class ParserOptimizeQueryColumnsSpecification : public IParserBase
+{
+protected:
+    const char * getName() const override { return "column specification for OPTIMIZE ... DEDUPLICATE BY"; }
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
+};
+
+/** Query OPTIMIZE TABLE [db.]name [PARTITION partition] [FINAL] [DEDUPLICATE] [CLEANUP]
   */
 class ParserOptimizeQuery : public IParserBase
 {

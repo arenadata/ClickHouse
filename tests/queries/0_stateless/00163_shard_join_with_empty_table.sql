@@ -1,7 +1,37 @@
+-- Tags: shard
+
 SET any_join_distinct_right_table_keys = 1;
 SET joined_subquery_requires_alias = 0;
+SET join_algorithm = 'hash';
+-- Pin max_block_size: with randomized values (e.g. 78753), LIMIT on a distributed
+-- stream from system.numbers can select rows starting at the block-size offset
+-- instead of 0, producing wrong output depending on block delivery order.
+SET max_block_size = 65536;
 
-SELECT number, number / 2 AS n, j1, j2 FROM remote('127.0.0.{2,3}', system.numbers) ANY LEFT JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0) USING n LIMIT 10;
-SELECT dummy + 2 AS number, number / 2 AS n, j1, j2 FROM remote('127.0.0.{2,3}', system.one) ANY INNER JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0) USING n LIMIT 10;
-SELECT number, number / 2 AS n, j1, j2 FROM remote('127.0.0.{2,3}', system.numbers) GLOBAL ANY LEFT JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0) USING n LIMIT 10;
-SELECT dummy + 2 AS number, number / 2 AS n, j1, j2 FROM remote('127.0.0.{2,3}', system.one) GLOBAL ANY INNER JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0) USING n LIMIT 10;
+SELECT * FROM (
+    SELECT number, n, j1, j2
+    FROM (SELECT number, number / 2 AS n FROM remote('127.0.0.{2,3}', system.numbers))
+    ANY LEFT JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0)
+    USING n LIMIT 10
+) ORDER BY number;
+
+SELECT * FROM (
+    SELECT number, n, j1, j2
+    FROM (SELECT dummy + 2 AS number, number / 2 AS n FROM remote('127.0.0.{2,3}', system.one))
+    ANY INNER JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0)
+    USING n LIMIT 10
+) ORDER BY number;
+
+SELECT * FROM (
+    SELECT number, n, j1, j2
+    FROM (SELECT number, number / 2 AS n FROM remote('127.0.0.{2,3}', system.numbers))
+    GLOBAL ANY LEFT JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0)
+    USING n LIMIT 10
+) ORDER BY number;
+
+SELECT * FROM (
+    SELECT number, n, j1, j2
+    FROM (SELECT dummy + 2 AS number, number / 2 AS n FROM remote('127.0.0.{2,3}', system.one))
+    GLOBAL ANY INNER JOIN (SELECT number / 3 AS n, number AS j1, 'Hello' AS j2 FROM system.numbers LIMIT 0)
+    USING n LIMIT 10
+) ORDER BY number;

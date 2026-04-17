@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
+# Tags: race, no-msan
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
 set -o errexit
 set -o pipefail
 
-for i in {1..10}; do seq 1 100 | sed 's/.*/SELECT * FROM system.numbers_mt LIMIT 111;/' | $CLICKHOUSE_CLIENT -n --max_block_size=$(($RANDOM % 123 + 1)) | wc -l | grep -vE '^11100$' && echo 'Fail!' && break; echo -n '.'; done; echo
+TIMELIMIT=$((SECONDS + 100))
+while [ $SECONDS -lt "$TIMELIMIT" ]; do seq 1 100 | sed 's/.*/SELECT * FROM system.numbers_mt LIMIT 111;/' | $CLICKHOUSE_CLIENT -n --max_block_size=$(($RANDOM % 123 + 1)) | wc -l | grep -vE '^11100$' && echo 'Fail!' && break; done; echo 'OK'

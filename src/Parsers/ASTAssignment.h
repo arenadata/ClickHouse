@@ -1,6 +1,8 @@
 #pragma once
 
 #include <Parsers/IAST.h>
+#include <Parsers/ASTWithAlias.h>
+#include <IO/Operators.h>
 
 namespace DB
 {
@@ -10,34 +12,33 @@ class ASTAssignment : public IAST
 {
 public:
     String column_name;
-    ASTPtr expression;
+
+    ASTPtr expression() const
+    {
+        return children.at(0);
+    }
 
     String getID(char delim) const override { return "Assignment" + (delim + column_name); }
 
     ASTPtr clone() const override
     {
-        auto res = std::make_shared<ASTAssignment>(*this);
-        res->children.clear();
-
-        if (expression)
-        {
-            res->expression = expression->clone();
-            res->children.push_back(res->expression);
-        }
-
+        auto res = make_intrusive<ASTAssignment>(*this);
+        res->children = { expression()->clone() };
         return res;
     }
 
 protected:
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
     {
-        settings.ostr << (settings.hilite ? hilite_identifier : "");
-        settings.writeIdentifier(column_name);
-        settings.ostr << (settings.hilite ? hilite_none : "");
+        settings.writeIdentifier(ostr, column_name, /*ambiguous=*/false);
+        ostr << " = ";
 
-        settings.ostr << (settings.hilite ? hilite_operator : "") << " = " << (settings.hilite ? hilite_none : "");
+        if (auto ast = boost::dynamic_pointer_cast<ASTWithAlias>(expression()); ast && !ast->alias.empty())
+        {
+            frame.need_parens = true;
+        }
 
-        expression->formatImpl(settings, state, frame);
+        expression()->format(ostr, settings, state, frame);
     }
 };
 

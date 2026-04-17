@@ -1,8 +1,7 @@
 #pragma once
 
-#include <ext/shared_ptr_helper.h>
 #include <optional>
-#include <Storages/IStorage.h>
+#include <Storages/StorageWithCommonVirtualColumns.h>
 
 namespace DB
 {
@@ -14,31 +13,35 @@ namespace DB
   * You could also specify a limit (how many zeros to give).
   * If multithreaded is specified, zeros will be generated in several streams.
   */
-class StorageSystemZeros final : public ext::shared_ptr_helper<StorageSystemZeros>, public IStorage
+class StorageSystemZeros final : public StorageWithCommonVirtualColumns
 {
-    friend struct ext::shared_ptr_helper<StorageSystemZeros>;
 public:
+    /// If even_distribution is true, numbers are distributed evenly between streams.
+    /// Otherwise, streams concurrently increment atomic.
+    StorageSystemZeros(const StorageID & table_id_, bool multithreaded_, std::optional<UInt64> limit_ = std::nullopt);
+
     std::string getName() const override { return "SystemZeros"; }
 
-    Pipes read(
+    static VirtualColumnsDescription createVirtuals();
+
+    using StorageWithCommonVirtualColumns::read;
+
+    Pipe read(
         const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
-        const SelectQueryInfo & query_info,
-        const Context & context,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
-        unsigned num_streams) override;
+        size_t num_streams) override;
 
     bool hasEvenlyDistributedRead() const override { return true; }
+    bool isSystemStorage() const override { return true; }
+    bool supportsTransactions() const override { return true; }
 
 private:
     bool multithreaded;
     std::optional<UInt64> limit;
-
-protected:
-    /// If even_distribution is true, numbers are distributed evenly between streams.
-    /// Otherwise, streams concurrently increment atomic.
-    StorageSystemZeros(const StorageID & table_id_, bool multithreaded_, std::optional<UInt64> limit_ = std::nullopt);
 };
 
 }

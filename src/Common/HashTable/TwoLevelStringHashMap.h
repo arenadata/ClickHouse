@@ -7,9 +7,9 @@ template <typename TMapped, typename Allocator = HashTableAllocator, template <t
 class TwoLevelStringHashMap : public TwoLevelStringHashTable<StringHashMapSubMaps<TMapped, Allocator>, ImplTable<TMapped, Allocator>>
 {
 public:
-    using Key = StringRef;
+    using Key = std::string_view;
     using Self = TwoLevelStringHashMap;
-    using Base = TwoLevelStringHashTable<StringHashMapSubMaps<TMapped, Allocator>, StringHashMap<TMapped, Allocator>>;
+    using Base = TwoLevelStringHashTable<StringHashMapSubMaps<TMapped, Allocator>, ImplTable<TMapped, Allocator>>;
     using LookupResult = typename Base::LookupResult;
 
     using Base::Base;
@@ -18,7 +18,7 @@ public:
     void ALWAYS_INLINE forEachMapped(Func && func)
     {
         for (auto i = 0u; i < this->NUM_BUCKETS; ++i)
-            return this->impls[i].forEachMapped(func);
+            this->impls[i].forEachMapped(func);
     }
 
     TMapped & ALWAYS_INLINE operator[](const Key & x)

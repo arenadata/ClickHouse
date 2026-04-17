@@ -1,4 +1,4 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeArray.h>
@@ -26,7 +26,7 @@ class FunctionArrayDistinct : public IFunction
 public:
     static constexpr auto name = "arrayDistinct";
 
-    static FunctionPtr create(const Context &)
+    static FunctionPtr create(ContextPtr)
     {
         return std::make_shared<FunctionArrayDistinct>();
     }
@@ -38,6 +38,8 @@ public:
 
     bool isVariadic() const override { return false; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     size_t getNumberOfArguments() const override { return 1; }
 
     bool useDefaultImplementationForConstants() const override { return true; }
@@ -46,16 +48,15 @@ public:
     {
         const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
         if (!array_type)
-            throw Exception("Argument for function " + getName() + " must be array but it "
-                " has type " + arguments[0]->getName() + ".",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Argument for function {} must be array but it  has type {}.",
+                getName(), arguments[0]->getName());
 
         auto nested_type = removeNullable(array_type->getNestedType());
 
         return std::make_shared<DataTypeArray>(nested_type);
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override;
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override;
 
 private:
     /// Initially allocate a piece of memory for 512 elements. NOTE: This is just a guess.
@@ -85,23 +86,23 @@ private:
 };
 
 
-void FunctionArrayDistinct::executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/)
+ColumnPtr FunctionArrayDistinct::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t /*input_rows_count*/) const
 {
-    ColumnPtr array_ptr = block.getByPosition(arguments[0]).column;
-    const ColumnArray * array = checkAndGetColumn<ColumnArray>(array_ptr.get());
+    ColumnPtr array_ptr = arguments[0].column;
+    const ColumnArray & array = checkAndGetColumn<ColumnArray>(*array_ptr);
 
-    const auto & return_type = block.getByPosition(result).type;
+    const auto & return_type = result_type;
 
     auto res_ptr = return_type->createColumn();
     ColumnArray & res = assert_cast<ColumnArray &>(*res_ptr);
 
-    const IColumn & src_data = array->getData();
-    const ColumnArray::Offsets & offsets = array->getOffsets();
+    const IColumn & src_data = array.getData();
+    const ColumnArray::Offsets & offsets = array.getOffsets();
 
     IColumn & res_data = res.getData();
     ColumnArray::Offsets & res_offsets = res.getOffsets();
 
-    const ColumnNullable * nullable_col = checkAndGetColumn<ColumnNullable>(src_data);
+    const ColumnNullable * nullable_col = checkAndGetColumn<ColumnNullable>(&src_data);
 
     const IColumn * inner_col;
 
@@ -127,7 +128,7 @@ void FunctionArrayDistinct::executeImpl(Block & block, const ColumnNumbers & arg
         || executeString(*inner_col, offsets, res_data, res_offsets, nullable_col)))
         executeHashed(*inner_col, offsets, res_data, res_offsets, nullable_col);
 
-    block.getByPosition(result).column = std::move(res_ptr);
+    return res_ptr;
 }
 
 template <typename T>
@@ -199,7 +200,7 @@ bool FunctionArrayDistinct::executeString(
 
     ColumnString & res_data_column_string = typeid_cast<ColumnString &>(res_data_col);
 
-    using Set = ClearableHashSetWithStackMemory<StringRef, StringRefHash,
+    using Set = ClearableHashSetWithStackMemory<std::string_view, StringViewHash,
         INITIAL_SIZE_DEGREE>;
 
     const PaddedPODArray<UInt8> * src_null_map = nullptr;
@@ -221,12 +222,12 @@ bool FunctionArrayDistinct::executeString(
             if (nullable_col && (*src_null_map)[j])
                 continue;
 
-            StringRef str_ref = src_data_concrete->getDataAt(j);
+            std::string_view str_ref = src_data_concrete->getDataAt(j);
 
             if (!set.find(str_ref))
             {
                 set.insert(str_ref);
-                res_data_column_string.insertData(str_ref.data, str_ref.size);
+                res_data_column_string.insertData(str_ref.data(), str_ref.size());
             }
         }
 
@@ -267,10 +268,9 @@ void FunctionArrayDistinct::executeHashed(
             if (nullable_col && (*src_null_map)[j])
                 continue;
 
-            UInt128 hash;
             SipHash hash_function;
             src_data.updateHashWithValue(j, hash_function);
-            hash_function.get128(reinterpret_cast<char *>(&hash));
+            const auto hash = hash_function.get128();
 
             if (!set.find(hash))
             {
@@ -287,9 +287,20 @@ void FunctionArrayDistinct::executeHashed(
 }
 
 
-void registerFunctionArrayDistinct(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayDistinct)
 {
-    factory.registerFunction<FunctionArrayDistinct>();
+    FunctionDocumentation::Description description = "Returns an array containing only the distinct elements of an array.";
+    FunctionDocumentation::Syntax syntax = "arrayDistinct(arr)";
+    FunctionDocumentation::Arguments argument = {
+        {"arr", "Array for which to extract distinct elements.", {"Array(T)"}},
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns an array containing the distinct elements", {"Array(T)"}};
+    FunctionDocumentation::Examples examples = {{"Usage example", "SELECT arrayDistinct([1, 2, 2, 3, 1]);", "[1,2,3]"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, argument, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionArrayDistinct>(documentation);
 }
 
 }

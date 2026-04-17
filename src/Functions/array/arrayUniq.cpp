@@ -1,4 +1,4 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeArray.h>
@@ -9,8 +9,6 @@
 #include <Columns/ColumnString.h>
 #include <Common/HashTable/ClearableHashSet.h>
 #include <Common/ColumnsHashing.h>
-#include <Interpreters/AggregationCommon.h>
-#include <IO/WriteHelpers.h>
 
 
 namespace DB
@@ -18,7 +16,7 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int SIZES_OF_ARRAYS_DOESNT_MATCH;
+    extern const int SIZES_OF_ARRAYS_DONT_MATCH;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int ILLEGAL_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
@@ -31,7 +29,7 @@ class FunctionArrayUniq : public IFunction
 public:
     static constexpr auto name = "arrayUniq";
 
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionArrayUniq>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionArrayUniq>(); }
 
     String getName() const override { return name; }
 
@@ -39,25 +37,33 @@ public:
     size_t getNumberOfArguments() const override { return 0; }
     bool useDefaultImplementationForConstants() const override { return true; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.empty())
-            throw Exception("Number of arguments for function " + getName() + " doesn't match: passed "
-                + toString(arguments.size()) + ", should be at least 1.",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                "Number of arguments for function {} doesn't match: passed {}, should be at least 1.",
+                getName(), arguments.size());
 
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[i].get());
             if (!array_type)
-                throw Exception("All arguments for function " + getName() + " must be arrays but argument " +
-                    toString(i + 1) + " has type " + arguments[i]->getName() + ".", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                                "All arguments for function {} must be arrays but argument {} has type {}.",
+                                getName(), i + 1, arguments[i]->getName());
         }
 
         return std::make_shared<DataTypeUInt32>();
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override;
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
+    {
+        return std::make_shared<DataTypeUInt32>();
+    }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override;
 
 private:
     /// Initially allocate a piece of memory for 512 elements. NOTE: This is just a guess.
@@ -74,7 +80,7 @@ private:
 
     struct MethodString
     {
-        using Set = ClearableHashSetWithStackMemory<StringRef, StringRefHash,
+        using Set = ClearableHashSetWithStackMemory<std::string_view, StringViewHash,
             INITIAL_SIZE_DEGREE>;
 
         using Method = ColumnsHashing::HashMethodString<typename Set::value_type, void, false, false>;
@@ -82,7 +88,7 @@ private:
 
     struct MethodFixedString
     {
-        using Set = ClearableHashSetWithStackMemory<StringRef, StringRefHash,
+        using Set = ClearableHashSetWithStackMemory<std::string_view, StringViewHash,
             INITIAL_SIZE_DEGREE>;
 
         using Method = ColumnsHashing::HashMethodFixedString<typename Set::value_type, void, false, false>;
@@ -106,22 +112,22 @@ private:
 
     template <typename Method>
     void executeMethod(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, const Sizes & key_sizes,
-            const NullMap * null_map, ColumnUInt32::Container & res_values);
+            const NullMap * null_map, ColumnUInt32::Container & res_values) const;
 
     template <typename Method, bool has_null_map>
     void executeMethodImpl(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, const Sizes & key_sizes,
-            const NullMap * null_map, ColumnUInt32::Container & res_values);
+            const NullMap * null_map, ColumnUInt32::Container & res_values) const;
 
     template <typename T>
-    bool executeNumber(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values);
-    bool executeString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values);
-    bool executeFixedString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values);
-    bool execute128bit(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values);
-    void executeHashed(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values);
+    bool executeNumber(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const;
+    bool executeString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const;
+    bool executeFixedString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const;
+    bool execute128bit(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values) const;
+    void executeHashed(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values) const;
 };
 
 
-void FunctionArrayUniq::executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/)
+ColumnPtr FunctionArrayUniq::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t /*input_rows_count*/) const
 {
     const ColumnArray::Offsets * offsets = nullptr;
     const size_t num_arguments = arguments.size();
@@ -131,16 +137,15 @@ void FunctionArrayUniq::executeImpl(Block & block, const ColumnNumbers & argumen
     Columns array_holders;
     for (size_t i = 0; i < num_arguments; ++i)
     {
-        const ColumnPtr & array_ptr = block.getByPosition(arguments[i]).column;
+        const ColumnPtr & array_ptr = arguments[i].column;
         const ColumnArray * array = checkAndGetColumn<ColumnArray>(array_ptr.get());
         if (!array)
         {
             const ColumnConst * const_array = checkAndGetColumnConst<ColumnArray>(
-                block.getByPosition(arguments[i]).column.get());
+                arguments[i].column.get());
             if (!const_array)
-                throw Exception("Illegal column " + block.getByPosition(arguments[i]).column->getName()
-                    + " of " + toString(i + 1) + "-th argument of function " + getName(),
-                    ErrorCodes::ILLEGAL_COLUMN);
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of {}-th argument of function {}",
+                    arguments[i].column->getName(), i + 1, getName());
             array_holders.emplace_back(const_array->convertToFullColumn());
             array = checkAndGetColumn<ColumnArray>(array_holders.back().get());
         }
@@ -149,8 +154,8 @@ void FunctionArrayUniq::executeImpl(Block & block, const ColumnNumbers & argumen
         if (i == 0)
             offsets = &offsets_i;
         else if (offsets_i != *offsets)
-            throw Exception("Lengths of all arrays passed to " + getName() + " must be equal.",
-                ErrorCodes::SIZES_OF_ARRAYS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH, "Lengths of all arrays passed to {} must be equal.",
+                getName());
 
         const auto * array_data = &array->getData();
         data_columns[i] = array_data;
@@ -160,7 +165,7 @@ void FunctionArrayUniq::executeImpl(Block & block, const ColumnNumbers & argumen
 
     for (size_t i = 0; i < num_arguments; ++i)
     {
-        if (const auto * nullable_col = checkAndGetColumn<ColumnNullable>(*data_columns[i]))
+        if (const auto * nullable_col = checkAndGetColumn<ColumnNullable>(data_columns[i]))
         {
             if (num_arguments == 1)
                 data_columns[i] = &nullable_col->getNestedColumn();
@@ -196,7 +201,7 @@ void FunctionArrayUniq::executeImpl(Block & block, const ColumnNumbers & argumen
             executeHashed(*offsets, data_columns, res_values);
     }
 
-    block.getByPosition(result).column = std::move(res);
+    return res;
 }
 
 template <typename Method, bool has_null_map>
@@ -205,7 +210,7 @@ void FunctionArrayUniq::executeMethodImpl(
     const ColumnRawPtrs & columns,
     const Sizes & key_sizes,
     [[maybe_unused]] const NullMap * null_map,
-    ColumnUInt32::Container & res_values)
+    ColumnUInt32::Container & res_values) const
 {
     typename Method::Set set;
     typename Method::Method method(columns, key_sizes, nullptr);
@@ -231,7 +236,7 @@ void FunctionArrayUniq::executeMethodImpl(
             method.emplaceKey(set, j, pool);
         }
 
-        res_values[i] = set.size() + found_null;
+        res_values[i] = static_cast<UInt32>(set.size() + found_null);
         prev_off = off;
     }
 }
@@ -242,7 +247,7 @@ void FunctionArrayUniq::executeMethod(
     const ColumnRawPtrs & columns,
     const Sizes & key_sizes,
     const NullMap * null_map,
-    ColumnUInt32::Container & res_values)
+    ColumnUInt32::Container & res_values) const
 {
     if (null_map)
         executeMethodImpl<Method, true>(offsets, columns, key_sizes, null_map, res_values);
@@ -252,7 +257,7 @@ void FunctionArrayUniq::executeMethod(
 }
 
 template <typename T>
-bool FunctionArrayUniq::executeNumber(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values)
+bool FunctionArrayUniq::executeNumber(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const
 {
     const auto * nested = checkAndGetColumn<ColumnVector<T>>(&data);
     if (!nested)
@@ -262,7 +267,7 @@ bool FunctionArrayUniq::executeNumber(const ColumnArray::Offsets & offsets, cons
     return true;
 }
 
-bool FunctionArrayUniq::executeString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values)
+bool FunctionArrayUniq::executeString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const
 {
     const auto * nested = checkAndGetColumn<ColumnString>(&data);
     if (nested)
@@ -271,7 +276,7 @@ bool FunctionArrayUniq::executeString(const ColumnArray::Offsets & offsets, cons
     return nested;
 }
 
-bool FunctionArrayUniq::executeFixedString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values)
+bool FunctionArrayUniq::executeFixedString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const
 {
     const auto * nested = checkAndGetColumn<ColumnFixedString>(&data);
     if (nested)
@@ -283,7 +288,7 @@ bool FunctionArrayUniq::executeFixedString(const ColumnArray::Offsets & offsets,
 bool FunctionArrayUniq::execute128bit(
         const ColumnArray::Offsets & offsets,
         const ColumnRawPtrs & columns,
-        ColumnUInt32::Container & res_values)
+        ColumnUInt32::Container & res_values) const
 {
     size_t count = columns.size();
     size_t keys_bytes = 0;
@@ -307,15 +312,54 @@ bool FunctionArrayUniq::execute128bit(
 void FunctionArrayUniq::executeHashed(
         const ColumnArray::Offsets & offsets,
         const ColumnRawPtrs & columns,
-        ColumnUInt32::Container & res_values)
+        ColumnUInt32::Container & res_values) const
 {
     executeMethod<MethodHashed>(offsets, columns, {}, nullptr, res_values);
 }
 
-
-void registerFunctionArrayUniq(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayUniq)
 {
-    factory.registerFunction<FunctionArrayUniq>();
-}
+    FunctionDocumentation::Description description = R"(
+For a single argument passed, counts the number of different elements in the array.
+For multiple arguments passed, it counts the number of different **tuples** made of elements at matching positions across multiple arrays.
 
+For example `SELECT arrayUniq([1,2], [3,4], [5,6])` will form the following tuples:
+* Position 1: (1,3,5)
+* Position 2: (2,4,6)
+
+It will then count the number of unique tuples. In this case `2`.
+
+All arrays passed must have the same length.
+
+:::tip
+If you want to get a list of unique items in an array, you can use `arrayReduce('groupUniqArray', arr)`.
+:::
+)";
+    FunctionDocumentation::Syntax syntax = "arrayUniq(arr1[, arr2, ..., arrN])";
+    FunctionDocumentation::Arguments arguments = {
+        {
+            "arr1",
+            "Array for which to count the number of unique elements.",
+            {"Array(T)"}
+        },
+        {
+            "[, arr2, ..., arrN]",
+            "Optional. Additional arrays used to count the number of unique tuples of elements at corresponding positions in multiple arrays.",
+            {"Array(T)"}
+        }
+    };
+    FunctionDocumentation::Examples examples =
+{{"Single argument", "SELECT arrayUniq([1, 1, 2, 2])", "2"},
+{"Multiple argument", "SELECT arrayUniq([1, 2, 3, 1], [4, 5, 6, 4])", "3"}};
+    FunctionDocumentation::ReturnedValue returned_value = {R"(
+For a single argument returns the number of unique
+elements. For multiple arguments returns the number of unique tuples made from
+elements at corresponding positions across the arrays.
+)", {"UInt32"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionArrayUniq>(documentation);
+}
 }

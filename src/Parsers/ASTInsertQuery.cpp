@@ -1,8 +1,14 @@
 #include <iomanip>
+
+#include <Common/logger_useful.h>
+#include <Common/SipHash.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTLiteral.h>
 #include <Common/quoteString.h>
 #include <IO/WriteHelpers.h>
+#include <IO/Operators.h>
 
 
 namespace DB
@@ -13,55 +19,142 @@ namespace ErrorCodes
     extern const int INVALID_USAGE_OF_INPUT;
 }
 
+String ASTInsertQuery::getDatabase() const
+{
+    String name;
+    tryGetIdentifierNameInto(database, name);
+    return name;
+}
 
-void ASTInsertQuery::formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
+String ASTInsertQuery::getTable() const
+{
+    String name;
+    tryGetIdentifierNameInto(table, name);
+    return name;
+}
+
+void ASTInsertQuery::setDatabase(const String & name)
+{
+    if (name.empty())
+        database.reset();
+    else
+        database = make_intrusive<ASTIdentifier>(name);
+}
+
+void ASTInsertQuery::setTable(const String & name)
+{
+    if (name.empty())
+        table.reset();
+    else
+        table = make_intrusive<ASTIdentifier>(name);
+}
+
+void ASTInsertQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
 {
     frame.need_parens = false;
 
-    settings.ostr << (settings.hilite ? hilite_keyword : "") << "INSERT INTO ";
+    ostr << "INSERT INTO" << " ";
     if (table_function)
     {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << "FUNCTION ";
-        table_function->formatImpl(settings, state, frame);
+        ostr << "FUNCTION" << " ";
+        table_function->format(ostr, settings, state, frame);
+        if (partition_by)
+        {
+            ostr << " " << "PARTITION BY" << " ";
+            partition_by->format(ostr, settings, state, frame);
+        }
+    }
+    else if (table_id)
+    {
+        ostr << (!table_id.database_name.empty() ? backQuoteIfNeed(table_id.database_name) + "." : "") << backQuoteIfNeed(table_id.table_name);
     }
     else
-        settings.ostr << (settings.hilite ? hilite_none : "")
-                      << (!table_id.database_name.empty() ? backQuoteIfNeed(table_id.database_name) + "." : "") << backQuoteIfNeed(table_id.table_name);
+    {
+        if (database)
+        {
+            database->format(ostr, settings, state, frame);
+            ostr << '.';
+        }
+
+        chassert(table);
+        table->format(ostr, settings, state, frame);
+    }
 
     if (columns)
     {
-        settings.ostr << " (";
-        columns->formatImpl(settings, state, frame);
-        settings.ostr << ")";
+        ostr << " (";
+        columns->format(ostr, settings, state, frame);
+        ostr << ")";
     }
+
+    if (infile)
+    {
+        ostr
+            << " "
+            << "FROM INFILE"
+
+            << " " << quoteString(infile->as<ASTLiteral &>().value.safeGet<std::string>());
+        if (compression)
+            ostr
+                << " "
+                << "COMPRESSION"
+
+                << " " << quoteString(compression->as<ASTLiteral &>().value.safeGet<std::string>());
+    }
+
+    if (settings_ast)
+    {
+        ostr << settings.nl_or_ws << "SETTINGS" << " ";
+        settings_ast->format(ostr, settings, state, frame);
+    }
+
+    /// Compatibility for INSERT without SETTINGS to format in oneline, i.e.:
+    ///
+    ///     INSERT INTO foo VALUES
+    ///
+    /// But
+    ///
+    ///     INSERT INTO foo
+    ///     SETTINGS max_threads=1
+    ///     VALUES
+    ///
+    char delim = settings_ast ? settings.nl_or_ws : ' ';
 
     if (select)
     {
-        settings.ostr << " ";
-        select->formatImpl(settings, state, frame);
-    }
-    else if (watch)
-    {
-        settings.ostr << " ";
-        watch->formatImpl(settings, state, frame);
+        ostr << delim;
+        select->format(ostr, settings, state, frame);
+
+        /// For INSERT ... SELECT ... FROM input('...') FORMAT Values,
+        /// the FORMAT clause must be preserved in the formatted output.
+        if (!format.empty())
+        {
+            ostr << delim
+                << "FORMAT" << " " << format;
+        }
     }
     else
     {
         if (!format.empty())
         {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FORMAT " << (settings.hilite ? hilite_none : "") << format;
+            ostr << delim
+                << "FORMAT" << " " << format;
         }
-        else
+        else if (!infile)
         {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " VALUES" << (settings.hilite ? hilite_none : "");
+            ostr << delim
+                << "VALUES";
         }
     }
+}
 
-    if (settings_ast)
-    {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << "SETTINGS " << (settings.hilite ? hilite_none : "");
-        settings_ast->formatImpl(settings, state, frame);
-    }
+void ASTInsertQuery::updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const
+{
+    hash_state.update(table_id.database_name);
+    hash_state.update(table_id.table_name);
+    hash_state.update(table_id.uuid);
+    hash_state.update(format);
+    IAST::updateTreeHashImpl(hash_state, ignore_aliases);
 }
 
 
@@ -77,7 +170,7 @@ static void tryFindInputFunctionImpl(const ASTPtr & ast, ASTPtr & input_function
         if (table_function_ast->name == "input")
         {
             if (input_function)
-                throw Exception("You can use 'input()' function only once per request.", ErrorCodes::INVALID_USAGE_OF_INPUT);
+                throw Exception(ErrorCodes::INVALID_USAGE_OF_INPUT, "You can use the `input` function only once in a query.");
             input_function = ast;
         }
     }

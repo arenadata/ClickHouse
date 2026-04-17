@@ -1,16 +1,13 @@
-#include <TableFunctions/ITableFunction.h>
-#include <TableFunctions/TableFunctionInput.h>
 #include <TableFunctions/TableFunctionFactory.h>
-#include <TableFunctions/parseColumnsListForTableFunction.h>
+#include <Interpreters/parseColumnsListForTableFunction.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
 #include <Common/Exception.h>
-#include <Common/typeid_cast.h>
 #include <Storages/StorageInput.h>
+#include <Storages/checkAndGetLiteralArgument.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <Interpreters/evaluateConstantExpression.h>
-#include <boost/algorithm/string.hpp>
-#include "registerTableFunctions.h"
+#include <TableFunctions/registerTableFunctions.h>
 
 
 namespace DB
@@ -20,33 +17,87 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int CANNOT_EXTRACT_TABLE_STRUCTURE;
 }
 
-StoragePtr TableFunctionInput::executeImpl(const ASTPtr & ast_function, const Context & context, const std::string & table_name) const
+namespace
+{
+
+/* input(structure) - allows to make INSERT SELECT from incoming stream of data
+ */
+class TableFunctionInput : public ITableFunction
+{
+public:
+    static constexpr auto name = "input";
+    std::string getName() const override { return name; }
+    bool hasStaticStructure() const override { return true; }
+    bool needStructureHint() const override { return true; }
+    void setStructureHint(const ColumnsDescription & structure_hint_) override { structure_hint = structure_hint_; }
+
+private:
+    StoragePtr executeImpl(const ASTPtr & ast_function, ContextPtr context, const std::string & table_name, ColumnsDescription cached_columns, bool is_insert_query) const override;
+    const char * getStorageEngineName() const override
+    {
+        /// Technically it's Input but it doesn't register itself
+        return "";
+    }
+
+    ColumnsDescription getActualTableStructure(ContextPtr context, bool is_insert_query) const override;
+    void parseArguments(const ASTPtr & ast_function, ContextPtr context) override;
+
+    String structure;
+    ColumnsDescription structure_hint;
+};
+
+void TableFunctionInput::parseArguments(const ASTPtr & ast_function, ContextPtr context)
 {
     const auto * function = ast_function->as<ASTFunction>();
 
     if (!function->arguments)
-        throw Exception("Table function '" + getName() + "' must have arguments", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Table function '{}' must have arguments", getName());
 
     auto args = function->arguments->children;
 
+    if (args.empty())
+    {
+        structure = "auto";
+        return;
+    }
+
     if (args.size() != 1)
-        throw Exception("Table function '" + getName() + "' requires exactly 1 argument: structure",
-            ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+        throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+            "Table function '{}' requires exactly 1 argument: structure", getName());
 
-    String structure = evaluateConstantExpressionOrIdentifierAsLiteral(args[0], context)->as<ASTLiteral &>().value.safeGet<String>();
-    auto columns = parseColumnsListFromString(structure, context);
-    StoragePtr storage = StorageInput::create(StorageID(getDatabaseName(), table_name), columns);
+    structure = checkAndGetLiteralArgument<String>(evaluateConstantExpressionOrIdentifierAsLiteral(args[0], context), "structure");
+}
 
+ColumnsDescription TableFunctionInput::getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const
+{
+    if (structure == "auto")
+    {
+        if (structure_hint.empty())
+            throw Exception(
+                ErrorCodes::CANNOT_EXTRACT_TABLE_STRUCTURE,
+                "Table function '{}' was used without structure argument but structure could not be determined automatically. Please, "
+                "provide structure manually",
+                getName());
+        return structure_hint;
+    }
+    return parseColumnsListFromString(structure, context);
+}
+
+StoragePtr TableFunctionInput::executeImpl(const ASTPtr & /*ast_function*/, ContextPtr context, const std::string & table_name, ColumnsDescription /*cached_columns*/, bool is_insert_query) const
+{
+    auto storage = std::make_shared<StorageInput>(StorageID(getDatabaseName(), table_name), getActualTableStructure(context, is_insert_query));
     storage->startup();
-
     return storage;
+}
+
 }
 
 void registerTableFunctionInput(TableFunctionFactory & factory)
 {
-    factory.registerFunction<TableFunctionInput>();
+    factory.registerFunction<TableFunctionInput>({});
 }
 
 }

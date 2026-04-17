@@ -1,9 +1,9 @@
-#include <Functions/IFunctionImpl.h>
-#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnArray.h>
+#include <base/arithmeticOverflow.h>
 
 
 namespace DB
@@ -15,8 +15,9 @@ namespace ErrorCodes
     extern const int TOO_LARGE_ARRAY_SIZE;
 }
 
-/// Reasonable threshold.
-static constexpr size_t max_arrays_size_in_block = 1000000000;
+/// Reasonable thresholds.
+static constexpr Int64 max_array_size_in_columns_bytes = 1000000000;
+static constexpr size_t max_arrays_size_in_columns = 1000000000;
 
 
 /* arrayWithConstant(num, const) - make array of constants with length num.
@@ -30,55 +31,80 @@ class FunctionArrayWithConstant : public IFunction
 public:
     static constexpr auto name = "arrayWithConstant";
 
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionArrayWithConstant>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionArrayWithConstant>(); }
 
     String getName() const override { return name; }
     size_t getNumberOfArguments() const override { return 2; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (!isNativeNumber(arguments[0]))
-            throw Exception("Illegal type " + arguments[0]->getName() +
-                " of argument of function " + getName() +
-                ", expected Integer", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument of function {}, expected Integer",
+                arguments[0]->getName(), getName());
         return std::make_shared<DataTypeArray>(arguments[1]);
     }
 
     bool useDefaultImplementationForConstants() const override { return true; }
     bool useDefaultImplementationForNulls() const override { return false; }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t num_rows) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t num_rows) const override
     {
-        const auto * col_num = block.getByPosition(arguments[0]).column.get();
-        const auto * col_value = block.getByPosition(arguments[1]).column.get();
+        const auto * col_num = arguments[0].column.get();
+        const auto * col_value = arguments[1].column.get();
 
         auto offsets_col = ColumnArray::ColumnOffsets::create();
         ColumnArray::Offsets & offsets = offsets_col->getData();
-        offsets.reserve(num_rows);
+        if (num_rows == 0)
+            return ColumnArray::create(col_value->replicate(offsets)->convertToFullColumnIfConst(), std::move(offsets_col));
 
+        offsets.reserve(num_rows);
         ColumnArray::Offset offset = 0;
         for (size_t i = 0; i < num_rows; ++i)
         {
             auto array_size = col_num->getInt(i);
 
             if (unlikely(array_size < 0))
-                throw Exception("Array size cannot be negative: while executing function " + getName(), ErrorCodes::TOO_LARGE_ARRAY_SIZE);
+                throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Array size {} cannot be negative: while executing function {}", array_size, getName());
+
+            auto element_size = col_value->byteSizeAt(i);
+            Int64 estimated_size = 0;
+            if (unlikely(common::mulOverflow(array_size, element_size, estimated_size)))
+                throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Array size {} with element size {} bytes is too large: while executing function {}", array_size, element_size, getName());
+
+            if (unlikely(estimated_size > max_array_size_in_columns_bytes))
+                throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Array size {} with element size {} bytes is too large: while executing function {}", array_size, element_size, getName());
 
             offset += array_size;
 
-            if (unlikely(offset > max_arrays_size_in_block))
-                throw Exception("Too large array size while executing function " + getName(), ErrorCodes::TOO_LARGE_ARRAY_SIZE);
+            if (unlikely(offset > max_arrays_size_in_columns))
+                throw Exception(ErrorCodes::TOO_LARGE_ARRAY_SIZE, "Too large array size {} (will generate at least {} elements) while executing function {}", array_size, offset, getName());
 
             offsets.push_back(offset);
         }
 
-        block.getByPosition(result).column = ColumnArray::create(col_value->replicate(offsets)->convertToFullColumnIfConst(), std::move(offsets_col));
+        return ColumnArray::create(col_value->replicate(offsets)->convertToFullColumnIfConst(), std::move(offsets_col));
     }
 };
 
-void registerFunctionArrayWithConstant(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayWithConstant)
 {
-    factory.registerFunction<FunctionArrayWithConstant>();
+    FunctionDocumentation::Description description = R"(
+Creates an array of length `length` filled with the constant `x`.
+    )";
+    FunctionDocumentation::Syntax syntax = "arrayWithConstant(N, x)";
+    FunctionDocumentation::Arguments arguments = {
+        {"length", "Number of elements in the array.", {"(U)Int*"}},
+        {"x", "The value of the `N` elements in the array, of any type."},
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns an Array with `N` elements of value `x`.", {"Array(T)"}};
+    FunctionDocumentation::Examples example = {{"Usage example", "SELECT arrayWithConstant(3, 1)", "[1, 1, 1]"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, example, introduced_in, category};
+
+    factory.registerFunction<FunctionArrayWithConstant>(documentation);
 }
 
 }

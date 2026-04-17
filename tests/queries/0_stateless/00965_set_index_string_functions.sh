@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
 $CLICKHOUSE_CLIENT --query="DROP TABLE IF EXISTS set_idx;"
 
-$CLICKHOUSE_CLIENT -n --query="
+$CLICKHOUSE_CLIENT --query="
 CREATE TABLE set_idx
 (
     k UInt64,
@@ -13,7 +14,7 @@ CREATE TABLE set_idx
     INDEX idx (s) TYPE set(2) GRANULARITY 1
 ) ENGINE = MergeTree()
 ORDER BY k
-SETTINGS index_granularity = 2;"
+SETTINGS index_granularity = 2, index_granularity_bytes = '10Mi';"
 
 $CLICKHOUSE_CLIENT --query="INSERT INTO set_idx VALUES
 (0, 'ClickHouse - столбцовая система управления базами данных (СУБД)'),

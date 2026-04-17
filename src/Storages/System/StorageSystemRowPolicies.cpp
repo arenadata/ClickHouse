@@ -1,61 +1,73 @@
 #include <Storages/System/StorageSystemRowPolicies.h>
+#include <Access/AccessControl.h>
+#include <Access/Common/AccessFlags.h>
+#include <Access/RowPolicy.h>
+#include <Backups/BackupEntriesCollector.h>
+#include <Backups/RestorerFromBackup.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnArray.h>
+#include <Columns/ColumnNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeArray.h>
-#include <Columns/ColumnString.h>
-#include <Columns/ColumnsNumber.h>
-#include <Columns/ColumnArray.h>
-#include <Columns/ColumnNullable.h>
 #include <Interpreters/Context.h>
-#include <Parsers/ASTRolesOrUsersSet.h>
-#include <Access/AccessControlManager.h>
-#include <Access/RowPolicy.h>
-#include <Access/AccessFlags.h>
-#include <ext/range.h>
-#include <boost/range/algorithm_ext/push_back.hpp>
+#include <Parsers/Access/ASTRolesOrUsersSet.h>
+#include <base/range.h>
+#include <base/insertAtEnd.h>
 
 
 namespace DB
 {
-using ConditionTypeInfo = RowPolicy::ConditionTypeInfo;
-constexpr auto MAX_CONDITION_TYPE = RowPolicy::MAX_CONDITION_TYPE;
-
-
-NamesAndTypesList StorageSystemRowPolicies::getNamesAndTypes()
+ColumnsDescription StorageSystemRowPolicies::getColumnsDescription()
 {
-    NamesAndTypesList names_and_types{
-        {"name", std::make_shared<DataTypeString>()},
-        {"short_name", std::make_shared<DataTypeString>()},
-        {"database", std::make_shared<DataTypeString>()},
-        {"table", std::make_shared<DataTypeString>()},
-        {"id", std::make_shared<DataTypeUUID>()},
-        {"storage", std::make_shared<DataTypeString>()},
+    ColumnsDescription description
+    {
+        {"name", std::make_shared<DataTypeString>(), "Name of a row policy."},
+        {"short_name", std::make_shared<DataTypeString>(),
+            "Short name of a row policy. Names of row policies are compound, for example: myfilter ON mydb.mytable. "
+            "Here 'myfilter ON mydb.mytable' is the name of the row policy, 'myfilter' is it's short name."
+        },
+        {"database", std::make_shared<DataTypeString>(), "Database name."},
+        {"table", std::make_shared<DataTypeString>(), "Table name. Empty if policy for database."},
+        {"id", std::make_shared<DataTypeUUID>(), "Row policy ID."},
+        {"storage", std::make_shared<DataTypeString>(), "Name of the directory where the row policy is stored."},
     };
 
-    for (auto type : ext::range(MAX_CONDITION_TYPE))
+    for (auto filter_type : collections::range(RowPolicyFilterType::MAX))
     {
-        const String & column_name = ConditionTypeInfo::get(type).name;
-        names_and_types.push_back({column_name, std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>())});
+        const auto & filter_type_info = RowPolicyFilterTypeInfo::get(filter_type);
+        description.add({filter_type_info.name, std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()), filter_type_info.description});
     }
 
-    NamesAndTypesList extra_names_and_types{
-        {"is_restrictive", std::make_shared<DataTypeUInt8>()},
-        {"apply_to_all", std::make_shared<DataTypeUInt8>()},
-        {"apply_to_list", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())},
-        {"apply_to_except", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>())}
-    };
+    description.add({"is_restrictive", std::make_shared<DataTypeUInt8>(),
+        "Shows whether the row policy restricts access to rows. Value: "
+        "• 0 — The row policy is defined with `AS PERMISSIVE` clause, "
+        "• 1 — The row policy is defined with AS RESTRICTIVE clause."
+    });
+    description.add({"apply_to_all", std::make_shared<DataTypeUInt8>(),
+        "Shows that the row policies set for all roles and/or users."
+    });
+    description.add({"apply_to_list", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()),
+        "List of the roles and/or users to which the row policies is applied."
+    });
+    description.add({"apply_to_except", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()),
+        "The row policies is applied to all roles and/or users excepting of the listed ones."
+    });
 
-    boost::range::push_back(names_and_types, std::move(extra_names_and_types));
-    return names_and_types;
+    return description;
 }
 
 
-void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo &) const
+void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node *, std::vector<UInt8>) const
 {
-    context.checkAccess(AccessType::SHOW_ROW_POLICIES);
-    const auto & access_control = context.getAccessControlManager();
+    /// If "select_from_system_db_requires_grant" is enabled the access rights were already checked in InterpreterSelectQuery.
+    const auto & access_control = context->getAccessControl();
+    if (!access_control.doesSelectFromSystemDatabaseRequireGrant())
+        context->checkAccess(AccessType::SHOW_ROW_POLICIES);
+
     std::vector<UUID> ids = access_control.findAll<RowPolicy>();
 
     size_t column_index = 0;
@@ -63,15 +75,16 @@ void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, const Cont
     auto & column_short_name = assert_cast<ColumnString &>(*res_columns[column_index++]);
     auto & column_database = assert_cast<ColumnString &>(*res_columns[column_index++]);
     auto & column_table = assert_cast<ColumnString &>(*res_columns[column_index++]);
-    auto & column_id = assert_cast<ColumnUInt128 &>(*res_columns[column_index++]).getData();
+    auto & column_id = assert_cast<ColumnUUID &>(*res_columns[column_index++]).getData();
     auto & column_storage = assert_cast<ColumnString &>(*res_columns[column_index++]);
 
-    ColumnString * column_condition[MAX_CONDITION_TYPE];
-    NullMap * column_condition_null_map[MAX_CONDITION_TYPE];
-    for (auto condition_type : ext::range(MAX_CONDITION_TYPE))
+    ColumnString * column_filter[static_cast<size_t>(RowPolicyFilterType::MAX)];
+    NullMap * column_filter_null_map[static_cast<size_t>(RowPolicyFilterType::MAX)];
+    for (auto filter_type : collections::range(RowPolicyFilterType::MAX))
     {
-        column_condition[condition_type] = &assert_cast<ColumnString &>(assert_cast<ColumnNullable &>(*res_columns[column_index]).getNestedColumn());
-        column_condition_null_map[condition_type] = &assert_cast<ColumnNullable &>(*res_columns[column_index++]).getNullMapData();
+        auto filter_type_i = static_cast<size_t>(filter_type);
+        column_filter[filter_type_i] = &assert_cast<ColumnString &>(assert_cast<ColumnNullable &>(*res_columns[column_index]).getNestedColumn());
+        column_filter_null_map[filter_type_i] = &assert_cast<ColumnNullable &>(*res_columns[column_index++]).getNullMapData();
     }
 
     auto & column_is_restrictive = assert_cast<ColumnUInt8 &>(*res_columns[column_index++]).getData();
@@ -82,32 +95,33 @@ void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, const Cont
     auto & column_apply_to_except_offsets = assert_cast<ColumnArray &>(*res_columns[column_index++]).getOffsets();
 
     auto add_row = [&](const String & name,
-                       const RowPolicy::NameParts & name_parts,
+                       const RowPolicyName & full_name,
                        const UUID & id,
                        const String & storage_name,
-                       const std::array<String, MAX_CONDITION_TYPE> & conditions,
+                       const std::array<String, static_cast<size_t>(RowPolicyFilterType::MAX)> & filters,
                        bool is_restrictive,
                        const RolesOrUsersSet & apply_to)
     {
         column_name.insertData(name.data(), name.length());
-        column_short_name.insertData(name_parts.short_name.data(), name_parts.short_name.length());
-        column_database.insertData(name_parts.database.data(), name_parts.database.length());
-        column_table.insertData(name_parts.table_name.data(), name_parts.table_name.length());
-        column_id.push_back(id);
+        column_short_name.insertData(full_name.short_name.data(), full_name.short_name.length());
+        column_database.insertData(full_name.database.data(), full_name.database.length());
+        column_table.insertData(full_name.table_name.data(), full_name.table_name.length());
+        column_id.push_back(id.toUnderType());
         column_storage.insertData(storage_name.data(), storage_name.length());
 
-        for (auto condition_type : ext::range(MAX_CONDITION_TYPE))
+        for (auto filter_type : collections::range(RowPolicyFilterType::MAX))
         {
-            const String & condition = conditions[condition_type];
-            if (condition.empty())
+            auto filter_type_i = static_cast<size_t>(filter_type);
+            const String & filter = filters[filter_type_i];
+            if (filter.empty())
             {
-                column_condition[condition_type]->insertDefault();
-                column_condition_null_map[condition_type]->push_back(true);
+                column_filter[filter_type_i]->insertDefault();
+                column_filter_null_map[filter_type_i]->push_back(true);
             }
             else
             {
-                column_condition[condition_type]->insertData(condition.data(), condition.length());
-                column_condition_null_map[condition_type]->push_back(false);
+                column_filter[filter_type_i]->insertData(filter.data(), filter.length());
+                column_filter_null_map[filter_type_i]->push_back(false);
             }
         }
 
@@ -130,11 +144,26 @@ void StorageSystemRowPolicies::fillData(MutableColumns & res_columns, const Cont
         auto policy = access_control.tryRead<RowPolicy>(id);
         if (!policy)
             continue;
-        const auto * storage = access_control.findStorage(id);
+        auto storage = access_control.findStorage(id);
         if (!storage)
             continue;
 
-        add_row(policy->getName(), policy->getNameParts(), id, storage->getStorageName(), policy->conditions, policy->isRestrictive(), policy->to_roles);
+        add_row(policy->getName(), policy->getFullName(), id, storage->getStorageName(), policy->filters, policy->isRestrictive(), policy->to_roles);
     }
 }
+
+void StorageSystemRowPolicies::backupData(
+    BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
+{
+    const auto & access_control = backup_entries_collector.getContext()->getAccessControl();
+    access_control.backup(backup_entries_collector, data_path_in_backup, AccessEntityType::ROW_POLICY);
+}
+
+void StorageSystemRowPolicies::restoreDataFromBackup(
+    RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
+{
+    auto & access_control = restorer.getContext()->getAccessControl();
+    access_control.restoreFromBackup(restorer, data_path_in_backup);
+}
+
 }

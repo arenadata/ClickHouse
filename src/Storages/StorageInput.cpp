@@ -1,14 +1,17 @@
 #include <Storages/StorageInput.h>
 #include <Storages/IStorage.h>
 
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeString.h>
 #include <Interpreters/Context.h>
 
-#include <DataStreams/IBlockInputStream.h>
 #include <memory>
-#include <Processors/Sources/SourceWithProgress.h>
-#include <Processors/Pipe.h>
-#include <Processors/Sources/SourceFromInputStream.h>
-
+#include <Processors/ISource.h>
+#include <Processors/Sources/ThrowingExceptionSource.h>
+#include <Processors/QueryPlan/ISourceStep.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <QueryPipeline/Pipe.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 
 namespace DB
 {
@@ -16,29 +19,36 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int INVALID_USAGE_OF_INPUT;
+    extern const int LOGICAL_ERROR;
 }
 
 StorageInput::StorageInput(const StorageID & table_id, const ColumnsDescription & columns_)
-    : IStorage(table_id)
+    : StorageWithCommonVirtualColumns(table_id)
 {
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(columns_);
+    storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
 }
 
+VirtualColumnsDescription StorageInput::createVirtuals()
+{
+    VirtualColumnsDescription desc;
+    desc.addEphemeral("_table", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    desc.addEphemeral("_database", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    return desc;
+}
 
-class StorageInputSource : public SourceWithProgress
+
+class StorageInputSource : public ISource, WithContext
 {
 public:
-    StorageInputSource(Context & context_, Block sample_block)
-        : SourceWithProgress(std::move(sample_block)), context(context_)
-    {
-    }
+    StorageInputSource(ContextPtr context_, SharedHeader sample_block) : ISource(std::move(sample_block)), WithContext(context_) {}
 
     Chunk generate() override
     {
-        auto block = context.getInputBlocksReaderCallback()(context);
-        if (!block)
+        auto block = getContext()->getInputBlocksReaderCallback()(getContext());
+        if (block.empty())
             return {};
 
         UInt64 num_rows = block.rows();
@@ -46,43 +56,87 @@ public:
     }
 
     String getName() const override { return "Input"; }
-
-private:
-    Context & context;
 };
 
 
-void StorageInput::setInputStream(BlockInputStreamPtr input_stream_)
+void StorageInput::setPipe(Pipe pipe_)
 {
-    input_stream = input_stream_;
+    pipe = std::move(pipe_);
+    was_pipe_initialized = true;
 }
 
-
-Pipes StorageInput::read(
-    const Names & /*column_names*/,
-    const StorageMetadataPtr & metadata_snapshot,
-    const SelectQueryInfo & /*query_info*/,
-    const Context & context,
-    QueryProcessingStage::Enum /*processed_stage*/,
-    size_t /*max_block_size*/,
-    unsigned /*num_streams*/)
+class ReadFromInput : public ISourceStep
 {
-    Pipes pipes;
-    Context & query_context = const_cast<Context &>(context).getQueryContext();
-    /// It is TCP request if we have callbacks for input().
-    if (query_context.getInputBlocksReaderCallback())
+public:
+    std::string getName() const override { return "ReadFromInput"; }
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+
+    ReadFromInput(
+        SharedHeader sample_block,
+        Pipe pipe_,
+        StorageInput & storage_)
+        : ISourceStep(std::move(sample_block))
+        , pipe(std::move(pipe_))
+        , storage(storage_)
     {
-        /// Send structure to the client.
-        query_context.initializeInput(shared_from_this());
-        pipes.emplace_back(std::make_shared<StorageInputSource>(query_context, metadata_snapshot->getSampleBlock()));
-        return pipes;
     }
 
-    if (!input_stream)
-        throw Exception("Input stream is not initialized, input() must be used only in INSERT SELECT query", ErrorCodes::INVALID_USAGE_OF_INPUT);
+private:
+    Pipe pipe;
+    StorageInput & storage;
+};
 
-    pipes.emplace_back(std::make_shared<SourceFromInputStream>(input_stream));
-    return pipes;
+void StorageInput::readImpl(
+    QueryPlan & query_plan,
+    const Names & column_names,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & /*query_info*/,
+    ContextPtr context,
+    QueryProcessingStage::Enum /*processed_stage*/,
+    size_t /*max_block_size*/,
+    size_t /*num_streams*/)
+{
+    storage_snapshot->check(column_names);
+    auto sample_block = std::make_shared<const Block>(storage_snapshot->metadata->getSampleBlock());
+    Pipe input_source_pipe;
+
+    auto query_context = context->getQueryContext();
+    /// It is TCP request if we have callbacks for input().
+    if (query_context->getInputBlocksReaderCallback())
+    {
+        /// Send structure to the client.
+        if (!is_input_initialized)
+        {
+            query_context->initializeInput(shared_from_this());
+            is_input_initialized = true;
+        }
+        input_source_pipe = Pipe(std::make_shared<StorageInputSource>(query_context, sample_block));
+    }
+
+    auto reading = std::make_unique<ReadFromInput>(
+        std::move(sample_block),
+        std::move(input_source_pipe),
+        *this);
+
+    query_plan.addStep(std::move(reading));
+}
+
+void ReadFromInput::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    if (!pipe.empty())
+    {
+        pipeline.init(std::move(pipe));
+        return;
+    }
+
+    if (!storage.was_pipe_initialized)
+        throw Exception(ErrorCodes::INVALID_USAGE_OF_INPUT, "Input stream is not initialized, input() must be used only in INSERT SELECT query");
+
+    if (storage.was_pipe_used)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to read from input() twice.");
+
+    pipeline.init(std::move(storage.pipe));
+    storage.was_pipe_used = true;
 }
 
 }

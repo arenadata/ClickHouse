@@ -1,14 +1,7 @@
+#include <Common/isValidUTF8.h>
 #include <DataTypes/DataTypeString.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionStringOrArrayToT.h>
-
-#include <cstring>
-
-#ifdef __SSE4_1__
-#    include <emmintrin.h>
-#    include <smmintrin.h>
-#    include <tmmintrin.h>
-#endif
 
 namespace DB
 {
@@ -71,77 +64,10 @@ SOFTWARE.
  * +--------------------+------------+-------------+------------+-------------+
  */
 
-    static inline UInt8 isValidUTF8Naive(const UInt8 * data, UInt64 len)
-    {
-        while (len)
-        {
-            int bytes;
-            const UInt8 byte1 = data[0];
-            /* 00..7F */
-            if (byte1 <= 0x7F)
-            {
-                bytes = 1;
-            }
-            /* C2..DF, 80..BF */
-            else if (len >= 2 && byte1 >= 0xC2 && byte1 <= 0xDF && static_cast<Int8>(data[1]) <= static_cast<Int8>(0xBF))
-            {
-                bytes = 2;
-            }
-            else if (len >= 3)
-            {
-                const UInt8 byte2 = data[1];
-                bool byte2_ok = static_cast<Int8>(byte2) <= static_cast<Int8>(0xBF);
-                bool byte3_ok = static_cast<Int8>(data[2]) <= static_cast<Int8>(0xBF);
-
-                if (byte2_ok && byte3_ok &&
-                    /* E0, A0..BF, 80..BF */
-                    ((byte1 == 0xE0 && byte2 >= 0xA0) ||
-                     /* E1..EC, 80..BF, 80..BF */
-                     (byte1 >= 0xE1 && byte1 <= 0xEC) ||
-                     /* ED, 80..9F, 80..BF */
-                     (byte1 == 0xED && byte2 <= 0x9F) ||
-                     /* EE..EF, 80..BF, 80..BF */
-                     (byte1 >= 0xEE && byte1 <= 0xEF)))
-                {
-                    bytes = 3;
-                }
-                else if (len >= 4)
-                {
-                    bool byte4_ok = static_cast<Int8>(data[3]) <= static_cast<Int8>(0xBF);
-                    if (byte2_ok && byte3_ok && byte4_ok &&
-                        /* F0, 90..BF, 80..BF, 80..BF */
-                        ((byte1 == 0xF0 && byte2 >= 0x90) ||
-                         /* F1..F3, 80..BF, 80..BF, 80..BF */
-                         (byte1 >= 0xF1 && byte1 <= 0xF3) ||
-                         /* F4, 80..8F, 80..BF, 80..BF */
-                         (byte1 == 0xF4 && byte2 <= 0x8F)))
-                    {
-                        bytes = 4;
-                    }
-                    else
-                    {
-                        return false;
-                    }
-                }
-                else
-                {
-                    return false;
-                }
-            }
-            else
-            {
-                return false;
-            }
-            len -= bytes;
-            data += bytes;
-        }
-        return true;
-    }
-
 #ifndef __SSE4_1__
-    static inline UInt8 isValidUTF8(const UInt8 * data, UInt64 len) { return isValidUTF8Naive(data, len); }
+    static UInt8 isValidUTF8(const UInt8 * data, UInt64 len) { return DB::UTF8::isValidUTF8(data, len); }
 #else
-    static inline UInt8 isValidUTF8(const UInt8 * data, UInt64 len)
+    static UInt8 isValidUTF8(const UInt8 * data, UInt64 len)
     {
         /*
         * Map high nibble of "First Byte" to legal character length minus 1
@@ -230,7 +156,7 @@ SOFTWARE.
             range = _mm_or_si128(range, _mm_alignr_epi8(tmp1, tmp2, 13));
 
             /*
-             * Now we have below range indices caluclated
+             * Now we have below range indices calculated
              * Correct cases:
              * - 8 for C0~FF
              * - 3 for 1st byte after F0~FF
@@ -245,7 +171,9 @@ SOFTWARE.
 
             /* Adjust Second Byte range for special First Bytes(E0,ED,F0,F4) */
             /* Overlaps lead to index 9~15, which are illegal in range table */
-            __m128i shift1, pos, range2;
+            __m128i shift1;
+            __m128i pos;
+            __m128i range2;
             /* shift1 = (input, prev_input) << 1 byte */
             shift1 = _mm_alignr_epi8(input, prev_input, 15);
             pos = _mm_sub_epi8(shift1, _mm_set1_epi8(0xEF));
@@ -287,35 +215,50 @@ SOFTWARE.
         memset(buf + len + 1, 0, 16);
         check_packed(_mm_loadu_si128(reinterpret_cast<__m128i *>(buf + 1)));
 
-        return _mm_testz_si128(error, error);
+        return static_cast<UInt8>(_mm_testz_si128(error, error));
     }
 #endif
 
     static constexpr bool is_fixed_to_constant = false;
 
-    static void vector(const ColumnString::Chars & data, const ColumnString::Offsets & offsets, PaddedPODArray<UInt8> & res)
+    static void vector(const ColumnString::Chars & data, const ColumnString::Offsets & offsets, PaddedPODArray<UInt8> & res, size_t input_rows_count)
     {
-        size_t size = offsets.size();
         size_t prev_offset = 0;
-        for (size_t i = 0; i < size; ++i)
+        for (size_t i = 0; i < input_rows_count; ++i)
         {
-            res[i] = isValidUTF8(data.data() + prev_offset, offsets[i] - 1 - prev_offset);
+            res[i] = isValidUTF8(data.data() + prev_offset, offsets[i] - prev_offset);
             prev_offset = offsets[i];
         }
     }
 
-    static void vectorFixedToConstant(const ColumnString::Chars & /*data*/, size_t /*n*/, UInt8 & /*res*/) {}
-
-    static void vectorFixedToVector(const ColumnString::Chars & data, size_t n, PaddedPODArray<UInt8> & res)
+    static void vectorFixedToConstant(const ColumnString::Chars &, size_t, UInt8 &, size_t)
     {
-        size_t size = data.size() / n;
-        for (size_t i = 0; i < size; ++i)
+    }
+
+    static void vectorFixedToVector(const ColumnString::Chars & data, size_t n, PaddedPODArray<UInt8> & res, size_t input_rows_count)
+    {
+        for (size_t i = 0; i < input_rows_count; ++i)
             res[i] = isValidUTF8(data.data() + i * n, n);
     }
 
-    [[noreturn]] static void array(const ColumnString::Offsets &, PaddedPODArray<UInt8> &)
+    [[noreturn]] static void array(const ColumnString::Offsets &, PaddedPODArray<UInt8> &, size_t)
     {
-        throw Exception("Cannot apply function isValidUTF8 to Array argument", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Cannot apply function isValidUTF8 to Array argument");
+    }
+
+    [[noreturn]] static void uuid(const ColumnUUID::Container &, size_t &, PaddedPODArray<UInt8> &, size_t)
+    {
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Cannot apply function isValidUTF8 to UUID argument");
+    }
+
+    [[noreturn]] static void ipv6(const ColumnIPv6::Container &, size_t &, PaddedPODArray<UInt8> &, size_t)
+    {
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Cannot apply function isValidUTF8 to IPv6 argument");
+    }
+
+    [[noreturn]] static void ipv4(const ColumnIPv4::Container &, size_t &, PaddedPODArray<UInt8> &, size_t)
+    {
+        throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Cannot apply function isValidUTF8 to IPv4 argument");
     }
 };
 
@@ -325,9 +268,32 @@ struct NameIsValidUTF8
 };
 using FunctionValidUTF8 = FunctionStringOrArrayToT<ValidUTF8Impl, NameIsValidUTF8, UInt8>;
 
-void registerFunctionIsValidUTF8(FunctionFactory & factory)
+REGISTER_FUNCTION(IsValidUTF8)
 {
-    factory.registerFunction<FunctionValidUTF8>();
+    FunctionDocumentation::Description description = R"(
+Checks if the set of bytes constitutes valid UTF-8-encoded text.
+)";
+    FunctionDocumentation::Syntax syntax = "isValidUTF8(s)";
+    FunctionDocumentation::Arguments arguments = {
+        {"s", "The string to check for UTF-8 encoded validity.", {"String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `1`, if the set of bytes constitutes valid UTF-8-encoded text, otherwise `0`.", {"UInt8"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(SELECT isValidUTF8('\\xc3\\xb1') AS valid, isValidUTF8('\\xc3\\x28') AS invalid)",
+        R"(
+┌─valid─┬─invalid─┐
+│     1 │       0 │
+└───────┴─────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::String;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionValidUTF8>(documentation);
 }
 
 }

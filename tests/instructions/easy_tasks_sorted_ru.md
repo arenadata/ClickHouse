@@ -6,7 +6,7 @@
 
 Делаем `chmod 000 /etc/clickhouse-client/config.xml` и смотрим, что получится.
 
-## Уменьшать max_memory_usage, если на сервере мало оперативки.
+## + Уменьшать max_memory_usage, если на сервере мало оперативки.
 
 Смотрим, сколько на сервере оперативки. Если `max_memory_usage`, `max_memory_usage_for_all_queries` ограничены, но больше 90% (настройка) от имеющейся оперативки, то уменьшать их и выводить предупреждение в лог..
 
@@ -16,7 +16,7 @@
 
 `context.setSetting` - для выставления `max_memory_usage` и других.
 
-## Битовые операции для FixedString.
+## + Битовые операции для FixedString.
 
 bitAnd, bitOr, bitNot, bitXor для значения типа FixedString, интерпретируемого как набор бит.
 
@@ -26,7 +26,7 @@ void memoryBitAnd(const char * a, const char * b, char * result, size_t size);
 ```
 Потом используйте их в вашей функции.
 
-## Добавить generic вариант функций least, greatest.
+## + Добавить generic вариант функций least, greatest.
 
 `SELECT least(123, 456)` - работает.
 
@@ -38,33 +38,35 @@ void memoryBitAnd(const char * a, const char * b, char * result, size_t size);
 
 Смотрим, что все файлы в прикрепляемых кусках от правильного пользователя.
 
-## COLLATE должно работать для Nullable(String).
+## + COLLATE должно работать для Nullable(String).
 
 В ClickHouse есть возможность указать collation для сортировки строк. Это не работает для `Nullable(String)`.
 
-## Запретить чтение значений типа AggregateFunction по-умолчанию и добавить настройку.
+## + Запретить чтение значений типа AggregateFunction по-умолчанию и добавить настройку.
 
 Состояния агрегатных функций могут быть записаны в дамп и считаны из него. Но десериализация состояний агрегатных функций небезопасна. Аккуратно выбранные пользовательские данные могут привести к segfault или порче памяти. Поэтому нужно просто сделать настройку, которая запрещает читать AggregateFunction из пользовательских данных.
 
-## В статистику jemalloc добавить информацию по arenas.
+Upd: сделали по-другому: теперь всё безопасно.
+
+## + В статистику jemalloc добавить информацию по arenas.
 
 В `system.asynchronous_metrics` - суммарный размер арен.
 
 # Более сложные задачи
 
-## Layout внешних словарей "direct".
+## + Layout внешних словарей "direct".
 
 Как cache, но без кэша — всегда прямой запрос в источник.
 
-## Функции randomFixedString, randomBinaryString, fuzzBits, fuzzBytes.
+## + Функции randomFixedString, randomBinaryString, fuzzBits, fuzzBytes.
 
-## Агрегатные функции для статистических тестов (e.g. тест нормальности распределения) и статистик.
+## + Агрегатные функции для статистических тестов (e.g. тест нормальности распределения) и статистик.
 
-## Функции создания и обновления состояния агрегатной функции по одному кортежу аргументов.
+## + Функции создания и обновления состояния агрегатной функции по одному кортежу аргументов.
 
-В ClickHouse есть понятие - состояние вычисления агрегатной функции. Состояния агрегатных функций можно записывать в таблицы, складывать, финализировать и т. п. https://clickhouse.yandex/docs/ru/data_types/nested_data_structures/aggregatefunction/
+В ClickHouse есть понятие - состояние вычисления агрегатной функции. Состояния агрегатных функций можно записывать в таблицы, складывать, финализировать и т. п. https://clickhouse.com/docs/ru/data_types/nested_data_structures/aggregatefunction/
 
-Получить состояние агрегатной функции можно с помощью комбинатора State: https://clickhouse.yandex/docs/ru/query_language/agg_functions/combinators/#-state Но хотелось бы добавить ещё более простой способ получения состояния агрегатной функции.
+Получить состояние агрегатной функции можно с помощью комбинатора State: https://clickhouse.com/docs/ru/query_language/agg_functions/combinators/#-state Но хотелось бы добавить ещё более простой способ получения состояния агрегатной функции.
 
 Например:
 
@@ -76,7 +78,7 @@ void memoryBitAnd(const char * a, const char * b, char * result, size_t size);
 
 ## LEFT ONLY JOIN
 
-## Функции makeDate, makeDateTime.
+## + Функции makeDate, makeDateTime.
 
 `makeDate(year, month, day)`
 `makeDateTime(year, month, day, hour, minute, second, [timezone])`
@@ -85,7 +87,7 @@ void memoryBitAnd(const char * a, const char * b, char * result, size_t size);
 
 `changeYear(datetime, 2019)`
 
-## Исправить мерцание прогресс-бара в clickhouse-client.
+## + Исправить мерцание прогресс-бара в clickhouse-client.
 
 Это заметно при работе с серверами с большим пингом.
 Прогресс бар не должен мерцать.
@@ -95,10 +97,6 @@ void memoryBitAnd(const char * a, const char * b, char * result, size_t size);
 
 Возвращает инкрементальное число для повторно встречающихся значений key.
 
-## Агрегатная функция groupConcat.
-
-`groupConcat(x, ',')` - собрать из переданных значений x строку, разделённую запятыми.
-
 ## Функции DATE_ADD, DATE_SUB как синонимы для совместимости с SQL.
 
 https://dev.mysql.com/doc/refman/8.0/en/date-and-time-functions.html#function_date-add
@@ -107,27 +105,27 @@ https://dev.mysql.com/doc/refman/8.0/en/date-and-time-functions.html#function_da
 
 position с конца строки.
 
-## Функция indexOf должна поддерживать Enum-ы без cast-а.
+## + Функция indexOf должна поддерживать Enum-ы без cast-а.
 
 `indexOf(arr, 'hello')`, `indexOf(arr, 1)` должны работать, если arr имеет тип `Array(Enum8('hello' = 1, 'world' = 2))`
 
-## Комбинатор агрегатных функций Distinct.
+## + Комбинатор агрегатных функций Distinct.
 
 Пример: `avgDistinct(x)` - вычислить среднее по всем различным переданным значениям.
 
-## Метрики количества ошибок.
+## + Метрики количества ошибок.
 
 Добавляем счётчики всех ошибок (ErrorCodes) по аналогии с ProfileEvents. Кроме количества запоминаем также время последней ошибки, стек трейс, сообщение. Добавляем системную таблицу system.errors. Отправка в Graphite.
 
-## Добавить Lizard, LZSSE и density в качестве вариантов алгоритмов сжатия.
+## + Добавить Lizard, LZSSE и density в качестве вариантов алгоритмов сжатия.
 
 Экспериментальные алгоритмы сжатия. Сейчас ClickHouse поддерживает только lz4 и zstd.
 
-## Запрос CREATE OR REPLACE TABLE
+## + Запрос CREATE OR REPLACE TABLE
 
-Атомарно (под блокировкой) удаляет таблицу перед созданием новой, если такая была.
+Атомарно удаляет таблицу перед созданием новой, если такая была.
 
-## Приведение типов для IN (subquery).
+## + Приведение типов для IN (subquery).
 
 `SELECT 1 IN (SELECT -1 UNION ALL SELECT 1)`
 
@@ -139,7 +137,7 @@ position с конца строки.
 
 ## Возможность использовать ALIAS столбцы при INSERT.
 
-https://clickhouse.yandex/docs/en/query_language/create/#create-table
+https://clickhouse.com/docs/query_language/create/#create-table
 
 `INSERT INTO table (column1, column2, ...)`
 
@@ -149,13 +147,17 @@ https://clickhouse.yandex/docs/en/query_language/create/#create-table
 
 Запретить модификацию данных в партиции. На партицию ставится флаг, что она заблокирована. В неё нельзя делать INSERT и ALTER. С файлов снимается доступ на запись.
 
+Upd: не нужно.
+
 ## Настройка join_use_nulls: поддержка для LEFT ARRAY JOIN.
 
-## Внешние словари из Aerospike/Couchbase/Cassandra (на выбор).
+## + Внешние словари из Aerospike/Couchbase/Cassandra (на выбор).
 
 Подключить одну из key-value БД как источник.
 
-## Движок таблиц Mongo, табличная функция mongo.
+Upd: сделали Redis, Cassandra, MongoDB.
+
+## + Движок таблиц Mongo, табличная функция mongo.
 
 Возможность легко импортировать данные из MongoDB.
 
@@ -177,7 +179,7 @@ world │ 123 │
 
 ## Работоспособность внешних данных на время сессии.
 
-https://clickhouse.yandex/docs/en/operations/table_engines/external_data/
+https://clickhouse.com/docs/operations/table_engines/external_data/
 
 Не работает, если открыть clickhouse-client в интерактивном режиме и делать несколько запросов.
 
@@ -187,7 +189,7 @@ https://clickhouse.yandex/docs/en/operations/table_engines/external_data/
 
 ## Раскрытие кортежей в функциях высшего порядка.
 
-## Табличная функция loop.
+## + Табличная функция loop.
 
 `SELECT * FROM loop(database, table)`
 
@@ -195,16 +197,16 @@ https://clickhouse.yandex/docs/en/operations/table_engines/external_data/
 
 ## Возможность ATTACH партиции с меньшим или большим количеством столбцов.
 
-## Поддержка неконстантного аргумента с тайм-зоной у некоторых функций для работы с датой и временем.
+## + Поддержка неконстантного аргумента с тайм-зоной у некоторых функций для работы с датой и временем.
 
-## Возможность задавать параметры соединений для табличных функций, движков таблиц и для реплик из отдельных разделов конфигурации.
+## + Возможность задавать параметры соединений для табличных функций, движков таблиц и для реплик из отдельных разделов конфигурации.
 
-## Настройка rollup_use_nulls.
+## + Настройка rollup_use_nulls.
 
-## Настройка cast_keep_nullable.
+Upd: it is named "group_by_use_nulls".
 
-## Функция bitEquals для сравнения произвольных типов данных побитово.
+## + Настройка cast_keep_nullable.
+
+## Функция bitEquals для сравнения произвольных типов данных побитово
 
 ## Функция serialize для implementation specific non portable non backwards compatible сериализации любого типа данных в набор байт.
-
-## Функция bitEquals и оператор <=>.

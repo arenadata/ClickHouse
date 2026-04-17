@@ -1,94 +1,109 @@
-#include <Functions/IFunctionImpl.h>
 #include <Functions/FunctionFactory.h>
+#include <Functions/IFunction.h>
 #include <Core/Field.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypeString.h>
+#include <Interpreters/Context.h>
 
 
 namespace DB
+{
+namespace Setting
+{
+    extern const SettingsBool print_pretty_type_names;
+}
+
+namespace
 {
 
 /** toTypeName(x) - get the type name
   * Returns name of IDataType instance (name of data type).
   */
-class ExecutableFunctionToTypeName : public IExecutableFunctionImpl
+class FunctionToTypeName : public IFunction
 {
 public:
+    explicit FunctionToTypeName(bool print_pretty_type_names_) : print_pretty_type_names(print_pretty_type_names_)
+    {
+    }
+
     static constexpr auto name = "toTypeName";
-    String getName() const override { return name; }
+
+    static FunctionPtr create(ContextPtr context)
+    {
+        return std::make_shared<FunctionToTypeName>(context->getSettingsRef()[Setting::print_pretty_type_names]);
+    }
+
+    String getName() const override
+    {
+        return name;
+    }
 
     bool useDefaultImplementationForNulls() const override { return false; }
+
+    bool useDefaultImplementationForNothing() const override { return false; }
+
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
+
     bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
 
-    /// Execute the function on the block.
-    void execute(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    size_t getNumberOfArguments() const override
     {
-        block.getByPosition(result).column
-            = DataTypeString().createColumnConst(input_rows_count, block.getByPosition(arguments[0]).type->getName());
-    }
-};
-
-
-class BaseFunctionToTypeName : public IFunctionBaseImpl
-{
-public:
-    BaseFunctionToTypeName(DataTypes argument_types_, DataTypePtr return_type_)
-        : argument_types(std::move(argument_types_)), return_type(std::move(return_type_)) {}
-
-    static constexpr auto name = "toTypeName";
-    String getName() const override { return name; }
-
-    bool isDeterministic() const override { return true; }
-    bool isDeterministicInScopeOfQuery() const override { return true; }
-
-    const DataTypes & getArgumentTypes() const override { return argument_types; }
-    const DataTypePtr & getReturnType() const override { return return_type; }
-
-    ExecutableFunctionImplPtr prepare(const Block &, const ColumnNumbers &, size_t) const override
-    {
-        return std::make_unique<ExecutableFunctionToTypeName>();
+        return 1;
     }
 
-    ColumnPtr getResultIfAlwaysReturnsConstantAndHasArguments(const Block &, const ColumnNumbers &) const override
+    DataTypePtr getReturnTypeImpl(const DataTypes & /*arguments*/) const override
     {
-        return DataTypeString().createColumnConst(1, argument_types.at(0)->getName());
+        return std::make_shared<DataTypeString>();
     }
+
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        return DataTypeString().createColumnConst(input_rows_count, print_pretty_type_names ? arguments[0].type->getPrettyName() : arguments[0].type->getName());
+    }
+
+    ColumnPtr getConstantResultForNonConstArguments(const ColumnsWithTypeAndName & arguments, const DataTypePtr &) const override
+    {
+        return DataTypeString().createColumnConst(1, print_pretty_type_names ? arguments[0].type->getPrettyName() : arguments[0].type->getName());
+    }
+
+    ColumnNumbers getArgumentsThatDontImplyNullableReturnType(size_t /*number_of_arguments*/) const override { return {0}; }
 
 private:
-    DataTypes argument_types;
-    DataTypePtr return_type;
+    bool print_pretty_type_names;
 };
 
+}
 
-class FunctionToTypeNameBuilder : public IFunctionOverloadResolverImpl
+REGISTER_FUNCTION(ToTypeName)
 {
-public:
-    static constexpr auto name = "toTypeName";
-    String getName() const override { return name; }
-    static FunctionOverloadResolverImplPtr create(const Context &) { return std::make_unique<FunctionToTypeNameBuilder>(); }
-
-    size_t getNumberOfArguments() const override { return 1; }
-
-    DataTypePtr getReturnType(const DataTypes &) const override { return std::make_shared<DataTypeString>(); }
-
-    FunctionBaseImplPtr build(const ColumnsWithTypeAndName & arguments, const DataTypePtr & return_type) const override
+    FunctionDocumentation::Description description = R"(
+Returns the type name of the passed argument.
+If `NULL` is passed, the function returns type `Nullable(Nothing)`, which corresponds to ClickHouse's internal `NULL` representation.
+    )";
+    FunctionDocumentation::Syntax syntax = "toTypeName(x)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "A value of arbitrary type.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the data type name of the input value.", {"String"}};
+    FunctionDocumentation::Examples examples = {
     {
-        DataTypes types;
-        types.reserve(arguments.size());
-        for (const auto & elem : arguments)
-            types.emplace_back(elem.type);
-
-        return std::make_unique<BaseFunctionToTypeName>(types, return_type);
+        "Usage example",
+        R"(
+SELECT toTypeName(123)
+        )",
+        R"(
+┌─toTypeName(123)─┐
+│ UInt8           │
+└─────────────────┘
+        )"
     }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
 
-    bool useDefaultImplementationForNulls() const override { return false; }
-    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
-    ColumnNumbers getArgumentsThatDontImplyNullableReturnType(size_t /*number_of_arguments*/) const override { return {0}; }
-};
-
-
-void registerFunctionToTypeName(FunctionFactory & factory)
-{
-    factory.registerFunction<FunctionToTypeNameBuilder>();
+    factory.registerFunction<FunctionToTypeName>(documentation);
 }
 
 }

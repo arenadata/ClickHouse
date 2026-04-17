@@ -1,12 +1,12 @@
 #pragma once
 
 #include <Common/NamePrompter.h>
+#include <Databases/LoadingStrictnessLevel.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/ColumnsDescription.h>
-#include <Storages/ConstraintsDescription.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/registerStorages.h>
-#include <Access/AccessType.h>
+#include <Access/Common/AccessType.h>
 #include <unordered_map>
 
 
@@ -17,21 +17,26 @@ class Context;
 class ASTCreateQuery;
 class ASTStorage;
 struct StorageID;
-
+struct ConstraintsDescription;
 
 /** Allows to create a table by the name and parameters of the engine.
   * In 'columns' Nested data structures must be flattened.
   * You should subsequently call IStorage::startup method to work with table.
   */
-class StorageFactory : private boost::noncopyable, public IHints<1, StorageFactory>
+class StorageFactory : private boost::noncopyable, public IHints<>
 {
 public:
 
     static StorageFactory & instance();
 
+    /// Helper function to validate if a specific storage supports a setting
+    /// Used to validate if table settings belong to the engine or the query before the start of the query interpretation
+    using HasBuiltinSettingFn = bool(std::string_view);
+
     struct Arguments
     {
         const String & engine_name;
+        /// Mutable to allow replacing constant expressions with literals, and other transformations.
         ASTs & engine_args;
         ASTStorage * storage_def;
         const ASTCreateQuery & query;
@@ -39,23 +44,38 @@ public:
         /// Relative to <path> from server config (possibly <path> of some <disk> of some <volume> for *MergeTree)
         const String & relative_data_path;
         const StorageID & table_id;
-        Context & local_context;
-        Context & context;
+        ContextWeakMutablePtr local_context;
+        ContextWeakMutablePtr context;
         const ColumnsDescription & columns;
         const ConstraintsDescription & constraints;
-        bool attach;
-        bool has_force_restore_data_flag;
+        LoadingStrictnessLevel mode;
+        const String & comment;
+        bool is_restore_from_backup = false;
+
+        ContextMutablePtr getContext() const;
+        ContextMutablePtr getLocalContext() const;
     };
 
+    /// Analog of the IStorage::supports*() helpers
+    /// (But the former cannot be replaced with StorageFeatures due to nesting)
     struct StorageFeatures
     {
         bool supports_settings = false;
         bool supports_skipping_indices = false;
+        bool supports_projections = false;
         bool supports_sort_order = false;
+        /// See also IStorage::supportsTTL()
         bool supports_ttl = false;
+        /// See also IStorage::supportsReplication()
         bool supports_replication = false;
+        /// See also IStorage::supportsDeduplication()
         bool supports_deduplication = false;
-        AccessType source_access_type = AccessType::NONE;
+        /// See also IStorage::supportsParallelInsert()
+        bool supports_parallel_insert = false;
+        bool supports_schema_inference = false;
+        std::optional<AccessTypeObjects::Source> source_access_type = std::nullopt;
+
+        HasBuiltinSettingFn * has_builtin_setting_fn = nullptr;
     };
 
     using CreatorFn = std::function<StoragePtr(const Arguments & arguments)>;
@@ -70,22 +90,27 @@ public:
     StoragePtr get(
         const ASTCreateQuery & query,
         const String & relative_data_path,
-        Context & local_context,
-        Context & context,
+        ContextMutablePtr local_context,
+        ContextMutablePtr context,
         const ColumnsDescription & columns,
         const ConstraintsDescription & constraints,
-        bool has_force_restore_data_flag) const;
+        LoadingStrictnessLevel mode,
+        bool is_restore_from_backup = false) const;
 
     /// Register a table engine by its name.
     /// No locking, you must register all engines before usage of get.
     void registerStorage(const std::string & name, CreatorFn creator_fn, StorageFeatures features = StorageFeatures{
         .supports_settings = false,
         .supports_skipping_indices = false,
+        .supports_projections = false,
         .supports_sort_order = false,
         .supports_ttl = false,
         .supports_replication = false,
         .supports_deduplication = false,
-        .source_access_type = AccessType::NONE,
+        .supports_parallel_insert = false,
+        .supports_schema_inference = false,
+        .source_access_type = std::nullopt,
+        .has_builtin_setting_fn = nullptr,
     });
 
     const Storages & getAllStorages() const
@@ -111,10 +136,14 @@ public:
         return result;
     }
 
-    AccessType getSourceAccessType(const String & table_engine) const;
+    std::optional<AccessTypeObjects::Source> getSourceAccessObject(const String & table_engine) const;
+
+    const StorageFeatures & getStorageFeatures(const String & storage_name) const;
 
 private:
     Storages storages;
 };
+
+void checkAllTypesAreAllowedInTable(const NamesAndTypesList & names_and_types);
 
 }

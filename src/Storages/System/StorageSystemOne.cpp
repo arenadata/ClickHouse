@@ -1,49 +1,74 @@
-#include <Common/Exception.h>
+#include <Storages/System/StorageSystemOne.h>
 
 #include <Columns/ColumnsNumber.h>
+#include <Common/Exception.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <Storages/System/StorageSystemOne.h>
+#include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
-#include <Processors/Pipe.h>
+#include <QueryPipeline/Pipe.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 
 
 namespace DB
 {
 
 
-StorageSystemOne::StorageSystemOne(const std::string & name_)
-    : IStorage({"system", name_})
+StorageSystemOne::StorageSystemOne(const StorageID & table_id_)
+    : StorageWithCommonVirtualColumns(table_id_)
 {
     StorageInMemoryMetadata storage_metadata;
+    /// This column doesn't have a comment, because otherwise it will be added to all tables created via:
+    /// CREATE TABLE test (dummy UInt8) ENGINE = Distributed(`default`, `system.one`)
     storage_metadata.setColumns(ColumnsDescription({{"dummy", std::make_shared<DataTypeUInt8>()}}));
+    storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
 }
 
-
-Pipes StorageSystemOne::read(
-    const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
-    const SelectQueryInfo &,
-    const Context & /*context*/,
-    QueryProcessingStage::Enum /*processed_stage*/,
-    const size_t /*max_block_size*/,
-    const unsigned /*num_streams*/)
+VirtualColumnsDescription StorageSystemOne::createVirtuals()
 {
-    metadata_snapshot->check(column_names, getVirtuals(), getStorageID());
+    VirtualColumnsDescription desc;
+    desc.addEphemeral("_table", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    desc.addEphemeral("_database", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    return desc;
+}
 
-    Block header{ColumnWithTypeAndName(
-            DataTypeUInt8().createColumn(),
-            std::make_shared<DataTypeUInt8>(),
-            "dummy")};
 
+void StorageSystemOne::readImpl(
+    QueryPlan & query_plan,
+    const Names & column_names,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & /*query_info*/,
+    ContextPtr /*context*/,
+    QueryProcessingStage::Enum /*processed_stage*/,
+    size_t /*max_block_size*/,
+    size_t /*num_streams*/)
+{
+    storage_snapshot->check(column_names);
+
+    query_plan.addStep(std::make_unique<ReadFromSystemOneStep>(column_names, storage_snapshot));
+}
+
+
+ReadFromSystemOneStep::ReadFromSystemOneStep(
+    const Names & column_names_,
+    const StorageSnapshotPtr & storage_snapshot_
+)
+    : ISourceStep(std::make_shared<const Block>(storage_snapshot_->getSampleBlockForColumns(column_names_)))
+{
+}
+
+
+void ReadFromSystemOneStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
     auto column = DataTypeUInt8().createColumnConst(1, 0u)->convertToFullColumnIfConst();
     Chunk chunk({ std::move(column) }, 1);
 
-    Pipes pipes;
-    pipes.emplace_back(std::make_shared<SourceFromSingleChunk>(std::move(header), std::move(chunk)));
+    auto source = std::make_shared<SourceFromSingleChunk>(getOutputHeader(), std::move(chunk));
+    source->addTotalRowsApprox(1);
 
-    return pipes;
+    pipeline.init(Pipe(source));
 }
-
 
 }

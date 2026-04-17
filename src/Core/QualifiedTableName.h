@@ -1,8 +1,12 @@
 #pragma once
 
+#include <base/types.h>
+
+#include <optional>
 #include <string>
 #include <tuple>
-#include <Common/SipHash.h>
+#include <vector>
+
 
 namespace DB
 {
@@ -23,13 +27,22 @@ struct QualifiedTableName
         return std::forward_as_tuple(database, table) < std::forward_as_tuple(other.database, other.table);
     }
 
-    UInt64 hash() const
+    UInt64 hash() const;
+
+    std::vector<std::string> getParts() const
     {
-        SipHash hash_state;
-        hash_state.update(database.data(), database.size());
-        hash_state.update(table.data(), table.size());
-        return hash_state.get64();
+        if (database.empty())
+            return {table};
+        return {database, table};
     }
+
+    std::string getFullName() const;
+
+    /// NOTE: It's different from compound identifier parsing and does not support escaping and dots in name.
+    /// Usually it's better to use ParserIdentifier instead,
+    /// but we parse DDL dictionary name (and similar things) this way for historical reasons.
+    static std::optional<QualifiedTableName> tryParseFromString(const String & maybe_qualified_name);
+    static QualifiedTableName parseFromString(const String & maybe_qualified_name);
 };
 
 }

@@ -1,12 +1,8 @@
-#include <ostream>
-#include <sstream>
-
 #include <Common/typeid_cast.h>
 #include <Interpreters/QueryAliasesVisitor.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSelectQuery.h>
-#include <Parsers/formatAST.h>
 #include <Parsers/ASTSubquery.h>
 #include <Common/quoteString.h>
 
@@ -18,15 +14,17 @@ namespace ErrorCodes
     extern const int MULTIPLE_EXPRESSIONS_FOR_ALIAS;
 }
 
-static String wrongAliasMessage(const ASTPtr & ast, const ASTPtr & prev_ast, const String & alias)
+namespace
 {
-    std::stringstream message;
-    message << "Different expressions with the same alias " << backQuoteIfNeed(alias) << ":" << std::endl;
-    formatAST(*ast, message, false, true);
-    message << std::endl << "and" << std::endl;
-    formatAST(*prev_ast, message, false, true);
-    message << std::endl;
-    return message.str();
+
+    constexpr auto dummy_subquery_name_prefix = "_subquery";
+
+    PreformattedMessage wrongAliasMessage(const ASTPtr & ast, const ASTPtr & prev_ast, const String & alias)
+    {
+        return PreformattedMessage::create("Different expressions with the same alias {}:\n{}\nand\n{}\n",
+                                           backQuoteIfNeed(alias), ast->formatForErrorMessage(), prev_ast->formatForErrorMessage());
+    }
+
 }
 
 
@@ -65,7 +63,7 @@ void QueryAliasesMatcher<T>::visit(const ASTSelectQuery & select, const ASTPtr &
 
     for (auto & child : with->children)
         if (auto * ast_with_alias = dynamic_cast<ASTWithAlias *>(child.get()))
-            ast_with_alias->prefer_alias_to_column_name = true;
+            ast_with_alias->setPreferAliasToColumnName(true);
 }
 
 /// The top-level aliases in the ARRAY JOIN section have a special meaning, we will not add them
@@ -102,9 +100,9 @@ void QueryAliasesMatcher<T>::visit(const ASTSubquery & const_subquery, const AST
         String alias;
         do
         {
-            alias = "_subquery" + std::to_string(++subquery_index);
+            alias = dummy_subquery_name_prefix + std::to_string(++subquery_index);
         }
-        while (aliases.count(alias));
+        while (aliases.contains(alias));
 
         subquery.setAlias(alias);
         aliases[alias] = ast;
@@ -112,7 +110,7 @@ void QueryAliasesMatcher<T>::visit(const ASTSubquery & const_subquery, const AST
     else
         visitOther(ast, aliases);
 
-    subquery.prefer_alias_to_column_name = true;
+    subquery.setPreferAliasToColumnName(true);
 }
 
 template <typename T>
@@ -122,10 +120,34 @@ void QueryAliasesMatcher<T>::visitOther(const ASTPtr & ast, Data & data)
     String alias = ast->tryGetAlias();
     if (!alias.empty())
     {
-        if (aliases.count(alias) && ast->getTreeHash() != aliases[alias]->getTreeHash())
-            throw Exception(wrongAliasMessage(ast, aliases[alias], alias), ErrorCodes::MULTIPLE_EXPRESSIONS_FOR_ALIAS);
+        if (aliases.contains(alias) && ast->getTreeHash(/*ignore_aliases=*/ true) != aliases[alias]->getTreeHash(/*ignore_aliases=*/ true))
+                throw Exception(wrongAliasMessage(ast, aliases[alias], alias), ErrorCodes::MULTIPLE_EXPRESSIONS_FOR_ALIAS);
 
         aliases[alias] = ast;
+    }
+
+    /** QueryAliasesVisitor is executed before ExecuteScalarSubqueriesVisitor.
+        For example we have subquery in our query (SELECT sum(number) FROM numbers(10)).
+
+        After running QueryAliasesVisitor it will be (SELECT sum(number) FROM numbers(10)) as _subquery_1
+        and prefer_alias_to_column_name for this subquery will be true.
+
+        After running ExecuteScalarSubqueriesVisitor it will be converted to (45 as _subquery_1)
+        and prefer_alias_to_column_name for ast literal will be true.
+
+        But if we send such query on remote host with Distributed engine for example we cannot send prefer_alias_to_column_name
+        information for our ast node with query string. And this alias will be dropped because prefer_alias_to_column_name for ASTWIthAlias
+        by default is false.
+
+        It is important that subquery can be converted to literal during ExecuteScalarSubqueriesVisitor.
+        And code below check if we previously set for subquery alias as _subquery, and if it is true
+        then set prefer_alias_to_column_name = true for node that was optimized during ExecuteScalarSubqueriesVisitor.
+     */
+
+    if (auto * ast_with_alias = dynamic_cast<ASTWithAlias *>(ast.get()))
+    {
+        if (startsWith(alias, dummy_subquery_name_prefix))
+            ast_with_alias->setPreferAliasToColumnName(true);
     }
 }
 

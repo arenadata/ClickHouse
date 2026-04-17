@@ -101,7 +101,7 @@
 #endif
 
 /*
- * The pcg_extras namespace contains some support code that is likley to
+ * The pcg_extras namespace contains some support code that is likely to
  * be useful for a variety of RNGs, including:
  *      - 128-bit int support for platforms where it isn't available natively
  *      - bit twiddling operations
@@ -113,6 +113,14 @@
 
 #include "pcg_extras.hpp"
 
+// NOLINTBEGIN(*)
+
+namespace DB
+{
+    struct PcgSerializer;
+    struct PcgDeserializer;
+}
+
 namespace pcg_detail {
 
 using namespace pcg_extras;
@@ -123,7 +131,7 @@ using namespace pcg_extras;
  *
  *      default_multiplier<uint32_t>::multiplier()
  *
- * gives you the default multipler for 32-bit integers.  We use the name
+ * gives you the default multiplier for 32-bit integers.  We use the name
  * of the constant and not a generic word like value to allow these classes
  * to be used as mixins.
  */
@@ -174,7 +182,7 @@ PCG_DEFINE_CONSTANT(pcg128_t, default, increment,
  *                       period
  *     specific stream - the constant can be changed at any time, selecting
  *                       a different random sequence
- *     unique stream   - the constant is based on the memory addresss of the
+ *     unique stream   - the constant is based on the memory address of the
  *                       object, thus every RNG has its own unique sequence
  *
  * This variation is provided though mixin classes which define a function
@@ -352,7 +360,7 @@ protected:
  * (reducing register pressure).
  *
  * Given the high level of parameterization, the code has to use some
- * template-metaprogramming tricks to handle some of the suble variations
+ * template-metaprogramming tricks to handle some of the subtle variations
  * involved.
  */
 
@@ -557,6 +565,9 @@ public:
                engine<xtype1, itype1,
                         output_mixin1, output_previous1,
                         stream_mixin1, multiplier_mixin1>& rng);
+
+    friend ::DB::PcgSerializer;
+    friend ::DB::PcgDeserializer;
 };
 
 template <typename CharT, typename Traits,
@@ -1634,22 +1645,22 @@ typedef setseq_base<pcg128_t, pcg128_t, xsl_rr_rr_mixin>
 
 template <bitcount_t table_pow2, bitcount_t advance_pow2,
           typename BaseRNG, bool kdd = true>
-using ext_std8 = extended<table_pow2, advance_pow2, BaseRNG,
+using ext_std8 = pcg_detail::extended<table_pow2, advance_pow2, BaseRNG,
                           oneseq_rxs_m_xs_8_8, kdd>;
 
 template <bitcount_t table_pow2, bitcount_t advance_pow2,
           typename BaseRNG, bool kdd = true>
-using ext_std16 = extended<table_pow2, advance_pow2, BaseRNG,
+using ext_std16 = pcg_detail::extended<table_pow2, advance_pow2, BaseRNG,
                            oneseq_rxs_m_xs_16_16, kdd>;
 
 template <bitcount_t table_pow2, bitcount_t advance_pow2,
           typename BaseRNG, bool kdd = true>
-using ext_std32 = extended<table_pow2, advance_pow2, BaseRNG,
+using ext_std32 = pcg_detail::extended<table_pow2, advance_pow2, BaseRNG,
                            oneseq_rxs_m_xs_32_32, kdd>;
 
 template <bitcount_t table_pow2, bitcount_t advance_pow2,
           typename BaseRNG, bool kdd = true>
-using ext_std64 = extended<table_pow2, advance_pow2, BaseRNG,
+using ext_std64 = pcg_detail::extended<table_pow2, advance_pow2, BaseRNG,
                            oneseq_rxs_m_xs_64_64, kdd>;
 
 
@@ -1767,5 +1778,7 @@ typedef pcg_engines::ext_oneseq_xsh_rs_64_32<14,32,true>    pcg32_k16384_fast;
 #ifdef _MSC_VER
     #pragma warning(default:4146)
 #endif
+
+// NOLINTEND(*)
 
 #endif // PCG_RAND_HPP_INCLUDED

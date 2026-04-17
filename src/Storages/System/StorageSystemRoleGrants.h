@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ext/shared_ptr_helper.h>
 #include <Storages/System/IStorageSystemOneBlock.h>
 
 
@@ -9,16 +8,15 @@ namespace DB
 class Context;
 
 /// Implements `role_grants` system table, which allows you to get information about granted roles.
-class StorageSystemRoleGrants final : public ext::shared_ptr_helper<StorageSystemRoleGrants>, public IStorageSystemOneBlock<StorageSystemRoleGrants>
+class StorageSystemRoleGrants final : public IStorageSystemOneBlock
 {
 public:
     std::string getName() const override { return "SystemRoleGrants"; }
-    static NamesAndTypesList getNamesAndTypes();
+    static ColumnsDescription getColumnsDescription();
 
 protected:
-    friend struct ext::shared_ptr_helper<StorageSystemRoleGrants>;
     using IStorageSystemOneBlock::IStorageSystemOneBlock;
-    void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo &) const override;
+    void fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node *, std::vector<UInt8>) const override;
 };
 
 }

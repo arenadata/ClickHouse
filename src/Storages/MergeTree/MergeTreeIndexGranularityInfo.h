@@ -1,24 +1,47 @@
 #pragma once
 
 #include <optional>
-#include <Core/Types.h>
+#include <base/types.h>
 #include <Storages/MergeTree/MergeTreeDataPartType.h>
-#include <Disks/IDisk.h>
 
 namespace DB
 {
 
 class MergeTreeData;
+class IDataPartStorage;
+struct MergeTreeSettings;
+
+struct ProjectionDescription;
+using ProjectionDescriptionRawPtr = const ProjectionDescription *;
+
+/** Various types of mark files are stored in files with various extensions:
+  * .mrk, .mrk2, .mrk3, .mrk4, .cmrk, .cmrk2, .cmrk3, .cmrk4.
+  * This helper allows to obtain mark type from file extension and vice versa.
+  */
+struct MarkType
+{
+    explicit MarkType(std::string_view extension);
+    MarkType(bool adaptive_, bool compressed_, bool with_substreams_, MergeTreeDataPartType::Value part_type_);
+
+    static bool isMarkFileExtension(std::string_view extension);
+    std::string getFileExtension() const;
+
+    std::string describe() const;
+
+    bool adaptive = false;
+    bool compressed = false;
+    /// For Compact parts only.
+    /// If true, marks are written for each substream, not for each column.
+    bool with_substreams = false;
+    MergeTreeDataPartType::Value part_type = MergeTreeDataPartType::Unknown;
+};
+
 
 /// Meta information about index granularity
 struct MergeTreeIndexGranularityInfo
 {
 public:
-    /// Marks file extension '.mrk' or '.mrk2'
-    String marks_file_extension;
-
-    /// Is stride in rows between marks non fixed?
-    bool is_adaptive = false;
+    MarkType mark_type;
 
     /// Fixed size in rows of one granule if index_granularity_bytes is zero
     size_t fixed_index_granularity = 0;
@@ -26,29 +49,26 @@ public:
     /// Approximate bytes size of one granule
     size_t index_granularity_bytes = 0;
 
-    MergeTreeIndexGranularityInfo(const MergeTreeData & storage, MergeTreeDataPartType type_);
+    MergeTreeIndexGranularityInfo(const MergeTreeData & storage, const MergeTreeSettings & storage_settings, MergeTreeDataPartType type_);
 
-    void changeGranularityIfRequired(const DiskPtr & disk, const String & path_to_part);
+    MergeTreeIndexGranularityInfo(const MergeTreeSettings & storage_settings, MarkType mark_type_);
+
+    void changeGranularityIfRequired(const IDataPartStorage & data_part_storage);
 
     String getMarksFilePath(const String & path_prefix) const
     {
-        return path_prefix + marks_file_extension;
+        return path_prefix + mark_type.getFileExtension();
     }
 
     size_t getMarkSizeInBytes(size_t columns_num = 1) const;
 
-    static std::optional<std::string> getMarksExtensionFromFilesystem(const DiskPtr & disk, const String & path_to_part);
+    static std::optional<MarkType> getMarksTypeFromFilesystem(const IDataPartStorage & data_part_storage);
 
-private:
-    MergeTreeDataPartType type;
-    void setAdaptive(size_t index_granularity_bytes_);
-    void setNonAdaptive();
+    std::string describe() const;
 };
 
-constexpr inline auto getNonAdaptiveMrkExtension() { return ".mrk"; }
-constexpr inline auto getNonAdaptiveMrkSizeWide() { return sizeof(UInt64) * 2; }
-constexpr inline auto getAdaptiveMrkSizeWide() { return sizeof(UInt64) * 3; }
+constexpr auto getNonAdaptiveMrkSizeWide() { return sizeof(UInt64) * 2; }
+constexpr auto getAdaptiveMrkSizeWide() { return sizeof(UInt64) * 3; }
 inline size_t getAdaptiveMrkSizeCompact(size_t columns_num);
-std::string getAdaptiveMrkExtension(MergeTreeDataPartType part_type);
 
 }

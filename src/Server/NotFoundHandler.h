@@ -1,18 +1,18 @@
 #pragma once
 
-#include <Poco/Net/HTTPRequestHandler.h>
-
+#include <Server/HTTP/HTTPRequestHandler.h>
 
 namespace DB
 {
 
 /// Response with 404 and verbose description.
-class NotFoundHandler : public Poco::Net::HTTPRequestHandler
+class NotFoundHandler : public HTTPRequestHandler
 {
 public:
-    void handleRequest(
-        Poco::Net::HTTPServerRequest & request,
-        Poco::Net::HTTPServerResponse & response) override;
+    explicit NotFoundHandler(std::vector<std::string> hints_) : hints(std::move(hints_)) {}
+    void handleRequest(HTTPServerRequest & request, HTTPServerResponse & response, const ProfileEvents::Event & write_event) override;
+private:
+    std::vector<std::string> hints;
 };
 
 }

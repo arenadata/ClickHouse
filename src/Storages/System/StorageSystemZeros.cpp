@@ -1,10 +1,14 @@
 #include <Storages/System/StorageSystemZeros.h>
+#include <Storages/SelectQueryInfo.h>
 
-#include <Processors/Sources/SourceWithProgress.h>
-#include <Processors/Pipe.h>
+#include <Processors/ISource.h>
+#include <QueryPipeline/Pipe.h>
 
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnsNumber.h>
+
 
 namespace DB
 {
@@ -14,7 +18,9 @@ namespace
 
 struct ZerosState
 {
+    explicit ZerosState(UInt64 limit) : add_total_rows(limit) { }
     std::atomic<UInt64> num_generated_rows = 0;
+    std::atomic<UInt64> add_total_rows = 0;
 };
 
 using ZerosStatePtr = std::shared_ptr<ZerosState>;
@@ -23,11 +29,11 @@ using ZerosStatePtr = std::shared_ptr<ZerosState>;
 /// Source which generates zeros.
 /// Uses state to share the number of generated rows between threads.
 /// If state is nullptr, then limit is ignored.
-class ZerosSource : public SourceWithProgress
+class ZerosSource : public ISource
 {
 public:
     ZerosSource(UInt64 block_size, UInt64 limit_, ZerosStatePtr state_)
-            : SourceWithProgress(createHeader()), limit(limit_), state(std::move(state_))
+            : ISource(createHeader()), limit(limit_), state(std::move(state_))
     {
         column = createColumn(block_size);
     }
@@ -40,10 +46,13 @@ protected:
         auto column_ptr = column;
         size_t column_size = column_ptr->size();
 
-        if (state)
+        UInt64 total_rows = state->add_total_rows.fetch_and(0);
+        if (total_rows)
+            addTotalRowsApprox(total_rows);
+
+        if (limit)
         {
             auto generated_rows = state->num_generated_rows.fetch_add(column_size, std::memory_order_acquire);
-
             if (generated_rows >= limit)
                 return {};
 
@@ -54,7 +63,7 @@ protected:
             }
         }
 
-        progress({column->size(), column->byteSize()});
+        progress(column->size(), column->byteSize());
 
         return { Columns {std::move(column_ptr)}, column_size };
     }
@@ -64,9 +73,9 @@ private:
     ZerosStatePtr state;
     ColumnPtr column;
 
-    static Block createHeader()
+    static SharedHeader createHeader()
     {
-        return { ColumnWithTypeAndName(ColumnUInt8::create(), std::make_shared<DataTypeUInt8>(), "zero") };
+        return std::make_shared<const Block>(Block{ ColumnWithTypeAndName(ColumnUInt8::create(), std::make_shared<DataTypeUInt8>(), "zero") });
     }
 
     static ColumnPtr createColumn(size_t size)
@@ -82,52 +91,53 @@ private:
 }
 
 StorageSystemZeros::StorageSystemZeros(const StorageID & table_id_, bool multithreaded_, std::optional<UInt64> limit_)
-    : IStorage(table_id_), multithreaded(multithreaded_), limit(limit_)
+    : StorageWithCommonVirtualColumns(table_id_), multithreaded(multithreaded_), limit(limit_)
 {
     StorageInMemoryMetadata storage_metadata;
-    storage_metadata.setColumns(ColumnsDescription({{"zero", std::make_shared<DataTypeUInt8>()}}));
+    storage_metadata.setColumns(ColumnsDescription({{"zero", std::make_shared<DataTypeUInt8>(), "dummy"}}));
+    storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
-
 }
 
-Pipes StorageSystemZeros::read(
+VirtualColumnsDescription StorageSystemZeros::createVirtuals()
+{
+    VirtualColumnsDescription desc;
+    desc.addEphemeral("_table", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    desc.addEphemeral("_database", std::make_shared<DataTypeLowCardinality>(std::make_shared<DataTypeString>()), "", VirtualsMaterializationPlace::Plan);
+    return desc;
+}
+
+Pipe StorageSystemZeros::read(
     const Names & column_names,
-    const StorageMetadataPtr & metadata_snapshot,
-    const SelectQueryInfo &,
-    const Context & /*context*/,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr /*context*/,
     QueryProcessingStage::Enum /*processed_stage*/,
     size_t max_block_size,
-    unsigned num_streams)
+    size_t num_streams)
 {
-    metadata_snapshot->check(column_names, getVirtuals(), getStorageID());
+    storage_snapshot->check(column_names);
 
-    bool use_multiple_streams = multithreaded;
+    UInt64 query_limit = limit ? *limit : 0;
+    if (query_info.trivial_limit)
+        query_limit = query_limit ? std::min(query_limit, query_info.trivial_limit) : query_info.trivial_limit;
 
-    if (limit && *limit < max_block_size)
-    {
-        max_block_size = static_cast<size_t>(*limit);
-        use_multiple_streams = false;
-    }
+    if (query_limit && query_limit < max_block_size)
+        max_block_size = query_limit;
 
-    if (!use_multiple_streams)
+    if (!multithreaded)
         num_streams = 1;
+    else if (query_limit && num_streams * max_block_size > query_limit)
+        /// We want to avoid spawning more streams than necessary
+        num_streams = std::min(num_streams, static_cast<size_t>(((query_limit + max_block_size - 1) / max_block_size)));
 
-    Pipes res;
-    res.reserve(num_streams);
+    ZerosStatePtr state = std::make_shared<ZerosState>(query_limit);
 
-    ZerosStatePtr state;
-
-    if (limit)
-        state = std::make_shared<ZerosState>();
-
+    Pipe res;
     for (size_t i = 0; i < num_streams; ++i)
     {
-        auto source = std::make_shared<ZerosSource>(max_block_size, limit ? *limit : 0, state);
-
-        if (limit && i == 0)
-            source->addTotalRowsApprox(*limit);
-
-        res.emplace_back(std::move(source));
+        auto source = std::make_shared<ZerosSource>(max_block_size, query_limit, state);
+        res.addSource(std::move(source));
     }
 
     return res;

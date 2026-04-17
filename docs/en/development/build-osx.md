@@ -1,58 +1,70 @@
 ---
-toc_priority: 65
-toc_title: Build on Mac OS X
+description: 'Guide for building ClickHouse from source on macOS systems'
+sidebar_label: 'Build on macOS for macOS'
+sidebar_position: 15
+slug: /development/build-osx
+title: 'Build on macOS for macOS'
+keywords: ['MacOS', 'Mac', 'build']
+doc_type: 'guide'
 ---
 
-# How to Build ClickHouse on Mac OS X {#how-to-build-clickhouse-on-mac-os-x}
+# How to Build ClickHouse on macOS for macOS
 
-Build should work on Mac OS X 10.15 (Catalina).
+:::info This build guide is for contributors modifying ClickHouse itself.
+If you are not changing ClickHouse source code, you can install pre-built ClickHouse as described in [Quick Start](https://clickhouse.com/docs/get-started/quick-start).
+:::
 
-## Install Homebrew {#install-homebrew}
+ClickHouse can be compiled on macOS x86_64 (Intel) and arm64 (Apple Silicon) using on macOS 10.15 (Catalina) or higher.
 
-``` bash
-$ /usr/bin/ruby -e "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
+As compiler, only Clang from homebrew is supported.
+
+## Install prerequisites {#install-prerequisites}
+
+First, see the generic [prerequisites documentation](developer-instruction.md).
+
+Next, install [Homebrew](https://brew.sh/) and run
+
+Then run:
+
+```bash
+brew update
+brew install ccache cmake ninja libtool gettext llvm lld binutils grep findutils nasm bash rust rustup
 ```
 
-## Install Required Compilers, Tools, and Libraries {#install-required-compilers-tools-and-libraries}
-
-``` bash
-$ brew install cmake ninja libtool gettext
-```
-
-## Checkout ClickHouse Sources {#checkout-clickhouse-sources}
-
-``` bash
-$ git clone --recursive git@github.com:ClickHouse/ClickHouse.git
-```
-
-or
-
-``` bash
-$ git clone --recursive https://github.com/ClickHouse/ClickHouse.git
-
-$ cd ClickHouse
-```
+:::note
+Apple uses a case-insensitive file system by default. While this usually does not affect compilation (especially scratch makes will work), it can confuse file operations like `git mv`.
+For serious development on macOS, make sure that the source code is stored on a case-sensitive disk volume, e.g. see [these instructions](https://brianboyko.medium.com/a-case-sensitive-src-folder-for-mac-programmers-176cc82a3830).
+:::
 
 ## Build ClickHouse {#build-clickhouse}
 
-``` bash
-$ mkdir build
-$ cd build
-$ cmake .. -DCMAKE_CXX_COMPILER=`which clang++` -DCMAKE_C_COMPILER=`which clang`
-$ ninja
-$ cd ..
+To build you must use Homebrew's Clang compiler:
+
+```bash
+cd ClickHouse
+mkdir build
+export PATH=$(brew --prefix llvm)/bin:$PATH
+cmake -S . -B build
+cmake --build build
+# The resulting binary will be created at: build/programs/clickhouse
 ```
+
+:::note
+If you are running into `ld: archive member '/' not a mach-o file in ...` errors during linking, you may need
+to use llvm-ar by setting flag `-DCMAKE_AR=/opt/homebrew/opt/llvm/bin/llvm-ar`.
+:::
 
 ## Caveats {#caveats}
 
-If you intend to run `clickhouse-server`, make sure to increase the system’s maxfiles variable.
+If you intend to run `clickhouse-server`, make sure to increase the system's `maxfiles` variable.
 
-!!! info "Note"
-    You’ll need to use sudo.
+:::note
+You'll need to use sudo.
+:::
 
 To do so, create the `/Library/LaunchDaemons/limit.maxfiles.plist` file with the following content:
 
-``` xml
+```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
         "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -76,14 +88,22 @@ To do so, create the `/Library/LaunchDaemons/limit.maxfiles.plist` file with the
 </plist>
 ```
 
-Execute the following command:
+Give the file correct permissions:
 
-``` bash
-$ sudo chown root:wheel /Library/LaunchDaemons/limit.maxfiles.plist
+```bash
+sudo chown root:wheel /Library/LaunchDaemons/limit.maxfiles.plist
 ```
 
-Reboot.
+Validate that the file is correct:
 
-To check if it’s working, you can use `ulimit -n` command.
+```bash
+plutil /Library/LaunchDaemons/limit.maxfiles.plist
+```
 
-[Original article](https://clickhouse.tech/docs/en/development/build_osx/) <!--hide-->
+Load the file (or reboot):
+
+```bash
+sudo launchctl load -w /Library/LaunchDaemons/limit.maxfiles.plist
+```
+
+To check if it's working, use the `ulimit -n` or `launchctl limit maxfiles` commands.

@@ -1,8 +1,13 @@
 #pragma once
 
+#include <Core/ServerSettings.h>
 #include <Server/IServer.h>
 
-#include <daemon/BaseDaemon.h>
+#include <Daemon/BaseDaemon.h>
+#include <Server/HTTP/HTTPContext.h>
+#include <Server/TCPProtocolStackFactory.h>
+#include <Server/ServerType.h>
+#include <Poco/Net/HTTPServerParams.h>
 
 /** Server provides three interfaces:
   * 1. HTTP - simple interface for any applications.
@@ -14,15 +19,25 @@
   * 3. Interserver HTTP - for replication.
   */
 
+namespace Poco
+{
+    namespace Net
+    {
+        class ServerSocket;
+    }
+}
 
 namespace DB
 {
+class AsynchronousMetrics;
+class ProtocolServerAdapter;
 
 class Server : public BaseDaemon, public IServer
 {
 public:
     using ServerApplication::run;
 
+    // Please register settings in ServerSettings.cpp instead of accessing the config directly if possible.
     Poco::Util::LayeredConfiguration & config() const override
     {
         return BaseDaemon::config();
@@ -33,9 +48,9 @@ public:
         return BaseDaemon::logger();
     }
 
-    Context & context() const override
+    ContextMutablePtr context() const override
     {
-        return *global_context_ptr;
+        return global_context;
     }
 
     bool isCancelled() const override
@@ -44,6 +59,7 @@ public:
     }
 
     void defineOptions(Poco::Util::OptionSet & _options) override;
+
 protected:
     int run() override;
 
@@ -56,7 +72,70 @@ protected:
     std::string getDefaultCorePath() const override;
 
 private:
-    Context * global_context_ptr = nullptr;
+    ContextMutablePtr global_context;
+    /// Updated/recent config, to compare http_handlers
+    ConfigurationPtr latest_config;
+
+    HTTPContextPtr httpContext() const;
+
+    Poco::Net::SocketAddress socketBindListen(
+        const ServerSettings & server_settings,
+        Poco::Net::ServerSocket & socket,
+        const std::string & host,
+        UInt16 port,
+        [[maybe_unused]] bool secure = false) const;
+
+    std::unique_ptr<TCPProtocolStackFactory> buildProtocolStackFromConfig(
+        const Poco::Util::AbstractConfiguration & config,
+        const ServerSettings & server_settings,
+        const std::string & protocol,
+        Poco::Net::HTTPServerParams::Ptr http_params,
+        AsynchronousMetrics & async_metrics,
+        bool & is_secure);
+
+    using CreateServerFunc = std::function<ProtocolServerAdapter(UInt16)>;
+    void createServer(
+        Poco::Util::AbstractConfiguration & config,
+        const std::string & listen_host,
+        const char * port_name,
+        bool listen_try,
+        bool start_server,
+        std::vector<ProtocolServerAdapter> & servers,
+        CreateServerFunc && func) const;
+
+    void createServers(
+        Poco::Util::AbstractConfiguration & config,
+        const ServerSettings & server_settings,
+        const Strings & listen_hosts,
+        bool listen_try,
+        Poco::ThreadPool & server_pool,
+        AsynchronousMetrics & async_metrics,
+        std::vector<ProtocolServerAdapter> & servers,
+        bool start_servers = false,
+        const ServerType & server_type = ServerType(ServerType::Type::QUERIES_ALL));
+
+    void createInterserverServers(
+        Poco::Util::AbstractConfiguration & config,
+        const ServerSettings & server_settings,
+        const Strings & interserver_listen_hosts,
+        bool listen_try,
+        Poco::ThreadPool & server_pool,
+        AsynchronousMetrics & async_metrics,
+        std::vector<ProtocolServerAdapter> & servers,
+        bool start_servers = false,
+        const ServerType & server_type = ServerType(ServerType::Type::QUERIES_ALL));
+
+    void updateServers(
+        Poco::Util::AbstractConfiguration & config,
+        const ServerSettings & server_settings,
+        Poco::ThreadPool & server_pool,
+        AsynchronousMetrics & async_metrics,
+        std::vector<ProtocolServerAdapter> & servers,
+        std::vector<ProtocolServerAdapter> & servers_to_start_before_tables);
+
+    void stopServers(
+        std::vector<ProtocolServerAdapter> & servers,
+        const ServerType & server_type) const;
 };
 
 }

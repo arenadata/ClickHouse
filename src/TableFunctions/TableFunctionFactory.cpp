@@ -1,12 +1,20 @@
 #include <TableFunctions/TableFunctionFactory.h>
 
 #include <Interpreters/Context.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
+#include <Common/KnownObjectNames.h>
+#include <Core/Settings.h>
 #include <IO/WriteHelpers.h>
+#include <Parsers/ASTFunction.h>
 
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool log_queries;
+}
 
 namespace ErrorCodes
 {
@@ -14,56 +22,123 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-
-void TableFunctionFactory::registerFunction(const std::string & name, Value creator, CaseSensitiveness case_sensitiveness)
+void TableFunctionFactory::registerFunction(
+    const std::string & name, Value value, Case case_sensitiveness)
 {
-    if (!table_functions.emplace(name, creator).second)
-        throw Exception("TableFunctionFactory: the table function name '" + name + "' is not unique",
-            ErrorCodes::LOGICAL_ERROR);
+    if (!table_functions.emplace(name, value).second)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "TableFunctionFactory: the table function name '{}' is not unique", name);
 
-    if (case_sensitiveness == CaseInsensitive
-        && !case_insensitive_table_functions.emplace(Poco::toLower(name), creator).second)
-        throw Exception("TableFunctionFactory: the case insensitive table function name '" + name + "' is not unique",
-                        ErrorCodes::LOGICAL_ERROR);
+    if (case_sensitiveness == Case::Insensitive
+        && !case_insensitive_table_functions.emplace(Poco::toLower(name), value).second)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "TableFunctionFactory: "
+                        "the case insensitive table function name '{}' is not unique", name);
+
+    KnownTableFunctionNames::instance().add(name, (case_sensitiveness == Case::Insensitive));
 }
 
 TableFunctionPtr TableFunctionFactory::get(
-    const std::string & name,
-    const Context & context) const
+    const ASTPtr & ast_function,
+    ContextPtr context) const
 {
-    auto res = tryGet(name, context);
+    const auto * table_function = ast_function->as<ASTFunction>();
+    auto res = tryGet(table_function->name, context);
     if (!res)
     {
-        auto hints = getHints(name);
+        auto hints = getHints(table_function->name);
         if (!hints.empty())
-            throw Exception("Unknown table function " + name + ". Maybe you meant: " + toString(hints), ErrorCodes::UNKNOWN_FUNCTION);
-        else
-            throw Exception("Unknown table function " + name, ErrorCodes::UNKNOWN_FUNCTION);
+            throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "Unknown table function {}. Maybe you meant: {}", table_function->name, toString(hints));
+        throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "Unknown table function {}", table_function->name);
     }
 
+    res->parseArguments(ast_function, context);
     return res;
 }
 
 TableFunctionPtr TableFunctionFactory::tryGet(
         const std::string & name_param,
-        const Context &) const
+        ContextPtr) const
 {
     String name = getAliasToOrName(name_param);
+    TableFunctionPtr res;
 
     auto it = table_functions.find(name);
     if (table_functions.end() != it)
-        return it->second();
+    {
+        res = it->second.creator();
+    }
+    else
+    {
+        it = case_insensitive_table_functions.find(Poco::toLower(name));
+        if (case_insensitive_table_functions.end() != it)
+            res = it->second.creator();
+    }
 
-    it = case_insensitive_table_functions.find(Poco::toLower(name));
-    if (case_insensitive_table_functions.end() != it)
-        return it->second();
+    if (!res)
+        return nullptr;
 
-    return {};
+    if (CurrentThread::isInitialized())
+    {
+        auto query_context = CurrentThread::get().tryGetQueryContext();
+        if (query_context && query_context->getSettingsRef()[Setting::log_queries])
+            query_context->addQueryFactoriesInfo(Context::QueryLogFactories::TableFunction, name);
+    }
+
+    return res;
 }
 
 bool TableFunctionFactory::isTableFunctionName(const std::string & name) const
 {
-    return table_functions.count(name);
+    return table_functions.contains(name);
+}
+
+std::optional<FunctionDocumentation> TableFunctionFactory::tryGetDocumentation(const String & name) const
+{
+    return tryGetDocumentationImpl(name);
+}
+
+std::optional<FunctionDocumentation> TableFunctionFactory::tryGetDocumentationImpl(const String & name_param) const
+{
+    String name = getAliasToOrName(name_param);
+    Value found;
+
+    /// Find by exact match.
+    if (auto it = table_functions.find(name); it != table_functions.end())
+    {
+        found = it->second;
+    }
+
+    if (auto jt = case_insensitive_table_functions.find(Poco::toLower(name)); jt != case_insensitive_table_functions.end())
+        found = jt->second;
+
+    if (found.creator)
+        return found.documentation;
+
+    return {};
+}
+
+std::optional<TableFunctionProperties> TableFunctionFactory::tryGetProperties(const String & name) const
+{
+    return tryGetPropertiesImpl(name);
+}
+
+std::optional<TableFunctionProperties> TableFunctionFactory::tryGetPropertiesImpl(const String & name_param) const
+{
+    String name = getAliasToOrName(name_param);
+    Value found;
+
+    /// Find by exact match.
+    if (auto it = table_functions.find(name); it != table_functions.end())
+    {
+        found = it->second;
+    }
+
+    if (auto jt = case_insensitive_table_functions.find(Poco::toLower(name)); jt != case_insensitive_table_functions.end())
+        found = jt->second;
+
+    if (found.creator)
+        return found.properties;
+
+    return {};
 }
 
 TableFunctionFactory & TableFunctionFactory::instance()

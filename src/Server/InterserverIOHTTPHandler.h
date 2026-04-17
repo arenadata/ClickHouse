@@ -1,9 +1,13 @@
 #pragma once
 
-#include <memory>
-#include <Poco/Logger.h>
-#include <Poco/Net/HTTPRequestHandler.h>
+#include <Interpreters/InterserverCredentials.h>
+#include <Server/HTTP/HTTPRequestHandler.h>
 #include <Common/CurrentMetrics.h>
+
+#include <Poco/Logger.h>
+
+#include <memory>
+#include <string>
 
 
 namespace CurrentMetrics
@@ -17,31 +21,28 @@ namespace DB
 class IServer;
 class WriteBufferFromHTTPServerResponse;
 
-class InterserverIOHTTPHandler : public Poco::Net::HTTPRequestHandler
+class InterserverIOHTTPHandler : public HTTPRequestHandler
 {
 public:
     explicit InterserverIOHTTPHandler(IServer & server_)
         : server(server_)
-        , log(&Poco::Logger::get("InterserverIOHTTPHandler"))
+        , log(getLogger("InterserverIOHTTPHandler"))
     {
     }
 
-    void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override;
+    void handleRequest(HTTPServerRequest & request, HTTPServerResponse & response, const ProfileEvents::Event & write_event) override;
 
 private:
-    struct Output
-    {
-        std::shared_ptr<WriteBufferFromHTTPServerResponse> out;
-    };
+    using OutputPtr = std::shared_ptr<WriteBufferFromHTTPServerResponse>;
 
     IServer & server;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     CurrentMetrics::Increment metric_increment{CurrentMetrics::InterserverConnection};
 
-    void processQuery(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response, Output & used_output);
+    void processQuery(HTTPServerRequest & request, HTTPServerResponse & response, OutputPtr used_output);
 
-    std::pair<String, bool> checkAuthentication(Poco::Net::HTTPServerRequest & request) const;
+    std::pair<String, bool> checkAuthentication(HTTPServerRequest & request) const;
 };
 
 }

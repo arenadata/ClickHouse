@@ -1,5 +1,3 @@
-configure_file(config_formats.h.in ${ConfigIncludePath}/config_formats.h)
-
-if (ENABLE_TESTS)
-    add_subdirectory (tests)
-endif ()
+if (ENABLE_FUZZING)
+    add_subdirectory(fuzzers)
+endif()

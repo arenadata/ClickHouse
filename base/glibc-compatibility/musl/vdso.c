@@ -40,24 +40,27 @@ static int checkver(Verdef *def, int vsym, const char *vername, char *strings)
 #define OK_TYPES (1<<STT_NOTYPE | 1<<STT_OBJECT | 1<<STT_FUNC | 1<<STT_COMMON)
 #define OK_BINDS (1<<STB_GLOBAL | 1<<STB_WEAK | 1<<STB_GNU_UNIQUE)
 
-extern char** environ;
-static Ehdr *eh = NULL;
-void *__vdsosym(const char *vername, const char *name);
-// We don't have libc struct available here. Compute aux vector manually.
-__attribute__((constructor)) static void auxv_init()
+static size_t count_syms_gnu(uint32_t *gh)
 {
-	size_t i, *auxv;
-	for (i=0; environ[i]; i++);
-	auxv = (void *)(environ+i+1);
-	for (i=0; auxv[i] != AT_SYSINFO_EHDR; i+=2)
-		if (!auxv[i]) return;
-	if (!auxv[i+1]) return;
-	eh = (void *)auxv[i+1];
+	size_t nsym, i;
+	uint32_t *buckets = gh + 4 + (gh[2]*sizeof(size_t)/4);
+	uint32_t *hashval;
+	for (i = nsym = 0; i < gh[0]; i++) {
+		if (buckets[i] > nsym)
+			nsym = buckets[i];
+	}
+	if (nsym) {
+		hashval = buckets + gh[0] + (nsym - gh[1]);
+		do nsym++;
+		while (!(*hashval++ & 1));
+	}
+	return nsym;
 }
 
 void *__vdsosym(const char *vername, const char *name)
 {
 	size_t i;
+	Ehdr * eh = (void *) getauxval(AT_SYSINFO_EHDR);
 	if (!eh) return 0;
 	Phdr *ph = (void *)((char *)eh + eh->e_phoff);
 	size_t *dynv=0, base=-1;
@@ -72,6 +75,7 @@ void *__vdsosym(const char *vername, const char *name)
 	char *strings = 0;
 	Sym *syms = 0;
 	Elf_Symndx *hashtab = 0;
+	uint32_t *ghashtab = 0;
 	uint16_t *versym = 0;
 	Verdef *verdef = 0;
 
@@ -81,15 +85,20 @@ void *__vdsosym(const char *vername, const char *name)
 		case DT_STRTAB: strings = p; break;
 		case DT_SYMTAB: syms = p; break;
 		case DT_HASH: hashtab = p; break;
+		case DT_GNU_HASH: ghashtab = p; break;
 		case DT_VERSYM: versym = p; break;
 		case DT_VERDEF: verdef = p; break;
 		}
 	}
 
-	if (!strings || !syms || !hashtab) return 0;
+	if (!strings || !syms) return 0;
 	if (!verdef) versym = 0;
+	size_t nsym = 0;
 
-	for (i=0; i<hashtab[1]; i++) {
+	if (hashtab) nsym = hashtab[1];
+	else if (ghashtab) nsym = count_syms_gnu(ghashtab);
+
+	for (i=0; i<nsym; i++) {
 		if (!(1<<(syms[i].st_info&0xf) & OK_TYPES)) continue;
 		if (!(1<<(syms[i].st_info>>4) & OK_BINDS)) continue;
 		if (!syms[i].st_shndx) continue;

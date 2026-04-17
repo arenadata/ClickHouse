@@ -1,8 +1,8 @@
 #pragma once
 
 #include <atomic>
-#include <cstddef>
-#include <common/types.h>
+#include <functional>
+#include <base/types.h>
 
 #include <Core/Defines.h>
 
@@ -15,35 +15,66 @@ class WriteBuffer;
 /// See Progress.
 struct ProgressValues
 {
-    size_t read_rows;
-    size_t read_bytes;
-    size_t total_rows_to_read;
-    size_t written_rows;
-    size_t written_bytes;
+    UInt64 read_rows = 0;
+    UInt64 read_bytes = 0;
+
+    UInt64 total_rows_to_read = 0;
+    UInt64 total_bytes_to_read = 0;
+
+    UInt64 written_rows = 0;
+    UInt64 written_bytes = 0;
+
+    UInt64 result_rows = 0;
+    UInt64 result_bytes = 0;
+
+    UInt64 elapsed_ns = 0;
+
+    Int64 memory_usage = 0;
 
     void read(ReadBuffer & in, UInt64 server_revision);
     void write(WriteBuffer & out, UInt64 client_revision) const;
-    void writeJSON(WriteBuffer & out) const;
+    void writeJSON(WriteBuffer & out, bool write_zero_values) const;
 };
 
 struct ReadProgress
 {
-    size_t read_rows;
-    size_t read_bytes;
-    size_t total_rows_to_read;
+    UInt64 read_rows = 0;
+    UInt64 read_bytes = 0;
+    UInt64 total_rows_to_read = 0;
+    UInt64 total_bytes_to_read = 0;
 
-    ReadProgress(size_t read_rows_, size_t read_bytes_, size_t total_rows_to_read_ = 0)
-        : read_rows(read_rows_), read_bytes(read_bytes_), total_rows_to_read(total_rows_to_read_) {}
+    ReadProgress(UInt64 read_rows_, UInt64 read_bytes_, UInt64 total_rows_to_read_ = 0, UInt64 total_bytes_to_read_ = 0)
+        : read_rows(read_rows_), read_bytes(read_bytes_), total_rows_to_read(total_rows_to_read_), total_bytes_to_read(total_bytes_to_read_) {}
 };
 
 struct WriteProgress
 {
-    size_t written_rows;
-    size_t written_bytes;
+    UInt64 written_rows = 0;
+    UInt64 written_bytes = 0;
 
-    WriteProgress(size_t written_rows_, size_t written_bytes_)
+    WriteProgress(UInt64 written_rows_, UInt64 written_bytes_)
         : written_rows(written_rows_), written_bytes(written_bytes_) {}
 };
+
+struct ResultProgress
+{
+    UInt64 result_rows = 0;
+    UInt64 result_bytes = 0;
+    Int64 memory_usage = 0;
+
+    ResultProgress(UInt64 result_rows_, UInt64 result_bytes_, Int64 memory_usage_)
+        : result_rows(result_rows_), result_bytes(result_bytes_), memory_usage(memory_usage_) {}
+};
+
+struct FileProgress
+{
+    /// Here read_bytes (raw bytes) - do not equal ReadProgress::read_bytes, which are calculated according to column types.
+    UInt64 read_bytes = 0;
+    UInt64 total_bytes_to_read = 0;
+
+    explicit FileProgress(UInt64 read_bytes_, UInt64 total_bytes_to_read_ = 0) : read_bytes(read_bytes_), total_bytes_to_read(total_bytes_to_read_) {}
+};
+
 
 /** Progress of query execution.
   * Values, transferred over network are deltas - how much was done after previously sent value.
@@ -51,94 +82,84 @@ struct WriteProgress
   */
 struct Progress
 {
-    std::atomic<size_t> read_rows {0};        /// Rows (source) processed.
-    std::atomic<size_t> read_bytes {0};       /// Bytes (uncompressed, source) processed.
+    std::atomic<UInt64> read_rows {0};        /// Rows (source) processed.
+    std::atomic<UInt64> read_bytes {0};       /// Bytes (uncompressed, source) processed.
 
-    /** How much rows must be processed, in total, approximately. Non-zero value is sent when there is information about some new part of job.
-      * Received values must be summed to get estimate of total rows to process.
-      * Used for rendering progress bar on client.
+    /** How much rows/bytes must be processed, in total, approximately. Non-zero value is sent when there is information about
+      * some new part of job. Received values must be summed to get estimate of total rows to process.
       */
-    std::atomic<size_t> total_rows_to_read {0};
+    std::atomic<UInt64> total_rows_to_read {0};
+    std::atomic<UInt64> total_bytes_to_read {0};
 
+    std::atomic<UInt64> written_rows {0};
+    std::atomic<UInt64> written_bytes {0};
 
-    std::atomic<size_t> written_rows {0};
-    std::atomic<size_t> written_bytes {0};
+    std::atomic<UInt64> result_rows {0};
+    std::atomic<UInt64> result_bytes {0};
 
-    Progress() {}
-    Progress(size_t read_rows_, size_t read_bytes_, size_t total_rows_to_read_ = 0)
-        : read_rows(read_rows_), read_bytes(read_bytes_), total_rows_to_read(total_rows_to_read_) {}
-    Progress(ReadProgress read_progress)
+    std::atomic<UInt64> elapsed_ns {0};
+
+    std::atomic<Int64> memory_usage {0};
+
+    Progress() = default;
+
+    Progress(UInt64 read_rows_, UInt64 read_bytes_, UInt64 total_rows_to_read_ = 0, UInt64 total_bytes_to_read_ = 0)
+        : read_rows(read_rows_), read_bytes(read_bytes_), total_rows_to_read(total_rows_to_read_), total_bytes_to_read(total_bytes_to_read_) {}
+
+    explicit Progress(ReadProgress read_progress)
         : read_rows(read_progress.read_rows), read_bytes(read_progress.read_bytes), total_rows_to_read(read_progress.total_rows_to_read) {}
-    Progress(WriteProgress write_progress)
-        : written_rows(write_progress.written_rows), written_bytes(write_progress.written_bytes)  {}
+
+    explicit Progress(WriteProgress write_progress)
+        : written_rows(write_progress.written_rows), written_bytes(write_progress.written_bytes) {}
+
+    explicit Progress(ResultProgress result_progress)
+        : result_rows(result_progress.result_rows), result_bytes(result_progress.result_bytes), memory_usage(result_progress.memory_usage) {}
+
+    explicit Progress(FileProgress file_progress)
+        : read_bytes(file_progress.read_bytes), total_bytes_to_read(file_progress.total_bytes_to_read) {}
 
     void read(ReadBuffer & in, UInt64 server_revision);
+
     void write(WriteBuffer & out, UInt64 client_revision) const;
+
+    enum class DisplayMode
+    {
+        Verbose,  // Display zero values. Needed for X-ClickHouse-Summary
+        Minimal   // Do not write zero values. Needed to send less data for frequent progress updates (X-ClickHouse-Progress)
+    };
+
     /// Progress in JSON format (single line, without whitespaces) is used in HTTP headers.
-    void writeJSON(WriteBuffer & out) const;
+    void writeJSON(WriteBuffer & out, DisplayMode mode) const;
 
     /// Each value separately is changed atomically (but not whole object).
-    bool incrementPiecewiseAtomically(const Progress & rhs)
-    {
-        read_rows += rhs.read_rows;
-        read_bytes += rhs.read_bytes;
-        total_rows_to_read += rhs.total_rows_to_read;
-        written_rows += rhs.written_rows;
-        written_bytes += rhs.written_bytes;
+    bool incrementPiecewiseAtomically(const Progress & rhs);
 
-        return rhs.read_rows || rhs.written_rows ? true : false;
-    }
+    void incrementElapsedNs(UInt64 elapsed_ns_);
 
-    void reset()
-    {
-        read_rows = 0;
-        read_bytes = 0;
-        total_rows_to_read = 0;
-        written_rows = 0;
-        written_bytes = 0;
-    }
+    bool empty() const;
 
-    ProgressValues getValues() const
-    {
-        ProgressValues res;
+    void reset();
 
-        res.read_rows = read_rows.load(std::memory_order_relaxed);
-        res.read_bytes = read_bytes.load(std::memory_order_relaxed);
-        res.total_rows_to_read = total_rows_to_read.load(std::memory_order_relaxed);
-        res.written_rows = written_rows.load(std::memory_order_relaxed);
-        res.written_bytes = written_bytes.load(std::memory_order_relaxed);
+    ProgressValues getValues() const;
 
-        return res;
-    }
+    ProgressValues fetchValuesAndResetPiecewiseAtomically();
 
-    ProgressValues fetchAndResetPiecewiseAtomically()
-    {
-        ProgressValues res;
+    Progress fetchAndResetPiecewiseAtomically();
 
-        res.read_rows = read_rows.fetch_and(0);
-        res.read_bytes = read_bytes.fetch_and(0);
-        res.total_rows_to_read = total_rows_to_read.fetch_and(0);
-        res.written_rows = written_rows.fetch_and(0);
-        res.written_bytes = written_bytes.fetch_and(0);
+    Progress & operator=(Progress && other) noexcept;
 
-        return res;
-    }
-
-    Progress & operator=(Progress && other)
-    {
-        read_rows = other.read_rows.load(std::memory_order_relaxed);
-        read_bytes = other.read_bytes.load(std::memory_order_relaxed);
-        total_rows_to_read = other.total_rows_to_read.load(std::memory_order_relaxed);
-        written_rows = other.written_rows.load(std::memory_order_relaxed);
-        written_bytes = other.written_bytes.load(std::memory_order_relaxed);
-
-        return *this;
-    }
-
-    Progress(Progress && other)
+    Progress(Progress && other) noexcept
     {
         *this = std::move(other);
     }
 };
+
+
+/** Callback to track the progress of the query.
+  * Used in QueryPipeline and Context.
+  * The function takes the number of rows in the last block, the number of bytes in the last block.
+  * Note that the callback can be called from different threads.
+  */
+using ProgressCallback = std::function<void(const Progress & progress)>;
 
 }

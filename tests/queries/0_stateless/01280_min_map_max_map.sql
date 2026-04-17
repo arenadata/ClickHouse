@@ -15,7 +15,7 @@ select minMap(val, cnt) from values ('val Array(FixedString(1)), cnt Array(Fixed
 select minMap(val, cnt) from values ('val Array(UInt64), cnt Array(UInt64)',  ([1], [1]), ([1], [2]));
 select minMap(val, cnt) from values ('val Array(Float64), cnt Array(Int8)',  ([1], [1]), ([1], [2]));
 select minMap(val, cnt) from values ('val Array(Date), cnt Array(Int16)',  ([1], [1]), ([1], [2]));
-select minMap(val, cnt) from values ('val Array(DateTime(\'Europe/Moscow\')), cnt Array(Int32)',  ([1], [1]), ([1], [2]));
+select minMap(val, cnt) from values ('val Array(DateTime(\'Asia/Istanbul\')), cnt Array(Int32)',  ([1], [1]), ([1], [2]));
 select minMap(val, cnt) from values ('val Array(Decimal(10, 2)), cnt Array(Int16)',  (['1.01'], [1]), (['1.01'], [2]));
 select minMap(val, cnt) from values ('val Array(Enum16(\'a\'=1)), cnt Array(Int16)',  (['a'], [1]), (['a'], [2]));
 
@@ -28,6 +28,19 @@ select maxMap(val, cnt) from values ('val Array(FixedString(1)), cnt Array(Fixed
 select maxMap(val, cnt) from values ('val Array(UInt64), cnt Array(UInt64)',  ([1], [1]), ([1], [2]));
 select maxMap(val, cnt) from values ('val Array(Float64), cnt Array(Int8)',  ([1], [1]), ([1], [2]));
 select maxMap(val, cnt) from values ('val Array(Date), cnt Array(Int16)',  ([1], [1]), ([1], [2]));
-select maxMap(val, cnt) from values ('val Array(DateTime(\'Europe/Moscow\')), cnt Array(Int32)',  ([1], [1]), ([1], [2]));
+select maxMap(val, cnt) from values ('val Array(DateTime(\'Asia/Istanbul\')), cnt Array(Int32)',  ([1], [1]), ([1], [2]));
 select maxMap(val, cnt) from values ('val Array(Decimal(10, 2)), cnt Array(Int16)',  (['1.01'], [1]), (['1.01'], [2]));
 select maxMap(val, cnt) from values ('val Array(Enum16(\'a\'=1)), cnt Array(Int16)',  (['a'], [1]), (['a'], [2]));
+
+-- bugfix, minMap and maxMap should not remove values with zero and empty strings but this behavior should not affect sumMap
+select minMap(val, cnt) from values ('val Array(UInt64), cnt Array(UInt64)',  ([1], [0]), ([2], [0]));
+select maxMap(val, cnt) from values ('val Array(UInt64), cnt Array(UInt64)',  ([1], [0]), ([2], [0]));
+select minMap(val, cnt) from values ('val Array(String), cnt Array(String)',  (['A'], ['']), (['B'], ['']));
+select maxMap(val, cnt) from values ('val Array(String), cnt Array(String)',  (['A'], ['']), (['B'], ['']));
+select sumMap(val, cnt) from values ('val Array(UInt64), cnt Array(UInt64)',  ([1], [0]), ([2], [0]));
+
+-- check working with arrays and tuples as values
+select minMap([1, 1, 1], [[1, 2], [1], [1, 2, 3]]);
+select maxMap([1, 1, 1], [[1, 2], [1], [1, 2, 3]]);
+select minMap([1, 1, 1], [(1, 2), (1, 1), (1, 3)]);
+select maxMap([1, 1, 1], [(1, 2), (1, 1), (1, 3)]);

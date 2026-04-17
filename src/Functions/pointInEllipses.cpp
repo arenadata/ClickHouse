@@ -3,15 +3,14 @@
 #include <Columns/ColumnConst.h>
 #include <Common/typeid_cast.h>
 #include <Common/assert_cast.h>
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
 #include <Functions/FunctionFactory.h>
-#include <ext/range.h>
+#include <base/range.h>
 
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
@@ -19,6 +18,9 @@ namespace ErrorCodes
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int ILLEGAL_COLUMN;
 }
+
+namespace
+{
 
 /**
  * The function checks if a point is in one of ellipses in set.
@@ -29,7 +31,7 @@ namespace ErrorCodes
  * The function first checks bounding box condition.
  * If a point is inside an ellipse's bounding box, the quadratic condition is evaluated.
  *
- * Here we assume that points in one block are close and are likely to fit in one ellipse,
+ * Here we assume that points in one columns are close and are likely to fit in one ellipse,
  * so the last success ellipse index is remembered to check this ellipse first for next point.
  *
  */
@@ -37,7 +39,7 @@ class FunctionPointInEllipses : public IFunction
 {
 public:
     static constexpr auto name = "pointInEllipses";
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionPointInEllipses>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionPointInEllipses>(); }
 
 private:
 
@@ -53,84 +55,88 @@ private:
 
     bool isVariadic() const override { return true; }
 
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+
     size_t getNumberOfArguments() const override { return 0; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.size() < 6 || arguments.size() % 4 != 2)
         {
-            throw Exception(
-                "Incorrect number of arguments of function " + getName() + ". Must be 2 for your point plus 4 * N for ellipses (x_i, y_i, a_i, b_i).",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                "Incorrect number of arguments of function {}. "
+                "Must be 2 for your point plus 4 * N for ellipses (x_i, y_i, a_i, b_i).", getName());
         }
 
         /// For array on stack, see below.
         if (arguments.size() > 10000)
         {
-            throw Exception(
-                "Number of arguments of function " + getName() + " is too large.", ErrorCodes::TOO_MANY_ARGUMENTS_FOR_FUNCTION);
+            throw Exception(ErrorCodes::TOO_MANY_ARGUMENTS_FOR_FUNCTION,
+                            "Number of arguments of function {} is too large (maximum: 10000).",
+                            getName());
         }
 
-        for (const auto arg_idx : ext::range(0, arguments.size()))
+        for (const auto arg_idx : collections::range(0, arguments.size()))
         {
             const auto * arg = arguments[arg_idx].get();
             if (!WhichDataType(arg).isFloat64())
             {
-                throw Exception(
-                    "Illegal type " + arg->getName() + " of argument " + std::to_string(arg_idx + 1) + " of function " + getName() + ". Must be Float64",
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument {} of function {}. "
+                    "Must be Float64", arg->getName(), std::to_string(arg_idx + 1), getName());
             }
         }
 
         return std::make_shared<DataTypeUInt8>();
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
     {
-        const auto size = input_rows_count;
+        return std::make_shared<DataTypeUInt8>();
+    }
 
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
+    {
         /// Prepare array of ellipses.
         size_t ellipses_count = (arguments.size() - 2) / 4;
         std::vector<Ellipse> ellipses(ellipses_count);
 
-        for (const auto ellipse_idx : ext::range(0, ellipses_count))
+        for (const auto ellipse_idx : collections::range(0, ellipses_count))
         {
             Float64 ellipse_data[4];
-            for (const auto idx : ext::range(0, 4))
+            for (const auto idx : collections::range(0, 4))
             {
-                int arg_idx = 2 + 4 * ellipse_idx + idx;
-                const auto * column = block.getByPosition(arguments[arg_idx]).column.get();
+                size_t arg_idx = 2 + 4 * ellipse_idx + idx;
+                const auto * column = arguments[arg_idx].column.get();
                 if (const auto * col = checkAndGetColumnConst<ColumnVector<Float64>>(column))
                 {
                     ellipse_data[idx] = col->getValue<Float64>();
                 }
                 else
                 {
-                    throw Exception(
-                        "Illegal type " + column->getName() + " of argument " + std::to_string(arg_idx + 1) + " of function " + getName() + ". Must be const Float64",
-                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+                    throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument {} of function {}. "
+                        "Must be const Float64", column->getName(), std::to_string(arg_idx + 1), getName());
                 }
             }
             ellipses[ellipse_idx] = Ellipse{ellipse_data[0], ellipse_data[1], ellipse_data[2], ellipse_data[3]};
         }
 
         int const_cnt = 0;
-        for (const auto idx : ext::range(0, 2))
+        for (const auto idx : collections::range(0, 2))
         {
-            const auto * column = block.getByPosition(arguments[idx]).column.get();
+            const auto * column = arguments[idx].column.get();
             if (typeid_cast<const ColumnConst *> (column))
             {
                 ++const_cnt;
             }
             else if (!typeid_cast<const ColumnVector<Float64> *> (column))
             {
-                throw Exception("Illegal column " + column->getName() + " of argument of function " + getName(),
-                    ErrorCodes::ILLEGAL_COLUMN);
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}",
+                    column->getName(), getName());
             }
         }
 
-        const auto * col_x = block.getByPosition(arguments[0]).column.get();
-        const auto * col_y = block.getByPosition(arguments[1]).column.get();
+        const auto * col_x = arguments[0].column.get();
+        const auto * col_y = arguments[1].column.get();
         if (const_cnt == 0)
         {
                 const auto * col_vec_x = assert_cast<const ColumnVector<Float64> *> (col_x);
@@ -138,30 +144,31 @@ private:
 
                 auto dst = ColumnVector<UInt8>::create();
                 auto & dst_data = dst->getData();
-                dst_data.resize(size);
+                dst_data.resize(input_rows_count);
 
                 size_t start_index = 0;
-                for (const auto row : ext::range(0, size))
-                {
+                for (size_t row = 0; row < input_rows_count; ++row)
                     dst_data[row] = isPointInEllipses(col_vec_x->getData()[row], col_vec_y->getData()[row], ellipses.data(), ellipses_count, start_index);
-                }
 
-                block.getByPosition(result).column = std::move(dst);
-            }
-            else if (const_cnt == 2)
-            {
-                const auto * col_const_x = assert_cast<const ColumnConst *> (col_x);
-                const auto * col_const_y = assert_cast<const ColumnConst *> (col_y);
-                size_t start_index = 0;
-                UInt8 res = isPointInEllipses(col_const_x->getValue<Float64>(), col_const_y->getValue<Float64>(), ellipses.data(), ellipses_count, start_index);
-                block.getByPosition(result).column = DataTypeUInt8().createColumnConst(size, res);
-            }
-            else
-            {
-                throw Exception(
-                    "Illegal types " + col_x->getName() + ", " + col_y->getName() + " of arguments 1, 2 of function " + getName() + ". Both must be either const or vector",
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-            }
+                return dst;
+        }
+        if (const_cnt == 2)
+        {
+            const auto * col_const_x = assert_cast<const ColumnConst *>(col_x);
+            const auto * col_const_y = assert_cast<const ColumnConst *>(col_y);
+            size_t start_index = 0;
+            UInt8 res = isPointInEllipses(
+                col_const_x->getValue<Float64>(), col_const_y->getValue<Float64>(), ellipses.data(), ellipses_count, start_index);
+            return DataTypeUInt8().createColumnConst(input_rows_count, res);
+        }
+
+        throw Exception(
+            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+            "Illegal types {}, {} of arguments 1, 2 of function {}. "
+            "Both must be either const or vector",
+            col_x->getName(),
+            col_y->getName(),
+            getName());
     }
 
     static bool isPointInEllipses(Float64 x, Float64 y, const Ellipse * ellipses, size_t ellipses_count, size_t & start_index)
@@ -188,10 +195,39 @@ private:
     }
 };
 
+}
 
-void registerFunctionPointInEllipses(FunctionFactory & factory)
+REGISTER_FUNCTION(PointInEllipses)
 {
-    factory.registerFunction<FunctionPointInEllipses>();
+    FunctionDocumentation::Description description = R"(
+Checks whether the point belongs to at least one of the ellipses.
+Coordinates are geometric in the Cartesian coordinate system.
+    )";
+    FunctionDocumentation::Syntax syntax = "pointInEllipses(x, y, x₀, y₀, a₀, b₀,...,xₙ, yₙ, aₙ, bₙ)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x, y", "Coordinates of a point on the plane.", {"Float64"}},
+        {"xᵢ, yᵢ", "Coordinates of the center of the i-th ellipsis.", {"Float64"}},
+        {"aᵢ, bᵢ", "Axes of the i-th ellipsis in units of x, y coordinates.", {"Float64"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {
+        "Returns `1` if the point is inside at least one of the ellipses, `0` otherwise",
+        {"UInt8"}
+    };
+    FunctionDocumentation::Examples examples = {
+        {
+            "Basic usage",
+            "SELECT pointInEllipses(10., 10., 10., 9.1, 1., 0.9999)",
+            R"(
+┌─pointInEllipses(10., 10., 10., 9.1, 1., 0.9999)─┐
+│                                               1 │
+└─────────────────────────────────────────────────┘
+            )"
+        }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Geo;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionPointInEllipses>(documentation);
 }
 
 }

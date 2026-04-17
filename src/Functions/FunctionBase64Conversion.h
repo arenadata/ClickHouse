@@ -1,168 +1,151 @@
-#if !defined(ARCADIA_BUILD)
-#    include "config_functions.h"
-#endif
+#pragma once
+#include "config.h"
 
 #if USE_BASE64
-#    include <Columns/ColumnConst.h>
+#    include <base/MemorySanitizer.h>
+#    include <Columns/ColumnFixedString.h>
 #    include <Columns/ColumnString.h>
 #    include <DataTypes/DataTypeString.h>
-#    include <Functions/FunctionFactory.h>
-#    include <Functions/FunctionHelpers.h>
-#    include <Functions/GatherUtils/Algorithms.h>
-#    include <IO/WriteHelpers.h>
-#    include <turbob64.h>
+#    include <Functions/FunctionBaseXXConversion.h>
+#    include <Interpreters/Context_fwd.h>
+#    include <libbase64.h>
 
+#    include <cstddef>
+#    include <string_view>
 
 namespace DB
 {
-using namespace GatherUtils;
 
-namespace ErrorCodes
+enum class Base64Variant : uint8_t
 {
-    extern const int ILLEGAL_COLUMN;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int INCORRECT_DATA;
+    Normal,
+    URL
+};
+
+inline std::string preprocessBase64URL(std::string_view src)
+{
+    std::string padded_src;
+    padded_src.reserve(src.size() + 3);
+
+    // Do symbol substitution as described in https://datatracker.ietf.org/doc/html/rfc4648#section-5
+    for (auto s : src)
+    {
+        switch (s)
+        {
+        case '_':
+            padded_src += '/';
+            break;
+        case '-':
+            padded_src += '+';
+            break;
+        default:
+            padded_src += s;
+            break;
+        }
+    }
+
+    /// Insert padding to please aklomp library
+    size_t remainder = src.size() % 4;
+    switch (remainder)
+    {
+        case 0:
+            break; // no padding needed
+        case 1:
+            padded_src.append("==="); // this case is impossible to occur with valid base64-URL encoded input, however, we'll insert padding anyway
+            break;
+        case 2:
+            padded_src.append("=="); // two bytes padding
+            break;
+        default: // remainder == 3
+            padded_src.append("="); // one byte padding
+            break;
+    }
+
+    return padded_src;
 }
 
-struct Base64Encode
+inline size_t postprocessBase64URL(UInt8 * dst, size_t out_len)
 {
-    static constexpr auto name = "base64Encode";
-    static size_t getBufferSize(size_t string_length, size_t string_count)
+    // Do symbol substitution as described in https://datatracker.ietf.org/doc/html/rfc4648#section-5
+    for (size_t i = 0; i < out_len; ++i)
     {
+        switch (dst[i])
+        {
+        case '/':
+            dst[i] = '_';
+            break;
+        case '+':
+            dst[i] = '-';
+            break;
+        case '=': // stop when padding is detected
+            return i;
+        default:
+            break;
+        }
+    }
+    return out_len;
+}
+
+
+template<Base64Variant variant>
+struct Base64EncodeTraits
+{
+    template<typename Col>
+    static size_t getBufferSize(Col const& src_column)
+    {
+        auto const string_length = src_column.byteSize();
+        auto const string_count = src_column.size();
         return ((string_length - string_count) / 3 + string_count) * 4 + string_count;
     }
+
+    static size_t perform(std::string_view src, UInt8 * dst)
+    {
+        size_t outlen = 0;
+        base64_encode(src.data(), src.size(), reinterpret_cast<char *>(dst), &outlen, 0);
+
+        /// Base64 library is using AVX-512 with some shuffle operations.
+        /// Memory sanitizer doesn't understand if there was uninitialized memory in SIMD register but it was not used in the result of shuffle.
+        __msan_unpoison(dst, outlen);
+
+        if constexpr (variant == Base64Variant::URL)
+            outlen = postprocessBase64URL(dst, outlen);
+
+        return outlen;
+    }
 };
 
-struct Base64Decode
+template<Base64Variant variant>
+struct Base64DecodeTraits
 {
-    static constexpr auto name = "base64Decode";
+    static constexpr bool has_size_optimization = false;
 
-    static size_t getBufferSize(size_t string_length, size_t string_count)
+    template<typename Col>
+    static size_t getBufferSize(Col const& src_column)
     {
+        auto const string_length = src_column.byteSize();
+        auto const string_count = src_column.size();
         return ((string_length - string_count) / 4 + string_count) * 3 + string_count;
     }
-};
 
-struct TryBase64Decode
-{
-    static constexpr auto name = "tryBase64Decode";
-
-    static size_t getBufferSize(size_t string_length, size_t string_count)
+    static std::optional<size_t> perform(std::string_view src, UInt8 * dst)
     {
-        return Base64Decode::getBufferSize(string_length, string_count);
-    }
-};
-
-template <typename Func>
-class FunctionBase64Conversion : public IFunction
-{
-public:
-    static constexpr auto name = Func::name;
-
-    static FunctionPtr create(const Context &)
-    {
-        return std::make_shared<FunctionBase64Conversion>();
-    }
-
-    String getName() const override
-    {
-        return Func::name;
-    }
-
-    size_t getNumberOfArguments() const override
-    {
-        return 1;
-    }
-
-    bool useDefaultImplementationForConstants() const override
-    {
-        return true;
-    }
-
-    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
-    {
-        if (!WhichDataType(arguments[0].type).isString())
-            throw Exception(
-                "Illegal type " + arguments[0].type->getName() + " of 1 argument of function " + getName() + ". Must be String.",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
-
-        return std::make_shared<DataTypeString>();
-    }
-
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
-    {
-        const ColumnPtr column_string = block.getByPosition(arguments[0]).column;
-        const ColumnString * input = checkAndGetColumn<ColumnString>(column_string.get());
-
-        if (!input)
-            throw Exception(
-                "Illegal column " + block.getByPosition(arguments[0]).column->getName() + " of first argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN);
-
-        auto dst_column = ColumnString::create();
-        auto & dst_data = dst_column->getChars();
-        auto & dst_offsets = dst_column->getOffsets();
-
-        size_t reserve = Func::getBufferSize(input->getChars().size(), input->size());
-        dst_data.resize(reserve);
-        dst_offsets.resize(input_rows_count);
-
-        const ColumnString::Offsets & src_offsets = input->getOffsets();
-
-        auto source = input->getChars().data();
-        auto dst = dst_data.data();
-        auto dst_pos = dst;
-
-        size_t src_offset_prev = 0;
-
-        for (size_t row = 0; row < input_rows_count; ++row)
+        int rc;
+        size_t outlen = 0;
+        if constexpr (variant == Base64Variant::URL)
         {
-            size_t srclen = src_offsets[row] - src_offset_prev - 1;
-            size_t outlen = 0;
-
-            if constexpr (std::is_same_v<Func, Base64Encode>)
-            {
-                outlen = _tb64e(reinterpret_cast<const uint8_t *>(source), srclen, reinterpret_cast<uint8_t *>(dst_pos));
-            }
-            else if constexpr (std::is_same_v<Func, Base64Decode>)
-            {
-                if (srclen > 0)
-                {
-                    outlen = _tb64d(reinterpret_cast<const uint8_t *>(source), srclen, reinterpret_cast<uint8_t *>(dst_pos));
-                    if (!outlen)
-                        throw Exception("Failed to " + getName() + " input '" + String(reinterpret_cast<const char *>(source), srclen) + "'", ErrorCodes::INCORRECT_DATA);
-                }
-            }
-            else
-            {
-                if (srclen > 0)
-                {
-                    // during decoding character array can be partially polluted
-                    // if fail, revert back and clean
-                    auto savepoint = dst_pos;
-                    outlen = _tb64d(reinterpret_cast<const uint8_t *>(source), srclen, reinterpret_cast<uint8_t *>(dst_pos));
-                    if (!outlen)
-                    {
-                        outlen = 0;
-                        dst_pos = savepoint;
-                        // clean the symbol
-                        dst_pos[0] = 0;
-                    }
-                }
-            }
-
-            source += srclen + 1;
-            dst_pos += outlen + 1;
-
-            dst_offsets[row] = dst_pos - dst;
-            src_offset_prev = src_offsets[row];
+            std::string src_padded = preprocessBase64URL(src);
+            rc = base64_decode(src_padded.data(), src_padded.size(), reinterpret_cast<char *>(dst), &outlen, 0);
         }
-
-        dst_data.resize(dst_pos - dst);
-
-        block.getByPosition(result).column = std::move(dst_column);
+        else
+        {
+            rc = base64_decode(src.data(), src.size(), reinterpret_cast<char *>(dst), &outlen, 0);
+        }
+        if (rc != 1) [[unlikely]]
+            return std::nullopt;
+        return outlen;
     }
 };
+
 }
 
 #endif

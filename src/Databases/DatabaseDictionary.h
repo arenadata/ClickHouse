@@ -1,10 +1,11 @@
 #pragma once
 
-#include <mutex>
-#include <unordered_set>
 #include <Databases/DatabasesCommon.h>
 #include <Databases/IDatabase.h>
 #include <Storages/IStorage_fwd.h>
+
+#include <mutex>
+#include <unordered_set>
 
 
 namespace Poco
@@ -19,40 +20,36 @@ namespace DB
 /* Database to store StorageDictionary tables
  * automatically creates tables for all dictionaries
  */
-class DatabaseDictionary final : public IDatabase
+class DatabaseDictionary final : public IDatabase, WithContext
 {
 public:
-    DatabaseDictionary(const String & name_, const Context & global_context);
+    DatabaseDictionary(const String & name_, ContextPtr context_);
 
     String getEngineName() const override
     {
         return "Dictionary";
     }
 
-    bool isTableExist(const String & table_name, const Context & context) const override;
+    bool isTableExist(const String & table_name, ContextPtr context) const override;
 
-    StoragePtr tryGetTable(const String & table_name, const Context & context) const override;
+    StoragePtr tryGetTable(const String & table_name, ContextPtr context) const override;
 
-    DatabaseTablesIteratorPtr getTablesIterator(const Context & context, const FilterByNameFunction & filter_by_table_name) override;
+    DatabaseTablesIteratorPtr getTablesIterator(ContextPtr context, const FilterByNameFunction & filter_by_table_name, bool skip_not_loaded) const override;
 
     bool empty() const override;
-
-    ASTPtr getCreateDatabaseQuery() const override;
 
     bool shouldBeEmptyOnDetach() const override { return false; }
 
     void shutdown() override;
 
 protected:
-    ASTPtr getCreateTableQueryImpl(const String & table_name, const Context & context, bool throw_on_error) const override;
+    ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
+    ASTPtr getCreateTableQueryImpl(const String & table_name, ContextPtr context, bool throw_on_error) const override;
 
 private:
-    mutable std::mutex mutex;
+    LoggerPtr log;
 
-    Poco::Logger * log;
-    const Context & global_context;
-
-    Tables listTables(const FilterByNameFunction & filter_by_name);
+    Tables listTables(const FilterByNameFunction & filter_by_name) const;
 };
 
 }

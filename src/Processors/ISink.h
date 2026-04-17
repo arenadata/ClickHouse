@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Core/Block_fwd.h>
+#include <Processors/Chunk.h>
 #include <Processors/IProcessor.h>
 
 
@@ -12,13 +14,15 @@ protected:
     InputPort & input;
     Chunk current_chunk;
     bool has_input = false;
+    bool was_on_start_called = false;
+    bool was_on_finish_called = false;
 
     virtual void consume(Chunk block) = 0;
-
+    virtual void onStart() {}
     virtual void onFinish() {}
 
 public:
-    explicit ISink(Block header);
+    explicit ISink(SharedHeader header);
 
     Status prepare() override;
     void work() override;

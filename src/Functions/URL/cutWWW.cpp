@@ -1,7 +1,7 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionStringToString.h>
-#include "protocol.h"
-#include <common/find_symbols.h>
+#include <Functions/URL/protocol.h>
+#include <base/find_symbols.h>
 
 
 namespace DB
@@ -54,9 +54,35 @@ struct ExtractWWW
 struct NameCutWWW { static constexpr auto name = "cutWWW"; };
 using FunctionCutWWW = FunctionStringToString<CutSubstringImpl<ExtractWWW>, NameCutWWW>;
 
-void registerFunctionCutWWW(FunctionFactory & factory)
+REGISTER_FUNCTION(CutWWW)
 {
-    factory.registerFunction<FunctionCutWWW>();
+    /// cutWWW documentation
+    FunctionDocumentation::Description description_cutWWW = R"(
+Removes the leading `www.`, if present, from the URL's domain.
+    )";
+    FunctionDocumentation::Syntax syntax_cutWWW = "cutWWW(url)";
+    FunctionDocumentation::Arguments arguments_cutWWW = {
+        {"url", "URL.", {"String"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value_cutWWW = {"Returns the URL with leading `www.` removed from the domain.", {"String"}};
+    FunctionDocumentation::Examples examples_cutWWW = {
+    {
+        "Usage example",
+        R"(
+SELECT cutWWW('http://www.example.com/path?query=value#fragment');
+        )",
+        R"(
+┌─cutWWW('http://www.example.com/path?query=value#fragment')─┐
+│ http://example.com/path?query=value#fragment               │
+└────────────────────────────────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in_cutWWW = {1, 1};
+    FunctionDocumentation::Category category_cutWWW = FunctionDocumentation::Category::URL;
+    FunctionDocumentation documentation_cutWWW = {description_cutWWW, syntax_cutWWW, arguments_cutWWW, {}, returned_value_cutWWW, examples_cutWWW, introduced_in_cutWWW, category_cutWWW};
+
+    factory.registerFunction<FunctionCutWWW>(documentation_cutWWW);
 }
 
 }

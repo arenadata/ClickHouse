@@ -3,11 +3,11 @@
 #include <Common/HashTable/FixedHashTable.h>
 
 template <typename Key, typename Allocator = HashTableAllocator>
-class FixedHashSet : public FixedHashTable<Key, FixedHashTableCell<Key>, Allocator>
+class FixedHashSet : public FixedHashTable<Key, FixedHashTableCell<Key>, FixedHashTableStoredSize<FixedHashTableCell<Key>>, Allocator>
 {
 public:
     using Cell = FixedHashTableCell<Key>;
-    using Base = FixedHashTable<Key, Cell, Allocator>;
+    using Base = FixedHashTable<Key, Cell, FixedHashTableStoredSize<Cell>, Allocator>;
     using Self = FixedHashSet;
 
     void merge(const Self & rhs)
@@ -16,11 +16,4 @@ public:
             if (Base::buf[i].isZero(*this) && !rhs.buf[i].isZero(*this))
                 new (&Base::buf[i]) Cell(rhs.buf[i]);
     }
-
-    /// NOTE: Currently this method isn't used. When it does, the ReadBuffer should
-    ///  contain the Key explicitly.
-    // void readAndMerge(DB::ReadBuffer & rb)
-    // {
-
-    // }
 };

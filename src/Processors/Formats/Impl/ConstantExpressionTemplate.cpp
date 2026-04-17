@@ -1,20 +1,27 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnTuple.h>
+#include <Columns/ColumnMap.h>
 #include <Columns/ColumnsNumber.h>
+#include <Common/SipHash.h>
+#include <Formats/FormatSettings.h>
+#include <Core/Settings.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/FieldToDataType.h>
 #include <Processors/Formats/IRowInputFormat.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/ExpressionAnalyzer.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ReplaceQueryParameterVisitor.h>
-#include <Interpreters/SyntaxAnalyzer.h>
+#include <Interpreters/TreeRewriter.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/convertFieldToType.h>
-#include <Interpreters/ExpressionActions.h>
+#include <Interpreters/castColumn.h>
+#include <IO/Operators.h>
 #include <IO/ReadHelpers.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -29,11 +36,72 @@
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsUInt64 max_parser_backtracks;
+    extern const SettingsUInt64 max_parser_depth;
+}
 
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int SYNTAX_ERROR;
+    extern const int BAD_ARGUMENTS;
+}
+
+/// Extract token info from the original AST before cloning.
+/// Traverses AST in DFS order and collects LiteralTokenInfo for each literal from the token_map.
+static void extractLiteralTokensImpl(
+    const ASTPtr & ast, const LiteralTokenMap & token_map, std::vector<std::optional<LiteralTokenInfo>> & result, ContextPtr context)
+{
+    if (auto * literal = ast->as<ASTLiteral>())
+    {
+        /// Null and Bool literals are never recorded by the parser, so always push nullopt.
+        /// This also protects against stale token_map entries from address reuse.
+        Field::Types::Which field_type = literal->value.getType();
+        if (field_type == Field::Types::Null || field_type == Field::Types::Bool)
+        {
+            result.push_back(std::nullopt);
+            return;
+        }
+
+        auto it = token_map.find(literal);
+        if (it != token_map.end())
+            result.push_back(it->second);
+        else
+            result.push_back(std::nullopt);
+        return;
+    }
+
+    if (auto * func = ast->as<ASTFunction>())
+    {
+        if (func->name == "lambda")
+            return;
+
+        if (func->name.starts_with("toInterval"))
+            return;
+
+        FunctionOverloadResolverPtr builder = FunctionFactory::instance().get(func->name, context);
+        ColumnNumbers dont_visit_children = builder->getArgumentsThatAreAlwaysConstant();
+
+        if (func->arguments)
+        {
+            for (size_t i = 0; i < func->arguments->children.size(); ++i)
+            {
+                if (std::find(dont_visit_children.begin(), dont_visit_children.end(), i) == dont_visit_children.end())
+                    extractLiteralTokensImpl(func->arguments->children[i], token_map, result, context);
+            }
+        }
+        return;
+    }
+}
+
+static std::vector<std::optional<LiteralTokenInfo>> extractLiteralTokens(
+    const ASTPtr & ast, const LiteralTokenMap & token_map, ContextPtr context)
+{
+    std::vector<std::optional<LiteralTokenInfo>> result;
+    extractLiteralTokensImpl(ast, token_map, result, context);
+    return result;
 }
 
 
@@ -46,6 +114,7 @@ struct SpecialParserType
     bool is_nullable = false;
     bool is_array = false;
     bool is_tuple = false;
+    bool is_map = false;
     /// Type and nullability
     std::vector<std::pair<Field::Types::Which, bool>> nested_types;
 
@@ -61,14 +130,16 @@ struct SpecialParserType
 
 struct LiteralInfo
 {
-    using ASTLiteralPtr = std::shared_ptr<ASTLiteral>;
-    LiteralInfo(const ASTLiteralPtr & literal_, const String & column_name_, bool force_nullable_)
-            : literal(literal_), dummy_column_name(column_name_), force_nullable(force_nullable_) { }
+    using ASTLiteralPtr = boost::intrusive_ptr<ASTLiteral>;
+    LiteralInfo(const ASTLiteralPtr & literal_, const String & column_name_, bool force_nullable_, const LiteralTokenInfo & token_info_)
+            : literal(literal_), dummy_column_name(column_name_), force_nullable(force_nullable_), token_info(token_info_) { }
     ASTLiteralPtr literal;
     String dummy_column_name;
     /// Make column nullable even if expression type is not.
     /// (for literals in functions like ifNull and assumeNotNul, which never return NULL even for NULL arguments)
     bool force_nullable;
+    /// Position in query string for sorting and template construction
+    LiteralTokenInfo token_info;
 
     DataTypePtr type;
     SpecialParserType special_parser;
@@ -119,9 +190,19 @@ static void fillLiteralInfo(DataTypes & nested_types, LiteralInfo & info)
         {
             field_type = Field::Types::Tuple;
         }
+        else if (type_info.isMap())
+        {
+            field_type = Field::Types::Map;
+        }
+        else if (type_info.isUInt8())
+        {
+            /// Could be Bool - treat as UInt64 for templating
+            nested_type = std::make_shared<DataTypeUInt64>();
+            field_type = Field::Types::UInt64;
+        }
         else
-            throw Exception("Unexpected literal type inside Array: " + nested_type->getName() + ". It's a bug",
-                            ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected literal type inside Array: {}. It's a bug",
+                            nested_type->getName());
 
         if (is_nullable)
             nested_type = std::make_shared<DataTypeNullable>(nested_type);
@@ -136,9 +217,12 @@ class ReplaceLiteralsVisitor
 {
 public:
     LiteralsInfo replaced_literals;
-    const Context & context;
+    ContextPtr context;
+    const std::vector<std::optional<LiteralTokenInfo>> & token_info_vec;
+    size_t token_info_index = 0;
 
-    explicit ReplaceLiteralsVisitor(const Context & context_) : context(context_) { }
+    ReplaceLiteralsVisitor(ContextPtr context_, const std::vector<std::optional<LiteralTokenInfo>> & token_info_vec_)
+        : context(context_), token_info_vec(token_info_vec_) { }
 
     void visit(ASTPtr & ast, bool force_nullable)
     {
@@ -149,9 +233,9 @@ public:
         else if (ast->as<ASTQueryParameter>())
             return;
         else if (ast->as<ASTIdentifier>())
-            throw DB::Exception("Identifier in constant expression", ErrorCodes::SYNTAX_ERROR);
+            throw DB::Exception(ErrorCodes::SYNTAX_ERROR, "Identifier in constant expression");
         else
-            throw DB::Exception("Syntax error in constant expression", ErrorCodes::SYNTAX_ERROR);
+            throw DB::Exception(ErrorCodes::SYNTAX_ERROR, "Syntax error in constant expression");
     }
 
 private:
@@ -165,6 +249,14 @@ private:
     void visit(ASTFunction & function, bool force_nullable)
     {
         if (function.name == "lambda")
+            return;
+
+        /// Parsing of INTERVALs is quite hacky. Expressions are rewritten during parsing like this:
+        /// "now() + interval 1 day" -> "now() + toIntervalDay(1)"
+        /// "select now() + INTERVAL '1 day 1 hour 1 minute'" -> "now() + (toIntervalDay(1), toIntervalHour(1), toIntervalMinute(1))"
+        /// so the AST is completely different from the original expression .
+        /// Avoid extracting these literals and simply compare tokens. It makes the template less flexible but much simpler.
+        if (function.name.starts_with("toInterval"))
             return;
 
         FunctionOverloadResolverPtr builder = FunctionFactory::instance().get(function.name, context);
@@ -183,23 +275,55 @@ private:
 
     bool visitIfLiteral(ASTPtr & ast, bool force_nullable)
     {
-        auto literal = std::dynamic_pointer_cast<ASTLiteral>(ast);
+        auto literal = boost::dynamic_pointer_cast<ASTLiteral>(ast);
         if (!literal)
             return false;
-        if (literal->begin && literal->end)
+
+        /// Get token info for this literal from pre-extracted vector (by DFS index)
+        chassert(token_info_index < token_info_vec.size());
+        auto token_info = token_info_vec[token_info_index++];
+
+        /// Skip Null and Bool literals - they are never recorded by the parser,
+        /// but might have stale token info due to memory address reuse.
+        /// Also skip if token_info is nullopt (literal wasn't recorded).
+        Field::Types::Which field_type = literal->value.getType();
+        if (field_type == Field::Types::Null || field_type == Field::Types::Bool)
+            return true;
+
+        if (token_info.has_value())
         {
             /// Do not replace empty array and array of NULLs
             if (literal->value.getType() == Field::Types::Array)
             {
-                const Array & array = literal->value.get<Array>();
+                const Array & array = literal->value.safeGet<Array>();
                 auto not_null = std::find_if_not(array.begin(), array.end(), [](const auto & elem) { return elem.isNull(); });
                 if (not_null == array.end())
                     return true;
             }
-            String column_name = "_dummy_" + std::to_string(replaced_literals.size());
-            replaced_literals.emplace_back(literal, column_name, force_nullable);
+            else if (literal->value.getType() == Field::Types::Map)
+            {
+                const Map & map = literal->value.safeGet<Map>();
+                if (map.size() % 2)
+                    return false;
+            }
+            else if (literal->value.getType() == Field::Types::Tuple)
+            {
+                const Tuple & tuple = literal->value.safeGet<Tuple>();
+
+                for (const auto & value : tuple)
+                    if (value.isNull())
+                        return true;
+            }
+
+            /// When generating placeholder names, ensure that we use names
+            /// requiring quotes to be valid identifiers. This prevents the
+            /// tuple() function from generating named tuples. Otherwise,
+            /// inserting named tuples with different names into another named
+            /// tuple will result in only default values being inserted.
+            String column_name = "-dummy-" + std::to_string(replaced_literals.size());
+            replaced_literals.emplace_back(literal, column_name, force_nullable, *token_info);
             setDataType(replaced_literals.back());
-            ast = std::make_shared<ASTIdentifier>(column_name);
+            ast = make_intrusive<ASTIdentifier>(column_name);
         }
         return true;
     }
@@ -243,9 +367,19 @@ private:
             fillLiteralInfo(nested_types, info);
             info.type = std::make_shared<DataTypeTuple>(nested_types);
         }
+        else if (field_type == Field::Types::Map)
+        {
+            info.special_parser.is_map = true;
+
+            info.type = applyVisitor(FieldToDataType(), info.literal->value);
+            auto nested_types = assert_cast<const DataTypeMap &>(*info.type).getKeyValueTypes();
+            fillLiteralInfo(nested_types, info);
+            info.type = std::make_shared<DataTypeMap>(nested_types);
+        }
         else
-            throw Exception(String("Unexpected literal type ") + info.literal->value.getTypeName() + ". It's a bug",
-                            ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Unexpected literal type {}",
+                info.literal->value.getTypeName());
 
         /// Allow literal to be NULL, if result column has nullable type or if function never returns NULL
         if (info.force_nullable && info.type->canBeInsideNullable())
@@ -261,27 +395,25 @@ private:
 /// E.g. template of "position('some string', 'other string') != 0" is
 /// ["position", "(", DataTypeString, ",", DataTypeString, ")", "!=", DataTypeUInt64]
 ConstantExpressionTemplate::TemplateStructure::TemplateStructure(LiteralsInfo & replaced_literals, TokenIterator expression_begin, TokenIterator expression_end,
-                                                                 ASTPtr & expression, const IDataType & result_type, bool null_as_default_, const Context & context)
+                                                                 ASTPtr & expression, const IDataType & result_type, bool null_as_default_, ContextPtr context)
 {
     null_as_default = null_as_default_;
 
-    std::sort(replaced_literals.begin(), replaced_literals.end(), [](const LiteralInfo & a, const LiteralInfo & b)
+    ::sort(replaced_literals.begin(), replaced_literals.end(), [](const LiteralInfo & a, const LiteralInfo & b)
     {
-        return a.literal->begin.value() < b.literal->begin.value();
+        return a.token_info.begin < b.token_info.begin;
     });
 
     /// Make sequence of tokens and determine IDataType by Field::Types:Which for each literal.
     token_after_literal_idx.reserve(replaced_literals.size());
     special_parser.resize(replaced_literals.size());
+    serializations.resize(replaced_literals.size());
 
     TokenIterator prev_end = expression_begin;
     for (size_t i = 0; i < replaced_literals.size(); ++i)
     {
         const LiteralInfo & info = replaced_literals[i];
-        if (info.literal->begin.value() < prev_end)
-            throw Exception("Cannot replace literals", ErrorCodes::LOGICAL_ERROR);
-
-        while (prev_end < info.literal->begin.value())
+        while (prev_end->begin < info.token_info.begin)
         {
             tokens.emplace_back(prev_end->begin, prev_end->size());
             ++prev_end;
@@ -292,7 +424,11 @@ ConstantExpressionTemplate::TemplateStructure::TemplateStructure(LiteralsInfo & 
 
         literals.insert({nullptr, info.type, info.dummy_column_name});
 
-        prev_end = info.literal->end.value();
+        /// Skip past the literal tokens
+        while (prev_end < expression_end && prev_end->begin < info.token_info.end)
+            ++prev_end;
+
+        serializations[i] = info.type->getDefaultSerialization();
     }
 
     while (prev_end < expression_end)
@@ -303,12 +439,41 @@ ConstantExpressionTemplate::TemplateStructure::TemplateStructure(LiteralsInfo & 
 
     addNodesToCastResult(result_type, expression, null_as_default);
 
-    auto syntax_result = SyntaxAnalyzer(context).analyze(expression, literals.getNamesAndTypesList());
+    auto syntax_result = TreeRewriter(context).analyze(expression, literals.getNamesAndTypesList());
     result_column_name = expression->getColumnName();
     actions_on_literals = ExpressionAnalyzer(expression, syntax_result, context).getActions(false);
+    if (actions_on_literals->hasArrayJoin())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Array joins are not allowed in constant expressions for IN, VALUES, LIMIT and similar sections.");
+
 }
 
-size_t ConstantExpressionTemplate::TemplateStructure::getTemplateHash(const ASTPtr & expression,
+String ConstantExpressionTemplate::TemplateStructure::dumpTemplate() const
+{
+    WriteBufferFromOwnString res;
+
+    size_t cur_column = 0;
+    size_t cur_token = 0;
+    size_t num_columns = literals.columns();
+    while (cur_column < num_columns)
+    {
+        size_t skip_tokens_until = token_after_literal_idx[cur_column];
+        while (cur_token < skip_tokens_until)
+            res << quote << tokens[cur_token++] << ", ";
+
+        const DataTypePtr & type = literals.getByPosition(cur_column).type;
+        res << type->getName() << ", ";
+        ++cur_column;
+    }
+
+    while (cur_token < tokens.size())
+        res << quote << tokens[cur_token++] << ", ";
+
+    res << "eof";
+    return res.str();
+}
+
+UInt64 ConstantExpressionTemplate::TemplateStructure::getTemplateHash(const ASTPtr & expression,
                                                                       const LiteralsInfo & replaced_literals,
                                                                       const DataTypePtr & result_column_type,
                                                                       bool null_as_default,
@@ -318,7 +483,7 @@ size_t ConstantExpressionTemplate::TemplateStructure::getTemplateHash(const ASTP
     SipHash hash_state;
     hash_state.update(result_column_type->getName());
 
-    expression->updateTreeHash(hash_state);
+    expression->updateTreeHash(hash_state, /*ignore_aliases=*/ true);
 
     for (const auto & info : replaced_literals)
         hash_state.update(info.type->getName());
@@ -327,12 +492,7 @@ size_t ConstantExpressionTemplate::TemplateStructure::getTemplateHash(const ASTP
     /// Allows distinguish expression in the last column in Values format
     hash_state.update(salt);
 
-    IAST::Hash res128;
-    hash_state.get128(res128.first, res128.second);
-    size_t res = 0;
-    boost::hash_combine(res, res128.first);
-    boost::hash_combine(res, res128.second);
-    return res;
+    return hash_state.get64();
 }
 
 
@@ -342,18 +502,23 @@ ConstantExpressionTemplate::Cache::getFromCacheOrConstruct(const DataTypePtr & r
                                                            TokenIterator expression_begin,
                                                            TokenIterator expression_end,
                                                            const ASTPtr & expression_,
-                                                           const Context & context,
+                                                           const LiteralTokenMap & token_map,
+                                                           ContextPtr context,
                                                            bool * found_in_cache,
                                                            const String & salt)
 {
     TemplateStructurePtr res;
+    /// Extract token info from original AST before cloning.
+    /// The token_map keys are pointers to original AST nodes, so we must
+    /// extract the info before cloning to ensure the pointers match.
+    auto token_info_vec = extractLiteralTokens(expression_, token_map, context);
     ASTPtr expression = expression_->clone();
-    ReplaceLiteralsVisitor visitor(context);
+    ReplaceLiteralsVisitor visitor(context, token_info_vec);
     visitor.visit(expression, result_column_type->isNullable() || null_as_default);
-    ReplaceQueryParameterVisitor param_visitor(context.getQueryParameters());
+    ReplaceQueryParameterVisitor param_visitor(context->getQueryParameters());
     param_visitor.visit(expression);
 
-    size_t template_hash = TemplateStructure::getTemplateHash(expression, visitor.replaced_literals, result_column_type, null_as_default, salt);
+    UInt64 template_hash = TemplateStructure::getTemplateHash(expression, visitor.replaced_literals, result_column_type, null_as_default, salt);
     auto iter = cache.find(template_hash);
     if (iter == cache.end())
     {
@@ -376,12 +541,13 @@ ConstantExpressionTemplate::Cache::getFromCacheOrConstruct(const DataTypePtr & r
     return res;
 }
 
-bool ConstantExpressionTemplate::parseExpression(ReadBuffer & istr, const FormatSettings & format_settings, const Settings & settings)
+bool ConstantExpressionTemplate::parseExpression(
+    ReadBuffer & istr, const TokenIterator & token_iterator, const FormatSettings & format_settings, const Settings & settings)
 {
     size_t cur_column = 0;
     try
     {
-        if (tryParseExpression(istr, format_settings, cur_column, settings))
+        if (tryParseExpression(istr, token_iterator, format_settings, cur_column, settings))
         {
             ++rows_count;
             return true;
@@ -403,7 +569,12 @@ bool ConstantExpressionTemplate::parseExpression(ReadBuffer & istr, const Format
     return false;
 }
 
-bool ConstantExpressionTemplate::tryParseExpression(ReadBuffer & istr, const FormatSettings & format_settings, size_t & cur_column, const Settings & settings)
+bool ConstantExpressionTemplate::tryParseExpression(
+    ReadBuffer & istr,
+    const TokenIterator & token_iterator,
+    const FormatSettings & format_settings,
+    size_t & cur_column,
+    const Settings & settings)
 {
     size_t cur_token = 0;
     size_t num_columns = structure->literals.columns();
@@ -422,11 +593,11 @@ bool ConstantExpressionTemplate::tryParseExpression(ReadBuffer & istr, const For
         const DataTypePtr & type = structure->literals.getByPosition(cur_column).type;
         if (format_settings.values.accurate_types_of_literals && !structure->special_parser[cur_column].useDefaultParser())
         {
-            if (!parseLiteralAndAssertType(istr, type.get(), cur_column, settings))
+            if (!parseLiteralAndAssertType(istr, token_iterator, type.get(), cur_column, settings))
                 return false;
         }
         else
-            type->deserializeAsTextQuoted(*columns[cur_column], istr, format_settings);
+            structure->serializations[cur_column]->deserializeTextQuoted(*columns[cur_column], istr, format_settings);
 
         ++cur_column;
     }
@@ -440,7 +611,8 @@ bool ConstantExpressionTemplate::tryParseExpression(ReadBuffer & istr, const For
     return true;
 }
 
-bool ConstantExpressionTemplate::parseLiteralAndAssertType(ReadBuffer & istr, const IDataType * complex_type, size_t column_idx, const Settings & settings)
+bool ConstantExpressionTemplate::parseLiteralAndAssertType(
+    ReadBuffer & istr, const TokenIterator & token_iterator, const IDataType * complex_type, size_t column_idx, const Settings & settings)
 {
     using Type = Field::Types::Which;
 
@@ -453,14 +625,15 @@ bool ConstantExpressionTemplate::parseLiteralAndAssertType(ReadBuffer & istr, co
     /// If literal does not fit entirely in the buffer, parsing error will happen.
     /// However, it's possible to deduce new template (or use template from cache) after error like it was template mismatch.
 
-    if (type_info.is_array || type_info.is_tuple)
+    if (type_info.is_array || type_info.is_tuple || type_info.is_map)
     {
-        /// TODO faster way to check types without using Parsers
         ParserArrayOfLiterals parser_array;
         ParserTupleOfLiterals parser_tuple;
 
-        Tokens tokens_number(istr.position(), istr.buffer().end());
-        IParser::Pos iterator(tokens_number, settings.max_parser_depth);
+        IParser::Pos iterator(
+            token_iterator, static_cast<unsigned>(settings[Setting::max_parser_depth]), static_cast<unsigned>(settings[Setting::max_parser_backtracks]));
+        while (iterator->begin < istr.position())
+            ++iterator;
         Expected expected;
         ASTPtr ast;
         if (!parser_array.parse(iterator, ast, expected) && !parser_tuple.parse(iterator, ast, expected))
@@ -473,9 +646,26 @@ bool ConstantExpressionTemplate::parseLiteralAndAssertType(ReadBuffer & istr, co
 
         DataTypes nested_types;
         if (type_info.is_array)
-            nested_types = { assert_cast<const DataTypeArray &>(*collection_type).getNestedType() };
+        {
+            const auto * array_type = typeid_cast<const DataTypeArray *>(collection_type.get());
+            if (!array_type)
+                return false;
+            nested_types = {array_type->getNestedType()};
+        }
+        else if (type_info.is_tuple)
+        {
+            const auto * tuple_type = typeid_cast<const DataTypeTuple *>(collection_type.get());
+            if (!tuple_type)
+                return false;
+            nested_types = tuple_type->getElements();
+        }
         else
-            nested_types = assert_cast<const DataTypeTuple &>(*collection_type).getElements();
+        {
+            const auto * map_type = typeid_cast<const DataTypeMap *>(collection_type.get());
+            if (!map_type)
+                return false;
+            nested_types = map_type->getKeyValueTypes();
+        }
 
         for (size_t i = 0; i < nested_types.size(); ++i)
         {
@@ -498,113 +688,121 @@ bool ConstantExpressionTemplate::parseLiteralAndAssertType(ReadBuffer & istr, co
         columns[column_idx]->insert(array_same_types);
         return true;
     }
+
+    Field number;
+    if (type_info.is_nullable && 4 <= istr.available() && 0 == strncasecmp(istr.position(), "NULL", 4))
+    {
+        istr.position() += 4;
+    }
     else
     {
-        Field number;
-        if (type_info.is_nullable && 4 <= istr.available() && 0 == strncasecmp(istr.position(), "NULL", 4))
-            istr.position() += 4;
-        else
+        /// ParserNumber::parse(...) is about 20x slower than strtod(...)
+        /// because of using ASTPtr, Expected and Tokens, which are not needed here.
+        /// Parse numeric literal in the same way, as ParserNumber does, but use strtod and strtoull directly.
+        bool negative = *istr.position() == '-';
+        if (negative || *istr.position() == '+')
+            ++istr.position();
+
+        static constexpr size_t MAX_LENGTH_OF_NUMBER = 319;
+        char buf[MAX_LENGTH_OF_NUMBER + 1];
+        size_t bytes_to_copy = std::min(istr.available(), MAX_LENGTH_OF_NUMBER);
+        memcpy(buf, istr.position(), bytes_to_copy);
+        buf[bytes_to_copy] = 0;
+
+        const bool hex_like = bytes_to_copy >= 2 && buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X');
+
+        char * pos_double = buf;
+        errno = 0;
+        Float64 float_value = std::strtod(buf, &pos_double);
+        if (pos_double == buf || errno == ERANGE || float_value < 0)
+            return false;
+
+        if (negative)
+            float_value = -float_value;
+
+        char * pos_integer = buf;
+        errno = 0;
+        UInt64 uint_value = std::strtoull(buf, &pos_integer, hex_like ? 16 : 10);
+        if (pos_integer == pos_double && errno != ERANGE && (!negative || uint_value <= (1ULL << 63)))
         {
-            /// ParserNumber::parse(...) is about 20x slower than strtod(...)
-            /// because of using ASTPtr, Expected and Tokens, which are not needed here.
-            /// Parse numeric literal in the same way, as ParserNumber does, but use strtod and strtoull directly.
-            bool negative = *istr.position() == '-';
-            if (negative || *istr.position() == '+')
-                ++istr.position();
-
-            static constexpr size_t MAX_LENGTH_OF_NUMBER = 319;
-            char buf[MAX_LENGTH_OF_NUMBER + 1];
-            size_t bytes_to_copy = std::min(istr.available(), MAX_LENGTH_OF_NUMBER);
-            memcpy(buf, istr.position(), bytes_to_copy);
-            buf[bytes_to_copy] = 0;
-
-            char * pos_double = buf;
-            errno = 0;
-            Float64 float_value = std::strtod(buf, &pos_double);
-            if (pos_double == buf || errno == ERANGE || float_value < 0)
-                return false;
-
-            if (negative)
-                float_value = -float_value;
-
-            char * pos_integer = buf;
-            errno = 0;
-            UInt64 uint_value = std::strtoull(buf, &pos_integer, 0);
-            if (pos_integer == pos_double && errno != ERANGE && (!negative || uint_value <= (1ULL << 63)))
-            {
-                istr.position() += pos_integer - buf;
-                if (negative && type_info.main_type == Type::Int64)
-                    number = static_cast<Int64>(-uint_value);
-                else if (!negative && type_info.main_type == Type::UInt64)
-                    number = uint_value;
-                else
-                    return false;
-            }
-            else if (type_info.main_type == Type::Float64)
-            {
-                istr.position() += pos_double - buf;
-                number = float_value;
-            }
+            istr.position() += pos_integer - buf;
+            if (negative && type_info.main_type == Type::Int64)
+                number = static_cast<Int64>(-uint_value);
+            else if (type_info.main_type == Type::UInt64 && (!negative || uint_value == 0))
+                number = uint_value;
             else
                 return false;
         }
-
-        columns[column_idx]->insert(number);
-        return true;
+        else if (type_info.main_type == Type::Float64)
+        {
+            istr.position() += pos_double - buf;
+            number = float_value;
+        }
+        else
+            return false;
     }
+
+    columns[column_idx]->insert(number);
+    return true;
 }
 
-ColumnPtr ConstantExpressionTemplate::evaluateAll(BlockMissingValues & nulls, size_t column_idx, size_t offset)
+ColumnPtr ConstantExpressionTemplate::evaluateAll(BlockMissingValues & nulls, size_t column_idx, const DataTypePtr & expected_type, size_t offset)
 {
     Block evaluated = structure->literals.cloneWithColumns(std::move(columns));
     columns = structure->literals.cloneEmptyColumns();
     if (!structure->literals.columns())
-        evaluated.insert({ColumnConst::create(ColumnUInt8::create(1, 0), rows_count), std::make_shared<DataTypeUInt8>(), "_dummy"});
+        evaluated.insert({ColumnConst::create(ColumnUInt8::create(1, static_cast<UInt8>(0)), rows_count), std::make_shared<DataTypeUInt8>(), "_dummy"});
     structure->actions_on_literals->execute(evaluated);
 
-    if (!evaluated || evaluated.rows() != rows_count)
-        throw Exception("Number of rows mismatch after evaluation of batch of constant expressions: got " +
-                        std::to_string(evaluated.rows()) + " rows for " + std::to_string(rows_count) + " expressions",
-                        ErrorCodes::LOGICAL_ERROR);
+    if (evaluated.empty() || evaluated.rows() != rows_count)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Number of rows mismatch after evaluation of batch of constant expressions: "
+                        "got {} rows for {} expressions", evaluated.rows(), rows_count);
 
     if (!evaluated.has(structure->result_column_name))
-        throw Exception("Cannot evaluate template " + structure->result_column_name + ", block structure:\n" + evaluated.dumpStructure(),
-                        ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot evaluate template {}, block structure:\n{}",
+                        structure->result_column_name, evaluated.dumpStructure());
 
     rows_count = 0;
-    ColumnPtr res = evaluated.getByName(structure->result_column_name).column->convertToFullColumnIfConst();
+    auto res = evaluated.getByName(structure->result_column_name);
+    res.column = res.column->convertToFullColumnIfConst();
     if (!structure->null_as_default)
-        return res;
+        return castColumn(res, expected_type);
 
     /// Extract column with evaluated expression and mask for NULLs
-    const auto & tuple = assert_cast<const ColumnTuple &>(*res);
+    const auto & tuple = assert_cast<const ColumnTuple &>(*res.column);
     if (tuple.tupleSize() != 2)
-        throw Exception("Invalid tuple size, it'a a bug", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid tuple size, it'a a bug");
     const auto & is_null = assert_cast<const ColumnUInt8 &>(tuple.getColumn(1));
 
     for (size_t i = 0; i < is_null.size(); ++i)
         if (is_null.getUInt(i))
             nulls.setBit(column_idx, offset + i);
 
-    return tuple.getColumnPtr(0);
+    res.column = tuple.getColumnPtr(0);
+    res.type = assert_cast<const DataTypeTuple &>(*res.type).getElements()[0];
+    return castColumn(res, expected_type);
 }
 
 void ConstantExpressionTemplate::TemplateStructure::addNodesToCastResult(const IDataType & result_column_type, ASTPtr & expr, bool null_as_default)
 {
     /// Replace "expr" with "CAST(expr, 'TypeName')"
-    /// or with "(CAST(assumeNotNull(expr as _expression), 'TypeName'), isNull(_expression))" if null_as_default is true
+    /// or with "(if(isNull(_dummy_0 AS _expression), defaultValueOfTypeName('TypeName'), _CAST(_expression, 'TypeName')), isNull(_expression))" if null_as_default is true
     if (null_as_default)
     {
         expr->setAlias("_expression");
-        expr = makeASTFunction("assumeNotNull", std::move(expr));
+
+        auto is_null = makeASTFunction("isNull", make_intrusive<ASTIdentifier>("_expression"));
+        is_null->setAlias("_is_expression_nullable");
+
+        auto default_value = makeASTFunction("defaultValueOfTypeName", make_intrusive<ASTLiteral>(result_column_type.getName()));
+        auto cast = makeASTFunction("_CAST", std::move(expr), make_intrusive<ASTLiteral>(result_column_type.getName()));
+
+        auto cond = makeASTFunction("if", std::move(is_null), std::move(default_value), std::move(cast));
+        expr = makeASTFunction("tuple", std::move(cond), make_intrusive<ASTIdentifier>("_is_expression_nullable"));
     }
-
-    expr = makeASTFunction("CAST", std::move(expr), std::make_shared<ASTLiteral>(result_column_type.getName()));
-
-    if (null_as_default)
+    else
     {
-        auto is_null = makeASTFunction("isNull", std::make_shared<ASTIdentifier>("_expression"));
-        expr = makeASTFunction("tuple", std::move(expr), std::move(is_null));
+        expr = makeASTFunction("_CAST", std::move(expr), make_intrusive<ASTLiteral>(result_column_type.getName()));
     }
 }
 

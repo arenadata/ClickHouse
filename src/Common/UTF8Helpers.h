@@ -1,11 +1,17 @@
 #pragma once
 
-#include <Core/Types.h>
+#include <optional>
+#include <base/types.h>
+#include <base/simd.h>
 #include <Common/BitHelpers.h>
-#include <Poco/UTF8Encoding.h>
 
 #ifdef __SSE2__
 #include <emmintrin.h>
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#    include <arm_neon.h>
+#      pragma clang diagnostic ignored "-Wreserved-identifier"
 #endif
 
 
@@ -42,7 +48,7 @@ inline void syncForward(const UInt8 * & s, const UInt8 * const end)
 /// returns UTF-8 code point sequence length judging by it's first octet
 inline size_t seqLength(const UInt8 first_octet)
 {
-    if (first_octet < 0x80u)
+    if (first_octet < 0x80 || first_octet >= 0xF8)  /// The specs of UTF-8.
         return 1;
 
     const size_t bits = 8;
@@ -54,17 +60,26 @@ inline size_t seqLength(const UInt8 first_octet)
 inline size_t countCodePoints(const UInt8 * data, size_t size)
 {
     size_t res = 0;
-    const auto end = data + size;
+    const auto * end = data + size;
 
 #ifdef __SSE2__
     constexpr auto bytes_sse = sizeof(__m128i);
-    const auto src_end_sse = data + size / bytes_sse * bytes_sse;
+    const auto * src_end_sse = data + size / bytes_sse * bytes_sse;
 
     const auto threshold = _mm_set1_epi8(0xBF);
 
     for (; data < src_end_sse; data += bytes_sse)
         res += __builtin_popcount(_mm_movemask_epi8(
             _mm_cmpgt_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(data)), threshold)));
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    constexpr auto bytes_sse = 16;
+    const auto * src_end_sse = data + size / bytes_sse * bytes_sse;
+
+    const auto threshold = vdupq_n_s8(0xBF);
+
+    for (; data < src_end_sse; data += bytes_sse)
+        res += std::popcount(getNibbleMask(vcgtq_s8(vld1q_s8(reinterpret_cast<const int8_t *>(data)), threshold)));
+    res >>= 2;
 #endif
 
     for (; data < end; ++data) /// Skip UTF-8 continuation bytes.
@@ -73,26 +88,10 @@ inline size_t countCodePoints(const UInt8 * data, size_t size)
     return res;
 }
 
-template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
-int convert(const CharT * bytes)
-{
-    static const Poco::UTF8Encoding utf8;
-    return utf8.convert(reinterpret_cast<const uint8_t *>(bytes));
-}
 
-template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
-int convert(int ch, CharT * bytes, int length)
-{
-    static const Poco::UTF8Encoding utf8;
-    return utf8.convert(ch, reinterpret_cast<uint8_t *>(bytes), length);
-}
+size_t convertCodePointToUTF8(int code_point, char * out_bytes, size_t out_length);
+std::optional<uint32_t> convertUTF8ToCodePoint(const char * in_bytes, size_t in_length);
 
-template <typename CharT, typename = std::enable_if_t<sizeof(CharT) == 1>>
-int queryConvert(const CharT * bytes, int length)
-{
-    static const Poco::UTF8Encoding utf8;
-    return utf8.queryConvert(reinterpret_cast<const uint8_t *>(bytes), length);
-}
 
 /// returns UTF-8 wcswidth. Invalid sequence is treated as zero width character.
 /// `prefix` is used to compute the `\t` width which extends the string before
@@ -112,7 +111,10 @@ size_t computeWidth(const UInt8 * data, size_t size, size_t prefix = 0) noexcept
   */
 size_t computeBytesBeforeWidth(const UInt8 * data, size_t size, size_t prefix, size_t limit) noexcept;
 
-}
+/** Calculate the number of bytes before limit-th code point.
+  */
+size_t computeBytesBeforeCodePoint(const UInt8 * data, size_t size, size_t limit) noexcept;
 
+}
 
 }

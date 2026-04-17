@@ -1,29 +1,25 @@
-#include <iostream>
-
-#include <Core/Types.h>
+#include <IO/WriteBufferFromString.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTDropQuery.h>
-#include <Parsers/ParserDictionary.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/DumpASTNode.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/ParserDropQuery.h>
-#include <Parsers/formatAST.h>
-#include <Parsers/parseQuery.h>
-#include <Parsers/DumpASTNode.h>
-#include <Parsers/TablePropertiesQueriesASTs.h>
 #include <Parsers/ParserTablePropertiesQuery.h>
-#include <sstream>
+#include <Parsers/TablePropertiesQueriesASTs.h>
+#include <Parsers/parseQuery.h>
+#include <base/types.h>
 
 #include <gtest/gtest.h>
 
 using namespace DB;
 
-#pragma GCC diagnostic ignored "-Wunused-function"
-
-static String astToString(IAST * ast)
+[[maybe_unused]] static String astToString(IAST * ast)
 {
-    std::ostringstream oss;
-    dumpAST(*ast, oss);
-    return oss.str();
+    WriteBufferFromOwnString buf;
+    dumpAST(*ast, buf);
+    return buf.str();
 }
 
 /// Tests for external dictionaries DDL parser
@@ -43,10 +39,10 @@ TEST(ParserDictionaryDDL, SimpleDictionary)
                    " RANGE(MIN second_column MAX third_column)";
 
     ParserCreateDictionaryQuery parser;
-    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0);
+    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0, 0);
     ASTCreateQuery * create = ast->as<ASTCreateQuery>();
-    EXPECT_EQ(create->table, "dict1");
-    EXPECT_EQ(create->database, "test");
+    EXPECT_EQ(create->getTable(), "dict1");
+    EXPECT_EQ(create->getDatabase(), "test");
     EXPECT_EQ(create->is_dictionary, true);
     EXPECT_NE(create->dictionary, nullptr);
     EXPECT_NE(create->dictionary->lifetime, nullptr);
@@ -59,26 +55,26 @@ TEST(ParserDictionaryDDL, SimpleDictionary)
     EXPECT_EQ(create->dictionary->source->name, "clickhouse");
     auto children = create->dictionary->source->elements->children;
     EXPECT_EQ(children[0]->as<ASTPair>() -> first, "host");
-    EXPECT_EQ(children[0]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "localhost");
+    EXPECT_EQ(children[0]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "localhost");
 
     EXPECT_EQ(children[1]->as<ASTPair>()->first, "port");
-    EXPECT_EQ(children[1]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<UInt64>(), 9000);
+    EXPECT_EQ(children[1]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<UInt64>(), 9000);
 
     EXPECT_EQ(children[2]->as<ASTPair>()->first, "user");
-    EXPECT_EQ(children[2]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "default");
+    EXPECT_EQ(children[2]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "default");
     EXPECT_EQ(children[3]->as<ASTPair>()->first, "password");
-    EXPECT_EQ(children[3]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "");
+    EXPECT_EQ(children[3]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "");
 
     EXPECT_EQ(children[4]->as<ASTPair>()->first, "db");
-    EXPECT_EQ(children[4]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "test");
+    EXPECT_EQ(children[4]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "test");
 
     EXPECT_EQ(children[5]->as<ASTPair>()->first, "table");
-    EXPECT_EQ(children[5]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "table_for_dict");
+    EXPECT_EQ(children[5]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "table_for_dict");
 
     /// layout test
     auto * layout = create->dictionary->layout;
     EXPECT_EQ(layout->layout_type, "flat");
-    EXPECT_EQ(layout->children.size(), 0);
+    EXPECT_EQ(layout->parameters->children.size(), 0);
 
     /// lifetime test
     auto * lifetime = create->dictionary->lifetime;
@@ -90,7 +86,7 @@ TEST(ParserDictionaryDDL, SimpleDictionary)
     auto * primary_key = create->dictionary->primary_key;
 
     EXPECT_EQ(primary_key->children.size(), 1);
-    EXPECT_EQ(primary_key->children[0]->as<ASTIdentifier>()->name, "key_column");
+    EXPECT_EQ(primary_key->children[0]->as<ASTIdentifier>()->name(), "key_column");
 
     /// range test
     auto * range = create->dictionary->range;
@@ -105,9 +101,9 @@ TEST(ParserDictionaryDDL, SimpleDictionary)
     EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->name, "second_column");
     EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->name, "third_column");
 
-    EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 0);
-    EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 1);
-    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 2);
+    EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 0);
+    EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 1);
+    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 2);
 
     EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->expression, nullptr);
     EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->expression, nullptr);
@@ -139,10 +135,10 @@ TEST(ParserDictionaryDDL, AttributesWithMultipleProperties)
                    " SOURCE(CLICKHOUSE(HOST 'localhost'))";
 
     ParserCreateDictionaryQuery parser;
-    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0);
+    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0, 0);
     ASTCreateQuery * create = ast->as<ASTCreateQuery>();
-    EXPECT_EQ(create->table, "dict2");
-    EXPECT_EQ(create->database, "");
+    EXPECT_EQ(create->getTable(), "dict2");
+    EXPECT_EQ(create->getDatabase(), "");
 
     /// test attributes
     EXPECT_NE(create->dictionary_attributes_list, nullptr);
@@ -153,12 +149,12 @@ TEST(ParserDictionaryDDL, AttributesWithMultipleProperties)
     EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->name, "third_column");
 
     EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->default_value, nullptr);
-    EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 1);
-    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 2);
+    EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 1);
+    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 2);
 
     EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->expression, nullptr);
     EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->expression, nullptr);
-    EXPECT_EQ(serializeAST(*attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->expression, true), "(rand() % 100) * 77");
+    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->expression->formatWithSecretsOneLine(), "(rand() % 100) * 77");
 
     EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->hierarchical, false);
     EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->hierarchical, true);
@@ -186,7 +182,7 @@ TEST(ParserDictionaryDDL, CustomAttributePropertiesOrder)
                    " LIFETIME(300)";
 
     ParserCreateDictionaryQuery parser;
-    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0);
+    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0, 0);
     ASTCreateQuery * create = ast->as<ASTCreateQuery>();
 
     /// test attributes
@@ -198,13 +194,13 @@ TEST(ParserDictionaryDDL, CustomAttributePropertiesOrder)
     EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->name, "second_column");
     EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->name, "third_column");
 
-    EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 100);
-    EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 1);
-    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.get<UInt64>(), 2);
+    EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 100);
+    EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 1);
+    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->default_value->as<ASTLiteral>()->value.safeGet<UInt64>(), 2);
 
     EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->expression, nullptr);
     EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->expression, nullptr);
-    EXPECT_EQ(serializeAST(*attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->expression, true), "(rand() % 100) * 77");
+    EXPECT_EQ(attributes_children[2]->as<ASTDictionaryAttributeDeclaration>()->expression->formatWithSecretsOneLine(), "(rand() % 100) * 77");
 
     EXPECT_EQ(attributes_children[0]->as<ASTDictionaryAttributeDeclaration>()->hierarchical, false);
     EXPECT_EQ(attributes_children[1]->as<ASTDictionaryAttributeDeclaration>()->hierarchical, true);
@@ -241,35 +237,35 @@ TEST(ParserDictionaryDDL, NestedSource)
                    " RANGE(MIN second_column MAX third_column)";
 
     ParserCreateDictionaryQuery parser;
-    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0);
+    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0, 0);
     ASTCreateQuery * create = ast->as<ASTCreateQuery>();
-    EXPECT_EQ(create->table, "dict4");
-    EXPECT_EQ(create->database, "");
+    EXPECT_EQ(create->getTable(), "dict4");
+    EXPECT_EQ(create->getDatabase(), "");
 
     /// source test
     EXPECT_EQ(create->dictionary->source->name, "mysql");
     auto children = create->dictionary->source->elements->children;
 
     EXPECT_EQ(children[0]->as<ASTPair>()->first, "host");
-    EXPECT_EQ(children[0]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "localhost");
+    EXPECT_EQ(children[0]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "localhost");
 
     EXPECT_EQ(children[1]->as<ASTPair>()->first, "port");
-    EXPECT_EQ(children[1]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<UInt64>(), 9000);
+    EXPECT_EQ(children[1]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<UInt64>(), 9000);
 
     EXPECT_EQ(children[2]->as<ASTPair>()->first, "user");
-    EXPECT_EQ(children[2]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "default");
+    EXPECT_EQ(children[2]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "default");
 
     EXPECT_EQ(children[3]->as<ASTPair>()->first, "replica");
     auto replica = children[3]->as<ASTPair>()->second->children;
 
     EXPECT_EQ(replica[0]->as<ASTPair>()->first, "host");
-    EXPECT_EQ(replica[0]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "127.0.0.1");
+    EXPECT_EQ(replica[0]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "127.0.0.1");
 
     EXPECT_EQ(replica[1]->as<ASTPair>()->first, "priority");
-    EXPECT_EQ(replica[1]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<UInt64>(), 1);
+    EXPECT_EQ(replica[1]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<UInt64>(), 1);
 
     EXPECT_EQ(children[4]->as<ASTPair>()->first, "password");
-    EXPECT_EQ(children[4]->as<ASTPair>()->second->as<ASTLiteral>()->value.get<String>(), "");
+    EXPECT_EQ(children[4]->as<ASTPair>()->second->as<ASTLiteral>()->value.safeGet<String>(), "");
 }
 
 
@@ -289,9 +285,9 @@ TEST(ParserDictionaryDDL, Formatting)
                    " RANGE(MIN second_column MAX third_column)";
 
     ParserCreateDictionaryQuery parser;
-    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0);
+    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0, 0, 0);
     ASTCreateQuery * create = ast->as<ASTCreateQuery>();
-    auto str = serializeAST(*create, true);
+    auto str = create->formatWithSecretsOneLine();
     EXPECT_EQ(str, "CREATE DICTIONARY test.dict5 (`key_column1` UInt64 DEFAULT 1 HIERARCHICAL INJECTIVE, `key_column2` String DEFAULT '', `second_column` UInt8 EXPRESSION intDiv(50, rand() % 1000), `third_column` UInt8) PRIMARY KEY key_column1, key_column2 SOURCE(MYSQL(HOST 'localhost' PORT 9000 USER 'default' REPLICA (HOST '127.0.0.1' PRIORITY 1) PASSWORD '')) LIFETIME(MIN 1 MAX 10) LAYOUT(CACHE(SIZE_IN_CELLS 50)) RANGE(MIN second_column MAX third_column)");
 }
 
@@ -300,24 +296,24 @@ TEST(ParserDictionaryDDL, ParseDropQuery)
     String input1 = "DROP DICTIONARY test.dict1";
 
     ParserDropQuery parser;
-    ASTPtr ast1 = parseQuery(parser, input1.data(), input1.data() + input1.size(), "", 0, 0);
+    ASTPtr ast1 = parseQuery(parser, input1.data(), input1.data() + input1.size(), "", 0, 0, 0);
     ASTDropQuery * drop1 = ast1->as<ASTDropQuery>();
 
     EXPECT_TRUE(drop1->is_dictionary);
-    EXPECT_EQ(drop1->database, "test");
-    EXPECT_EQ(drop1->table, "dict1");
-    auto str1 = serializeAST(*drop1, true);
+    EXPECT_EQ(drop1->getDatabase(), "test");
+    EXPECT_EQ(drop1->getTable(), "dict1");
+    auto str1 = drop1->formatWithSecretsOneLine();
     EXPECT_EQ(input1, str1);
 
     String input2 = "DROP DICTIONARY IF EXISTS dict2";
 
-    ASTPtr ast2 = parseQuery(parser, input2.data(), input2.data() + input2.size(), "", 0, 0);
+    ASTPtr ast2 = parseQuery(parser, input2.data(), input2.data() + input2.size(), "", 0, 0, 0);
     ASTDropQuery * drop2 = ast2->as<ASTDropQuery>();
 
     EXPECT_TRUE(drop2->is_dictionary);
-    EXPECT_EQ(drop2->database, "");
-    EXPECT_EQ(drop2->table, "dict2");
-    auto str2 = serializeAST(*drop2, true);
+    EXPECT_EQ(drop2->getDatabase(), "");
+    EXPECT_EQ(drop2->getTable(), "dict2");
+    auto str2 = drop2->formatWithSecretsOneLine();
     EXPECT_EQ(input2, str2);
 }
 
@@ -326,19 +322,19 @@ TEST(ParserDictionaryDDL, ParsePropertiesQueries)
     String input1 = "SHOW CREATE DICTIONARY test.dict1";
 
     ParserTablePropertiesQuery parser;
-    ASTPtr ast1 = parseQuery(parser, input1.data(), input1.data() + input1.size(), "", 0, 0);
+    ASTPtr ast1 = parseQuery(parser, input1.data(), input1.data() + input1.size(), "", 0, 0, 0);
     ASTShowCreateDictionaryQuery * show1 = ast1->as<ASTShowCreateDictionaryQuery>();
 
-    EXPECT_EQ(show1->table, "dict1");
-    EXPECT_EQ(show1->database, "test");
-    EXPECT_EQ(serializeAST(*show1), input1);
+    EXPECT_EQ(show1->getTable(), "dict1");
+    EXPECT_EQ(show1->getDatabase(), "test");
+    EXPECT_EQ(show1->formatWithSecretsOneLine(), input1);
 
     String input2 = "EXISTS DICTIONARY dict2";
 
-    ASTPtr ast2 = parseQuery(parser, input2.data(), input2.data() + input2.size(), "", 0, 0);
+    ASTPtr ast2 = parseQuery(parser, input2.data(), input2.data() + input2.size(), "", 0, 0, 0);
     ASTExistsDictionaryQuery * show2 = ast2->as<ASTExistsDictionaryQuery>();
 
-    EXPECT_EQ(show2->table, "dict2");
-    EXPECT_EQ(show2->database, "");
-    EXPECT_EQ(serializeAST(*show2), input2);
+    EXPECT_EQ(show2->getTable(), "dict2");
+    EXPECT_EQ(show2->getDatabase(), "");
+    EXPECT_EQ(show2->formatWithSecretsOneLine(), input2);
 }

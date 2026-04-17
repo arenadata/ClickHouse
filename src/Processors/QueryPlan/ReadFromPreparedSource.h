@@ -1,23 +1,43 @@
 #pragma once
+
+#include <Interpreters/Context_fwd.h>
 #include <Processors/QueryPlan/ISourceStep.h>
-#include <Processors/Pipe.h>
+#include <QueryPipeline/Pipe.h>
+#include <Storages/SelectQueryInfo.h>
 
 namespace DB
 {
+
+class IStorage;
+using StoragePtr = std::shared_ptr<IStorage>;
 
 /// Create source from prepared pipe.
 class ReadFromPreparedSource : public ISourceStep
 {
 public:
-    explicit ReadFromPreparedSource(Pipe pipe_, std::shared_ptr<Context> context_);
+    explicit ReadFromPreparedSource(Pipe pipe_);
 
-    String getName() const override { return "ReadNothing"; }
+    String getName() const override { return "ReadFromPreparedSource"; }
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
 
-    void initializePipeline(QueryPipeline & pipeline) override;
+protected:
+    Pipe pipe;
+};
+
+class ReadFromStorageStep final : public ReadFromPreparedSource
+{
+public:
+    ReadFromStorageStep(Pipe pipe_, StoragePtr storage_, ContextPtr context_, const SelectQueryInfo & query_info_);
+
+    String getName() const override { return "ReadFromStorage"; }
+
+    const StoragePtr & getStorage() const { return storage; }
 
 private:
-    Pipe pipe;
-    std::shared_ptr<Context> context;
+    StoragePtr storage;
+
+    ContextPtr context;
+    SelectQueryInfo query_info;
 };
 
 }

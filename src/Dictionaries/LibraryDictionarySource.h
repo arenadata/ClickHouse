@@ -1,10 +1,13 @@
 #pragma once
 
-#include <Common/SharedLibrary.h>
-#include <common/LocalDateTime.h>
-#include "DictionaryStructure.h"
+#include <BridgeHelper/ExternalDictionaryLibraryBridgeHelper.h>
+#include <Common/LocalDateTime.h>
+#include <QueryPipeline/BlockIO.h>
+#include <Core/UUID.h>
+#include <Dictionaries/DictionaryStructure.h>
 #include <Core/ExternalResultDescription.h>
-#include "IDictionarySource.h"
+#include <Dictionaries/IDictionarySource.h>
+#include <Interpreters/Context_fwd.h>
 
 
 namespace Poco
@@ -17,18 +20,17 @@ namespace Util
 }
 }
 
-
 namespace DB
 {
+
 namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
 }
-class CStringsHolder;
 
-/// Allows loading dictionaries from dynamic libraries (.so)
-/// Experimental version
-/// Example: tests/external_dictionaries/dictionary_library/dictionary_library.cpp
+class CStringsHolder;
+using ExternalDictionaryLibraryBridgeHelperPtr = std::shared_ptr<ExternalDictionaryLibraryBridgeHelper>;
+
 class LibraryDictionarySource final : public IDictionarySource
 {
 public:
@@ -37,24 +39,24 @@ public:
         const Poco::Util::AbstractConfiguration & config,
         const std::string & config_prefix_,
         Block & sample_block_,
-        const Context & context,
-        bool check_config);
+        ContextPtr context_,
+        bool created_from_ddl);
 
     LibraryDictionarySource(const LibraryDictionarySource & other);
     LibraryDictionarySource & operator=(const LibraryDictionarySource &) = delete;
 
     ~LibraryDictionarySource() override;
 
-    BlockInputStreamPtr loadAll() override;
+    BlockIO loadAll() override;
 
-    BlockInputStreamPtr loadUpdatedAll() override
+    BlockIO loadUpdatedAll() override
     {
-        throw Exception{"Method loadUpdatedAll is unsupported for LibraryDictionarySource", ErrorCodes::NOT_IMPLEMENTED};
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method loadUpdatedAll is unsupported for LibraryDictionarySource");
     }
 
-    BlockInputStreamPtr loadIds(const std::vector<UInt64> & ids) override;
+    BlockIO loadIds(const VectorWithMemoryTracking<UInt64> & ids) override;
 
-    BlockInputStreamPtr loadKeys(const Columns & key_columns, const std::vector<std::size_t> & requested_rows) override;
+    BlockIO loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<std::size_t> & requested_rows) override;
 
     bool isModified() const override;
 
@@ -68,18 +70,24 @@ public:
     std::string toString() const override;
 
 private:
-    Poco::Logger * log;
+    String getDictAttributesString();
 
-    LocalDateTime getLastModification() const;
+    static String getLibrarySettingsString(const Poco::Util::AbstractConfiguration & config, const std::string & config_root);
+
+    static Field getDictID() { return UUIDHelpers::generateV4(); }
+
+    LoggerPtr log;
 
     const DictionaryStructure dict_struct;
     const std::string config_prefix;
-    const std::string path;
+    std::string path;
+    const Field dictionary_id;
+
     Block sample_block;
-    SharedLibraryPtr library;
+    ContextPtr context;
+
+    ExternalDictionaryLibraryBridgeHelperPtr bridge_helper;
     ExternalResultDescription description;
-    std::shared_ptr<CStringsHolder> settings;
-    void * lib_data = nullptr;
 };
 
 }

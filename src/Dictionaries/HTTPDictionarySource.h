@@ -1,13 +1,15 @@
 #pragma once
 
+#include <Core/Block.h>
 #include <IO/ConnectionTimeouts.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <Poco/Net/HTTPBasicCredentials.h>
 #include <Poco/URI.h>
-#include <common/LocalDateTime.h>
-#include "DictionaryStructure.h"
-#include "IDictionarySource.h"
-#include <Interpreters/Context.h>
+#include <Common/LocalDateTime.h>
+#include <Dictionaries/DictionaryStructure.h>
+#include <Dictionaries/IDictionarySource.h>
+#include <Interpreters/Context_fwd.h>
+#include <IO/CompressionMethod.h>
 
 namespace Poco
 {
@@ -21,24 +23,33 @@ namespace DB
 class HTTPDictionarySource final : public IDictionarySource
 {
 public:
+
+    struct Configuration
+    {
+        const std::string url;
+        const std::string format;
+        const std::string update_field;
+        const UInt64 update_lag;
+        const HTTPHeaderEntries header_entries;
+    };
+
     HTTPDictionarySource(
         const DictionaryStructure & dict_struct_,
-        const Poco::Util::AbstractConfiguration & config,
-        const std::string & config_prefix,
+        const Configuration & configuration,
+        const Poco::Net::HTTPBasicCredentials & credentials_,
         Block & sample_block_,
-        const Context & context_,
-        bool check_config);
+        ContextPtr context_);
 
     HTTPDictionarySource(const HTTPDictionarySource & other);
     HTTPDictionarySource & operator=(const HTTPDictionarySource &) = delete;
 
-    BlockInputStreamPtr loadAll() override;
+    BlockIO loadAll() override;
 
-    BlockInputStreamPtr loadUpdatedAll() override;
+    BlockIO loadUpdatedAll() override;
 
-    BlockInputStreamPtr loadIds(const std::vector<UInt64> & ids) override;
+    BlockIO loadIds(const VectorWithMemoryTracking<UInt64> & ids) override;
 
-    BlockInputStreamPtr loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows) override;
+    BlockIO loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows) override;
 
     bool isModified() const override;
 
@@ -53,19 +64,19 @@ public:
 private:
     void getUpdateFieldAndDate(Poco::URI & uri);
 
-    Poco::Logger * log;
+    // wrap buffer using encoding from made request
+    QueryPipeline createWrappedBuffer(std::unique_ptr<ReadWriteBufferFromHTTP> http_buffer);
+
+    LoggerPtr log;
 
     LocalDateTime getLastModification() const;
 
     std::chrono::time_point<std::chrono::system_clock> update_time;
     const DictionaryStructure dict_struct;
-    const std::string url;
+    const Configuration configuration;
     Poco::Net::HTTPBasicCredentials credentials;
-    ReadWriteBufferFromHTTP::HTTPHeaderEntries header_entries;
-    std::string update_field;
-    const std::string format;
     Block sample_block;
-    Context context;
+    ContextPtr context;
     ConnectionTimeouts timeouts;
 };
 

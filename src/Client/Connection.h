@@ -1,72 +1,45 @@
 #pragma once
 
-#include <common/logger_useful.h>
-
 #include <Poco/Net/StreamSocket.h>
 
-#include <Common/Throttler.h>
-
-#include <Core/Block.h>
+#include <Common/callOnce.h>
+#include <Common/SSHWrapper.h>
+#include <Common/SettingsChanges.h>
+#include <Client/IServerConnection.h>
 #include <Core/Defines.h>
-#include <IO/Progress.h>
-#include <Core/Protocol.h>
-#include <Core/QueryProcessingStage.h>
 
-#include <DataStreams/IBlockStream_fwd.h>
-#include <DataStreams/BlockStreamProfileInfo.h>
+#include <Formats/FormatSettings.h>
 
-#include <IO/ConnectionTimeouts.h>
+#include <IO/ReadBufferFromPocoSocketChunked.h>
+#include <IO/WriteBufferFromPocoSocketChunked.h>
 
-#include <Core/Settings.h>
 #include <Interpreters/TablesStatus.h>
+#include <Interpreters/Context_fwd.h>
 
 #include <Compression/ICompressionCodec.h>
 
-#include <atomic>
+#include <Storages/MergeTree/RequestResponse.h>
+
 #include <optional>
 
+#include "config.h"
 
 namespace DB
 {
 
-class ClientInfo;
-class Pipe;
+struct Settings;
+struct TimeoutSetter;
 
-/// Struct which represents data we are going to send for external table.
-struct ExternalTableData
-{
-    /// Pipe of data form table;
-    std::unique_ptr<Pipe> pipe;
-    std::string table_name;
-    /// Flag if need to stop reading.
-    std::atomic_bool is_cancelled = false;
-};
-
-using ExternalTableDataPtr = std::unique_ptr<ExternalTableData>;
-using ExternalTablesData = std::vector<ExternalTableDataPtr>;
-
+class JWTProvider;
 class Connection;
+struct ConnectionParameters;
+struct ClusterFunctionReadTaskResponse;
 
 using ConnectionPtr = std::shared_ptr<Connection>;
 using Connections = std::vector<ConnectionPtr>;
 
-using Scalars = std::map<String, Block>;
-
-
-/// Packet that could be received from server.
-struct Packet
-{
-    UInt64 type;
-
-    Block block;
-    std::unique_ptr<Exception> exception;
-    std::vector<String> multistring_message;
-    Progress progress;
-    BlockStreamProfileInfo profile_info;
-
-    Packet() : type(Protocol::Server::Hello) {}
-};
-
+class NativeReader;
+class NativeWriter;
 
 /** Connection with database server, to use by client.
   * How to use - see Core/Protocol.h
@@ -75,7 +48,7 @@ struct Packet
   * As 'default_database' empty string could be passed
   *  - in that case, server will use it's own default database.
   */
-class Connection : private boost::noncopyable
+class Connection : public IServerConnection
 {
     friend class MultiplexedConnections;
 
@@ -83,106 +56,136 @@ public:
     Connection(const String & host_, UInt16 port_,
         const String & default_database_,
         const String & user_, const String & password_,
-        const String & client_name_ = "client",
-        Protocol::Compression compression_ = Protocol::Compression::Enable,
-        Protocol::Secure secure_ = Protocol::Secure::Disable,
-        Poco::Timespan sync_request_timeout_ = Poco::Timespan(DBMS_DEFAULT_SYNC_REQUEST_TIMEOUT_SEC, 0))
-        :
-        host(host_), port(port_), default_database(default_database_),
-        user(user_), password(password_),
-        client_name(client_name_),
-        compression(compression_),
-        secure(secure_),
-        sync_request_timeout(sync_request_timeout_),
-        log_wrapper(*this)
-    {
-        /// Don't connect immediately, only on first need.
+        const String & proto_send_chunked_, const String & proto_recv_chunked_,
+        const SSHKey & ssh_private_key_,
+        const String & jwt_,
+        const String & quota_key_,
+        const String & cluster_,
+        const String & cluster_secret_,
+        const String & client_name_,
+        Protocol::Compression compression_,
+        Protocol::Secure secure_,
+        const String & tls_sni_override_,
+        const String & bind_host_
+#if USE_JWT_CPP && USE_SSL
+        , std::shared_ptr<JWTProvider> jwt_provider_ = nullptr
+#endif
+    );
 
-        if (user.empty())
-            user = "default";
+    ~Connection() override;
 
-        setDescription();
-    }
+    IServerConnection::Type getConnectionType() const override { return IServerConnection::Type::SERVER; }
 
-    virtual ~Connection() {}
+    static ServerConnectionPtr createConnection(const ConnectionParameters & parameters, ContextPtr context);
 
     /// Set throttler of network traffic. One throttler could be used for multiple connections to limit total traffic.
-    void setThrottler(const ThrottlerPtr & throttler_)
+    void setThrottler(const ThrottlerPtr & throttler_) override
     {
         throttler = throttler_;
     }
 
-
     /// Change default database. Changes will take effect on next reconnect.
-    void setDefaultDatabase(const String & database);
+    void setDefaultDatabase(const String & database) override;
 
     void getServerVersion(const ConnectionTimeouts & timeouts,
                           String & name,
                           UInt64 & version_major,
                           UInt64 & version_minor,
                           UInt64 & version_patch,
-                          UInt64 & revision);
-    UInt64 getServerRevision(const ConnectionTimeouts & timeouts);
+                          UInt64 & revision) override;
 
-    const String & getServerTimezone(const ConnectionTimeouts & timeouts);
-    const String & getServerDisplayName(const ConnectionTimeouts & timeouts);
+    UInt64 getServerRevision(const ConnectionTimeouts & timeouts) override;
+
+    const String & getServerTimezone(const ConnectionTimeouts & timeouts) override;
+    const String & getServerDisplayName(const ConnectionTimeouts & timeouts) override;
+
+    const SettingsChanges & settingsFromServer() const;
 
     /// For log and exception messages.
-    const String & getDescription() const;
+    const String & getDescription(bool with_extra = false) const override; /// NOLINT
     const String & getHost() const;
     UInt16 getPort() const;
     const String & getDefaultDatabase() const;
 
-    /// If last flag is true, you need to call sendExternalTablesData after.
+    Protocol::Compression getCompression() const { return compression; }
+
+    std::vector<std::pair<String, String>> getPasswordComplexityRules() const override { return password_complexity_rules; }
+
     void sendQuery(
         const ConnectionTimeouts & timeouts,
         const String & query,
-        const String & query_id_ = "",
-        UInt64 stage = QueryProcessingStage::Complete,
-        const Settings * settings = nullptr,
-        const ClientInfo * client_info = nullptr,
-        bool with_pending_data = false);
+        const NameToNameMap& query_parameters,
+        const String & query_id_/* = "" */,
+        UInt64 stage/* = QueryProcessingStage::Complete */,
+        const Settings * settings/* = nullptr */,
+        const ClientInfo * client_info/* = nullptr */,
+        bool with_pending_data/* = false */,
+        const std::vector<String> & external_roles,
+        std::function<void(const Progress &)> process_progress_callback) override;
 
-    void sendCancel();
-    /// Send block of data; if name is specified, server will write it to external (temporary) table of that name.
-    void sendData(const Block & block, const String & name = "", bool scalar = false);
-    /// Send all scalars.
-    void sendScalarsData(Scalars & data);
-    /// Send all contents of external (temporary) tables.
-    void sendExternalTablesData(ExternalTablesData & data);
+    void sendQueryPlan(const QueryPlan & query_plan) override;
+
+    void sendCancel() override;
+
+    void sendData(const Block & block, const String & name/* = "" */, bool scalar/* = false */) override;
+
+    void sendMergeTreeReadTaskResponse(const ParallelReadResponse & response) override;
+
+    void sendExternalTablesData(ExternalTablesData & data) override;
+
+    bool poll(size_t timeout_microseconds/* = 0 */) override;
+
+    bool hasReadPendingData() const override;
+
+    std::optional<UInt64> checkPacket(size_t timeout_microseconds/* = 0*/) override;
+
+    Packet receivePacket() override;
+    UInt64 receivePacketType() override;
+
+    void forceConnected(const ConnectionTimeouts & timeouts) override;
+
+    bool isConnected() const override { return connected && in && out && !in->isCanceled() && !out->isCanceled(); }
+
+    bool checkConnected(const ConnectionTimeouts & timeouts) override { return isConnected() && ping(timeouts); }
+
+    void disconnect() override;
 
     /// Send prepared block of data (serialized and, if need, compressed), that will be read from 'input'.
     /// You could pass size of serialized/compressed block.
     void sendPreparedData(ReadBuffer & input, size_t size, const String & name = "");
 
-    /// Check, if has data to read.
-    bool poll(size_t timeout_microseconds = 0);
-
-    /// Check, if has data in read buffer.
-    bool hasReadPendingData() const;
-
-    /// Checks if there is input data in connection and reads packet ID.
-    std::optional<UInt64> checkPacket(size_t timeout_microseconds = 0);
-
-    /// Receive packet from server.
-    Packet receivePacket();
-
-    /// If not connected yet, or if connection is broken - then connect. If cannot connect - throw an exception.
-    void forceConnected(const ConnectionTimeouts & timeouts);
-
-    bool isConnected() const { return connected; }
+    void sendClusterFunctionReadTaskResponse(const ClusterFunctionReadTaskResponse & response);
+    /// Send all scalars.
+    void sendScalarsData(Scalars & data);
+    /// Send parts' uuids to excluded them from query processing
+    void sendIgnoredPartUUIDs(const std::vector<UUID> & uuids);
 
     TablesStatusResponse getTablesStatus(const ConnectionTimeouts & timeouts,
                                          const TablesStatusRequest & request);
 
-    /** Disconnect.
-      * This may be used, if connection is left in unsynchronised state
-      *  (when someone continues to wait for something) after an exception.
-      */
-    void disconnect();
-
     size_t outBytesCount() const { return out ? out->count() : 0; }
     size_t inBytesCount() const { return in ? in->count() : 0; }
+
+    Poco::Net::Socket * getSocket() { return socket.get(); }
+
+    /// Each time read from socket blocks and async_callback is set, it will be called. You can poll socket inside it.
+    void setAsyncCallback(AsyncCallback async_callback_)
+    {
+        async_callback = std::move(async_callback_);
+        if (in)
+            in->setAsyncCallback(async_callback);
+        if (out)
+            out->setAsyncCallback(async_callback);
+    }
+
+    bool haveMoreAddressesToConnect() const { return have_more_addresses_to_connect; }
+
+    void setAddressConnectTimeoutExpired() { address_connect_timeout_expired = true; }
+
+    void setFormatSettings(const FormatSettings & settings) override
+    {
+        format_settings = settings;
+    }
 
 private:
     String host;
@@ -190,6 +193,26 @@ private:
     String default_database;
     String user;
     String password;
+    String proto_send_chunked;
+    String proto_recv_chunked;
+    String proto_send_chunked_srv;
+    String proto_recv_chunked_srv;
+#if USE_SSH
+    SSHKey ssh_private_key;
+#endif
+    String quota_key;
+#if USE_JWT_CPP && USE_SSL
+    String jwt;
+    std::shared_ptr<JWTProvider> jwt_provider;
+#endif
+
+    /// For inter-server authorization
+    String cluster;
+    String cluster_secret;
+    /// For DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET
+    String salt;
+    /// For DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2
+    std::optional<UInt64> nonce;
 
     /// Address is resolved during the first connection (or the following reconnects)
     /// Use it only for logging purposes
@@ -197,6 +220,7 @@ private:
 
     /// For messages in log and in exceptions.
     String description;
+    String full_description;
     void setDescription();
 
     /// Returns resolved address if it was resolved.
@@ -211,17 +235,23 @@ private:
     UInt64 server_version_minor = 0;
     UInt64 server_version_patch = 0;
     UInt64 server_revision = 0;
+    UInt64 server_parallel_replicas_protocol_version = 0;
+    UInt64 worker_cluster_function_protocol_version = 0;
+    UInt64 server_query_plan_serialization_version = 0;
     String server_timezone;
     String server_display_name;
+    SettingsChanges settings_from_server;
 
     std::unique_ptr<Poco::Net::StreamSocket> socket;
-    std::shared_ptr<ReadBuffer> in;
-    std::shared_ptr<WriteBuffer> out;
+    std::shared_ptr<ReadBufferFromPocoSocketChunked> in;
+    std::shared_ptr<WriteBufferFromPocoSocketChunked> out;
     std::optional<UInt64> last_input_packet_type;
 
     String query_id;
     Protocol::Compression compression;        /// Enable data compression for communication.
     Protocol::Secure secure;             /// Enable data encryption for communication.
+    String tls_sni_override;             /// Override for TLS SNI field.
+    String bind_host;
 
     /// What compression settings to use while sending data for INSERT queries and external tables.
     CompressionCodecPtr compression_codec;
@@ -231,60 +261,107 @@ private:
       */
     ThrottlerPtr throttler;
 
-    Poco::Timespan sync_request_timeout;
+    std::vector<std::pair<String, String>> password_complexity_rules;
 
     /// From where to read query execution result.
     std::shared_ptr<ReadBuffer> maybe_compressed_in;
-    BlockInputStreamPtr block_in;
-    BlockInputStreamPtr block_logs_in;
+    std::unique_ptr<NativeReader> block_in;
+    std::unique_ptr<NativeReader> block_logs_in;
+    std::unique_ptr<NativeReader> block_profile_events_in;
 
     /// Where to write data for INSERT.
     std::shared_ptr<WriteBuffer> maybe_compressed_out;
-    BlockOutputStreamPtr block_out;
+    std::unique_ptr<NativeWriter> block_out;
+
+    /// True if there are more resolved addresses to try when connecting (hostname may resolve to multiple IPs).
+    bool have_more_addresses_to_connect = false;
+    /// Set by async callback when the per-address connect timeout expires, used to abort the current attempt.
+    bool address_connect_timeout_expired = false;
 
     /// Logger is created lazily, for avoid to run DNS request in constructor.
     class LoggerWrapper
     {
     public:
-        LoggerWrapper(Connection & parent_)
+        explicit LoggerWrapper(Connection & parent_)
             : log(nullptr), parent(parent_)
         {
         }
 
-        Poco::Logger * get()
+        LoggerPtr get()
         {
-            if (!log)
-                log = &Poco::Logger::get("Connection (" + parent.getDescription() + ")");
+            callOnce(log_initialized, [&] {
+                log = getLogger("Connection (" + parent.getDescription() + ")");
+            });
 
             return log;
         }
 
     private:
-        std::atomic<Poco::Logger *> log;
+        OnceFlag log_initialized;
+        LoggerPtr log;
         Connection & parent;
     };
 
     LoggerWrapper log_wrapper;
 
+    AsyncCallback async_callback = {};
+
+    std::optional<FormatSettings> format_settings;
+
     void connect(const ConnectionTimeouts & timeouts);
     void sendHello();
+
+    void cancel() noexcept;
+    void reset() noexcept;
+
+#if USE_SSH
+    void performHandshakeForSSHAuth();
+#endif
+
+    void sendAddendum();
     void receiveHello();
-    bool ping();
+
+#if USE_SSL
+    void sendClusterNameAndSalt();
+#endif
+    bool ping(const ConnectionTimeouts & timeouts);
 
     Block receiveData();
     Block receiveLogData();
-    Block receiveDataImpl(BlockInputStreamPtr & stream);
+    Block receiveDataImpl(NativeReader & reader);
+    Block receiveProfileEvents();
 
-    std::vector<String> receiveMultistringMessage(UInt64 msg_type);
-    std::unique_ptr<Exception> receiveException();
-    Progress receiveProgress();
-    BlockStreamProfileInfo receiveProfileInfo();
+    String receiveTableColumns();
+    std::unique_ptr<Exception> receiveException() const;
+    Progress receiveProgress() const;
+    ParallelReadRequest receiveParallelReadRequest() const;
+    InitialAllRangesAnnouncement receiveInitialParallelReadAnnouncement() const;
+    ProfileInfo receiveProfileInfo() const;
 
     void initInputBuffers();
+    void initMaybeCompressedInput();
     void initBlockInput();
     void initBlockLogsInput();
+    void initBlockProfileEventsInput();
 
-    [[noreturn]] void throwUnexpectedPacket(UInt64 packet_type, const char * expected) const;
+    [[noreturn]] void throwUnexpectedPacket(UInt64 packet_type, const char * expected, TimeoutSetter * timeout_setter = nullptr);
+};
+
+template <typename Conn>
+class AsyncCallbackSetter
+{
+public:
+    AsyncCallbackSetter(Conn * connection_, AsyncCallback async_callback) : connection(connection_)
+    {
+        connection->setAsyncCallback(std::move(async_callback));
+    }
+
+    ~AsyncCallbackSetter()
+    {
+        connection->setAsyncCallback({});
+    }
+private:
+    Conn * connection;
 };
 
 }

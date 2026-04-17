@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
+# Tags: no-fasttest, no-debug, no-flaky-check
+# no-flaky-check: some queries are too long with Thread Fuzzer
 
 set -e
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
-$CLICKHOUSE_CLIENT --multiquery <<EOF
+$CLICKHOUSE_CLIENT <<EOF
 DROP TABLE IF EXISTS src;
 DROP TABLE IF EXISTS mv;
 
@@ -33,21 +36,25 @@ function alter_thread()
     ALTERS[0]="ALTER TABLE mv MODIFY QUERY SELECT v FROM src;"
     ALTERS[1]="ALTER TABLE mv MODIFY QUERY SELECT v * 2 as v FROM src;"
 
-    while true; do
+    local TIMELIMIT=$((SECONDS+10))
+    while [ $SECONDS -lt "$TIMELIMIT" ]
+    do
         $CLICKHOUSE_CLIENT --allow_experimental_alter_materialized_view_structure=1 -q "${ALTERS[$RANDOM % 2]}"
-        sleep `echo 0.$RANDOM`;
+        sleep "$(echo 0.$RANDOM)";
     done
 }
 
-export -f alter_thread;
-timeout 10 bash -c alter_thread &
+alter_thread &
 
-for i in {1..100}; do
+for _ in {1..100}; do
     # Retry (hopefully retriable (deadlock avoided)) errors.
     while true; do
-      $CLICKHOUSE_CLIENT -q "INSERT INTO src VALUES (1);" 2>/dev/null && break
+        $CLICKHOUSE_CLIENT -q "INSERT INTO src VALUES (1);" 2>/dev/null && break
     done
 done
 
 $CLICKHOUSE_CLIENT -q "SELECT count() FROM mv;"
 wait
+
+$CLICKHOUSE_CLIENT -q "DROP VIEW mv"
+$CLICKHOUSE_CLIENT -q "DROP TABLE src"

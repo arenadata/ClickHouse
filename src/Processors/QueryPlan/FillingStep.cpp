@@ -1,7 +1,9 @@
 #include <Processors/QueryPlan/FillingStep.h>
 #include <Processors/Transforms/FillingTransform.h>
-#include <Processors/QueryPipeline.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 #include <IO/Operators.h>
+#include <Interpreters/ExpressionActions.h>
+#include <Common/JSONBuilder.h>
 
 namespace DB
 {
@@ -11,37 +13,76 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-static ITransformingStep::DataStreamTraits getTraits()
+static ITransformingStep::Traits getTraits()
 {
-    return ITransformingStep::DataStreamTraits
+    return ITransformingStep::Traits
     {
-            .preserves_distinct_columns = false, /// TODO: it seem to actually be true. Check it later.
+        {
             .returns_single_stream = true,
             .preserves_number_of_streams = true,
+            .preserves_sorting = true,
+        },
+        {
+            .preserves_number_of_rows = false,
+        }
     };
 }
 
-FillingStep::FillingStep(const DataStream & input_stream_, SortDescription sort_description_)
-    : ITransformingStep(input_stream_, input_stream_.header, getTraits())
+FillingStep::FillingStep(
+    SharedHeader input_header_,
+    SortDescription sort_description_,
+    SortDescription fill_description_,
+    InterpolateDescriptionPtr interpolate_description_,
+    bool use_with_fill_by_sorting_prefix_)
+    : ITransformingStep(input_header_, std::make_shared<const Block>(FillingTransform::transformHeader(*input_header_, sort_description_)), getTraits())
     , sort_description(std::move(sort_description_))
+    , fill_description(std::move(fill_description_))
+    , interpolate_description(interpolate_description_)
+    , use_with_fill_by_sorting_prefix(use_with_fill_by_sorting_prefix_)
 {
-    if (!input_stream_.has_single_port)
-        throw Exception("FillingStep expects single input", ErrorCodes::LOGICAL_ERROR);
 }
 
-void FillingStep::transformPipeline(QueryPipeline & pipeline)
+void FillingStep::transformPipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
-    pipeline.addSimpleTransform([&](const Block & header)
+    if (pipeline.getNumStreams() != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "FillingStep expects single input");
+
+    pipeline.addSimpleTransform([&](const SharedHeader & header, QueryPipelineBuilder::StreamType stream_type) -> ProcessorPtr
     {
-        return std::make_shared<FillingTransform>(header, sort_description);
+        if (stream_type == QueryPipelineBuilder::StreamType::Totals)
+            return std::make_shared<FillingNoopTransform>(header, fill_description);
+
+        return std::make_shared<FillingTransform>(
+            header, sort_description, fill_description, std::move(interpolate_description), use_with_fill_by_sorting_prefix);
     });
 }
 
 void FillingStep::describeActions(FormatSettings & settings) const
 {
-    settings.out << String(settings.offset, ' ');
-    dumpSortDescription(sort_description, input_streams.front().header, settings.out);
+    const String & prefix = settings.detail_prefix;
+    settings.out << prefix;
+    dumpSortDescription(sort_description, settings.out);
     settings.out << '\n';
+    if (interpolate_description)
+    {
+        auto expression = std::make_shared<ExpressionActions>(interpolate_description->actions.clone());
+        if (!settings.compact)
+            expression->describeActions(settings.out, prefix);
+    }
 }
 
+void FillingStep::describeActions(JSONBuilder::JSONMap & map) const
+{
+    map.add("Sort Description", explainSortDescription(sort_description));
+    if (interpolate_description)
+    {
+        auto expression = std::make_shared<ExpressionActions>(interpolate_description->actions.clone());
+        map.add("Expression", expression->toTree());
+    }
+}
+
+void FillingStep::updateOutputHeader()
+{
+    output_header = std::make_shared<const Block>(FillingTransform::transformHeader(*input_headers.front(), sort_description));
+}
 }

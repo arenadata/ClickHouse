@@ -13,10 +13,10 @@ struct FixedClearableHashTableCell
     using mapped_type = VoidMapped;
     UInt32 version;
 
-    FixedClearableHashTableCell() {}
+    FixedClearableHashTableCell() {} /// NOLINT
     FixedClearableHashTableCell(const Key &, const State & state) : version(state.version) {}
 
-    const VoidKey getKey() const { return {}; }
+    const VoidKey getKey() const { return {}; } /// NOLINT
     VoidMapped getMapped() const { return {}; }
 
     bool isZero(const State & state) const { return version != state.version; }
@@ -25,7 +25,7 @@ struct FixedClearableHashTableCell
     struct CellExt
     {
         Key key;
-        const VoidKey getKey() const { return {}; }
+        const VoidKey getKey() const { return {}; } /// NOLINT
         VoidMapped getMapped() const { return {}; }
         const value_type & getValue() const { return key; }
         void update(Key && key_, FixedClearableHashTableCell *) { key = key_; }
@@ -34,10 +34,11 @@ struct FixedClearableHashTableCell
 
 
 template <typename Key, typename Allocator = HashTableAllocator>
-class FixedClearableHashSet : public FixedHashTable<Key, FixedClearableHashTableCell<Key>, Allocator>
+class FixedClearableHashSet : public FixedHashTable<
+    Key, FixedClearableHashTableCell<Key>, FixedHashTableStoredSize<FixedClearableHashTableCell<Key>>, Allocator>
 {
 public:
-    using Base = FixedHashTable<Key, FixedClearableHashTableCell<Key>, Allocator>;
+    using Base = FixedHashTable<Key, FixedClearableHashTableCell<Key>, FixedHashTableStoredSize<FixedClearableHashTableCell<Key>>, Allocator>;
     using LookupResult = typename Base::LookupResult;
 
     void clear()

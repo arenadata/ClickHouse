@@ -1,6 +1,4 @@
 #include <cmath>
-#include <sstream>
-#include <iomanip>
 
 #include <Common/formatReadable.h>
 #include <IO/DoubleConverter.h>
@@ -15,7 +13,8 @@ namespace DB
     }
 }
 
-static void formatReadable(double size, DB::WriteBuffer & out, int precision, const char ** units, size_t units_size, double delimiter)
+static void formatReadable(double size, DB::WriteBuffer & out,
+    int precision, const char ** units, size_t units_size, double delimiter)
 {
     size_t i = 0;
     for (; i + 1 < units_size && fabs(size) >= delimiter; ++i)
@@ -24,10 +23,15 @@ static void formatReadable(double size, DB::WriteBuffer & out, int precision, co
     DB::DoubleConverter<false>::BufferType buffer;
     double_conversion::StringBuilder builder{buffer, sizeof(buffer)};
 
-    const auto result = DB::DoubleConverter<false>::instance().ToFixed(size, precision, &builder);
+    const auto & converter = DB::DoubleConverter<false>::instance();
+
+    auto result = converter.ToFixed(size, precision, &builder);
 
     if (!result)
-        throw DB::Exception("Cannot print float or double number", DB::ErrorCodes::CANNOT_PRINT_FLOAT_OR_DOUBLE_NUMBER);
+        result = converter.ToShortest(size, &builder);
+
+    if (!result)
+        throw DB::Exception(DB::ErrorCodes::CANNOT_PRINT_FLOAT_OR_DOUBLE_NUMBER, "Cannot print float or double number");
 
     out.write(buffer, builder.position());
     writeCString(units[i], out);
@@ -64,7 +68,11 @@ std::string formatReadableSizeWithDecimalSuffix(double value, int precision)
 
 void formatReadableQuantity(double value, DB::WriteBuffer & out, int precision)
 {
-    const char * units[] = {"", " thousand", " million", " billion", " trillion", " quadrillion"};
+    const char * units[] = {"", " thousand", " million", " billion", " trillion", " quadrillion",
+        " quintillion", " sextillion", " septillion", " octillion", " nonillion", " decillion",
+        " undecillion", " duodecillion", " tredecillion", " quattuordecillion", " quindecillion",
+        " sexdecillion", " septendecillion", " octodecillion", " novemdecillion", " vigintillion"};
+
     formatReadable(value, out, precision, units, sizeof(units) / sizeof(units[0]), 1000);
 }
 
@@ -72,5 +80,18 @@ std::string formatReadableQuantity(double value, int precision)
 {
     DB::WriteBufferFromOwnString out;
     formatReadableQuantity(value, out, precision);
+    return out.str();
+}
+
+void formatReadableTime(double ns, DB::WriteBuffer & out, int precision)
+{
+    const char * units[] = {" ns", " us", " ms", " s"};
+    formatReadable(ns, out, precision, units, sizeof(units) / sizeof(units[0]), 1000);
+}
+
+std::string formatReadableTime(double ns, int precision)
+{
+    DB::WriteBufferFromOwnString out;
+    formatReadableTime(ns, out, precision);
     return out.str();
 }

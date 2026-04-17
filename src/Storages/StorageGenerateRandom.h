@@ -1,37 +1,51 @@
 #pragma once
 
 #include <optional>
-#include <ext/shared_ptr_helper.h>
-#include <Storages/IStorage.h>
+#include <Storages/StorageWithCommonVirtualColumns.h>
+#include <pcg_random.hpp>
 
 
 namespace DB
 {
+
+/// If `fuzzy` is true, tries to generate more "interesting" values. E.g. small numbers are more
+/// likely, and strings sometimes are in datetime format.
+ColumnPtr fillColumnWithRandomData(
+    DataTypePtr type, UInt64 limit, UInt64 max_array_length, UInt64 max_string_length, pcg64 & rng, bool fuzzy = false);
+
 /* Generates random data for given schema.
  */
-class StorageGenerateRandom final : public ext::shared_ptr_helper<StorageGenerateRandom>, public IStorage
+class StorageGenerateRandom final : public StorageWithCommonVirtualColumns
 {
-    friend struct ext::shared_ptr_helper<StorageGenerateRandom>;
 public:
+    StorageGenerateRandom(
+        const StorageID & table_id_,
+        const ColumnsDescription & columns_,
+        const String & comment,
+        UInt64 max_array_length,
+        UInt64 max_string_length,
+        const std::optional<UInt64> & random_seed);
+
     std::string getName() const override { return "GenerateRandom"; }
 
-    Pipes read(
+    static VirtualColumnsDescription createVirtuals();
+
+    using StorageWithCommonVirtualColumns::read;
+
+    Pipe read(
         const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
-        const SelectQueryInfo & query_info,
-        const Context & context,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
-        unsigned num_streams) override;
+        size_t num_streams) override;
 
+    bool supportsTransactions() const override { return true; }
 private:
     UInt64 max_array_length = 10;
     UInt64 max_string_length = 10;
     UInt64 random_seed = 0;
-
-protected:
-    StorageGenerateRandom(const StorageID & table_id_, const ColumnsDescription & columns_,
-        UInt64 max_array_length, UInt64 max_string_length, std::optional<UInt64> random_seed);
 };
 
 }

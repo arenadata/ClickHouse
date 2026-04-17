@@ -1,16 +1,20 @@
 #pragma once
 
+#include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnVector.h>
 #include <Columns/ColumnsCommon.h>
 #include <Columns/ColumnsNumber.h>
-#include <Common/typeid_cast.h>
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypeArray.h>
-#include "IAggregateFunction.h"
+#include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <Common/typeid_cast.h>
+#include <Common/VectorWithMemoryTracking.h>
+
 
 namespace DB
 {
+struct Settings;
+
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
@@ -23,40 +27,41 @@ GradientComputer class computes gradient according to its loss function
 class IGradientComputer
 {
 public:
-    IGradientComputer() {}
+    IGradientComputer() = default;
 
     virtual ~IGradientComputer() = default;
 
     /// Adds computed gradient in new point (weights, bias) to batch_gradient
     virtual void compute(
-        std::vector<Float64> & batch_gradient,
-        const std::vector<Float64> & weights,
+        VectorWithMemoryTracking<Float64> & batch_gradient,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
         Float64 l2_reg_coef,
         Float64 target,
         const IColumn ** columns,
-        size_t row_num) = 0;
+        size_t row_num)
+        = 0;
 
     virtual void predict(
         ColumnVector<Float64>::Container & container,
-        Block & block,
+        const ColumnsWithTypeAndName & arguments,
         size_t offset,
         size_t limit,
-        const ColumnNumbers & arguments,
-        const std::vector<Float64> & weights,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
-        const Context & context) const = 0;
+        ContextPtr context) const
+        = 0;
 };
 
 
 class LinearRegression : public IGradientComputer
 {
 public:
-    LinearRegression() {}
+    LinearRegression() = default;
 
     void compute(
-        std::vector<Float64> & batch_gradient,
-        const std::vector<Float64> & weights,
+        VectorWithMemoryTracking<Float64> & batch_gradient,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
         Float64 l2_reg_coef,
         Float64 target,
@@ -65,24 +70,23 @@ public:
 
     void predict(
         ColumnVector<Float64>::Container & container,
-        Block & block,
+        const ColumnsWithTypeAndName & arguments,
         size_t offset,
         size_t limit,
-        const ColumnNumbers & arguments,
-        const std::vector<Float64> & weights,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
-        const Context & context) const override;
+        ContextPtr context) const override;
 };
 
 
 class LogisticRegression : public IGradientComputer
 {
 public:
-    LogisticRegression() {}
+    LogisticRegression() = default;
 
     void compute(
-        std::vector<Float64> & batch_gradient,
-        const std::vector<Float64> & weights,
+        VectorWithMemoryTracking<Float64> & batch_gradient,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
         Float64 l2_reg_coef,
         Float64 target,
@@ -91,13 +95,12 @@ public:
 
     void predict(
         ColumnVector<Float64>::Container & container,
-        Block & block,
+        const ColumnsWithTypeAndName & arguments,
         size_t offset,
         size_t limit,
-        const ColumnNumbers & arguments,
-        const std::vector<Float64> & weights,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
-        const Context & context) const override;
+        ContextPtr context) const override;
 };
 
 
@@ -112,9 +115,9 @@ public:
 
     /// Calls GradientComputer to update current mini-batch
     virtual void addToBatch(
-        std::vector<Float64> & batch_gradient,
+        VectorWithMemoryTracking<Float64> & batch_gradient,
         IGradientComputer & gradient_computer,
-        const std::vector<Float64> & weights,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
         Float64 l2_reg_coef,
         Float64 target,
@@ -122,12 +125,9 @@ public:
         size_t row_num);
 
     /// Updates current weights according to the gradient from the last mini-batch
-    virtual void update(
-        UInt64 batch_size,
-        std::vector<Float64> & weights,
-        Float64 & bias,
-        Float64 learning_rate,
-        const std::vector<Float64> & gradient) = 0;
+    virtual void
+    update(UInt64 batch_size, VectorWithMemoryTracking<Float64> & weights, Float64 & bias, Float64 learning_rate, const VectorWithMemoryTracking<Float64> & gradient)
+        = 0;
 
     /// Used during the merge of two states
     virtual void merge(const IWeightsUpdater &, Float64, Float64) {}
@@ -143,84 +143,111 @@ public:
 class StochasticGradientDescent : public IWeightsUpdater
 {
 public:
-    void update(UInt64 batch_size, std::vector<Float64> & weights, Float64 & bias, Float64 learning_rate, const std::vector<Float64> & batch_gradient) override;
+    void update(
+        UInt64 batch_size,
+        VectorWithMemoryTracking<Float64> & weights,
+        Float64 & bias,
+        Float64 learning_rate,
+        const VectorWithMemoryTracking<Float64> & batch_gradient) override;
 };
 
 
 class Momentum : public IWeightsUpdater
 {
 public:
-    Momentum() {}
 
-    Momentum(Float64 alpha) : alpha_(alpha) {}
+    explicit Momentum(size_t num_params, Float64 alpha_ = 0.1) : alpha(alpha_)
+    {
+        accumulated_gradient.resize(num_params + 1, 0);
+    }
 
-    void update(UInt64 batch_size, std::vector<Float64> & weights, Float64 & bias, Float64 learning_rate, const std::vector<Float64> & batch_gradient) override;
+    void update(
+        UInt64 batch_size,
+        VectorWithMemoryTracking<Float64> & weights,
+        Float64 & bias,
+        Float64 learning_rate,
+        const VectorWithMemoryTracking<Float64> & batch_gradient) override;
 
-    virtual void merge(const IWeightsUpdater & rhs, Float64 frac, Float64 rhs_frac) override;
+    void merge(const IWeightsUpdater & rhs, Float64 frac, Float64 rhs_frac) override;
 
     void write(WriteBuffer & buf) const override;
 
     void read(ReadBuffer & buf) override;
 
 private:
-    Float64 alpha_{0.1};
-    std::vector<Float64> accumulated_gradient;
+    Float64 alpha{0.1};
+    VectorWithMemoryTracking<Float64> accumulated_gradient;
 };
 
 
 class Nesterov : public IWeightsUpdater
 {
 public:
-    Nesterov() {}
-
-    Nesterov(Float64 alpha) : alpha_(alpha) {}
+    explicit Nesterov(size_t num_params, Float64 alpha_ = 0.9) : alpha(alpha_)
+    {
+        accumulated_gradient.resize(num_params + 1, 0);
+    }
 
     void addToBatch(
-        std::vector<Float64> & batch_gradient,
+        VectorWithMemoryTracking<Float64> & batch_gradient,
         IGradientComputer & gradient_computer,
-        const std::vector<Float64> & weights,
+        const VectorWithMemoryTracking<Float64> & weights,
         Float64 bias,
         Float64 l2_reg_coef,
         Float64 target,
         const IColumn ** columns,
         size_t row_num) override;
 
-    void update(UInt64 batch_size, std::vector<Float64> & weights, Float64 & bias, Float64 learning_rate, const std::vector<Float64> & batch_gradient) override;
+    void update(
+        UInt64 batch_size,
+        VectorWithMemoryTracking<Float64> & weights,
+        Float64 & bias,
+        Float64 learning_rate,
+        const VectorWithMemoryTracking<Float64> & batch_gradient) override;
 
-    virtual void merge(const IWeightsUpdater & rhs, Float64 frac, Float64 rhs_frac) override;
+    void merge(const IWeightsUpdater & rhs, Float64 frac, Float64 rhs_frac) override;
 
     void write(WriteBuffer & buf) const override;
 
     void read(ReadBuffer & buf) override;
 
 private:
-    const Float64 alpha_ = 0.9;
-    std::vector<Float64> accumulated_gradient;
+    const Float64 alpha = 0.9;
+    VectorWithMemoryTracking<Float64> accumulated_gradient;
 };
 
 
 class Adam : public IWeightsUpdater
 {
 public:
-    Adam()
+    explicit Adam(size_t num_params)
     {
-        beta1_powered_ = beta1_;
-        beta2_powered_ = beta2_;
+        beta1_powered = beta1;
+        beta2_powered = beta2;
+
+
+        average_gradient.resize(num_params + 1, 0);
+        average_squared_gradient.resize(num_params + 1, 0);
     }
 
     void addToBatch(
-            std::vector<Float64> & batch_gradient,
-            IGradientComputer & gradient_computer,
-            const std::vector<Float64> & weights,
-            Float64 bias,
-            Float64 l2_reg_coef,
-            Float64 target,
-            const IColumn ** columns,
-            size_t row_num) override;
+        VectorWithMemoryTracking<Float64> & batch_gradient,
+        IGradientComputer & gradient_computer,
+        const VectorWithMemoryTracking<Float64> & weights,
+        Float64 bias,
+        Float64 l2_reg_coef,
+        Float64 target,
+        const IColumn ** columns,
+        size_t row_num) override;
 
-    void update(UInt64 batch_size, std::vector<Float64> & weights, Float64 & bias, Float64 learning_rate, const std::vector<Float64> & batch_gradient) override;
+    void update(
+        UInt64 batch_size,
+        VectorWithMemoryTracking<Float64> & weights,
+        Float64 & bias,
+        Float64 learning_rate,
+        const VectorWithMemoryTracking<Float64> & batch_gradient) override;
 
-    virtual void merge(const IWeightsUpdater & rhs, Float64 frac, Float64 rhs_frac) override;
+    void merge(const IWeightsUpdater & rhs, Float64 frac, Float64 rhs_frac) override;
 
     void write(WriteBuffer & buf) const override;
 
@@ -228,14 +255,14 @@ public:
 
 private:
     /// beta1 and beta2 hyperparameters have such recommended values
-    const Float64 beta1_ = 0.9;
-    const Float64 beta2_ = 0.999;
-    const Float64 eps_ = 0.000001;
-    Float64 beta1_powered_;
-    Float64 beta2_powered_;
+    const Float64 beta1 = 0.9;
+    const Float64 beta2 = 0.999;
+    const Float64 eps = 0.000001;
+    Float64 beta1_powered;
+    Float64 beta2_powered;
 
-    std::vector<Float64> average_gradient;
-    std::vector<Float64> average_squared_gradient;
+    VectorWithMemoryTracking<Float64> average_gradient;
+    VectorWithMemoryTracking<Float64> average_squared_gradient;
 };
 
 
@@ -244,7 +271,7 @@ private:
 class LinearModelData
 {
 public:
-    LinearModelData() {}
+    LinearModelData() = default;
 
     LinearModelData(
         Float64 learning_rate_,
@@ -264,15 +291,14 @@ public:
 
     void predict(
         ColumnVector<Float64>::Container & container,
-        Block & block,
+        const ColumnsWithTypeAndName & arguments,
         size_t offset,
         size_t limit,
-        const ColumnNumbers & arguments,
-        const Context & context) const;
+        ContextPtr context) const;
 
     void returnWeights(IColumn & to) const;
 private:
-    std::vector<Float64> weights;
+    VectorWithMemoryTracking<Float64> weights;
     Float64 bias{0.0};
 
     Float64 learning_rate;
@@ -280,7 +306,7 @@ private:
     UInt64 batch_capacity;
 
     UInt64 iter_num = 0;
-    std::vector<Float64> gradient_batch;
+    VectorWithMemoryTracking<Float64> gradient_batch;
     UInt64 batch_size;
 
     std::shared_ptr<IGradientComputer> gradient_computer;
@@ -311,7 +337,7 @@ public:
         UInt64 batch_size_,
         const DataTypes & arguments_types,
         const Array & params)
-        : IAggregateFunctionDataHelper<Data, AggregateFunctionMLMethod<Data, Name>>(arguments_types, params)
+        : IAggregateFunctionDataHelper<Data, AggregateFunctionMLMethod<Data, Name>>(arguments_types, params, createResultType())
         , param_num(param_num_)
         , learning_rate(learning_rate_)
         , l2_reg_coef(l2_reg_coef_)
@@ -321,11 +347,12 @@ public:
     {
     }
 
-    /// This function is called when SELECT linearRegression(...) is called
-    DataTypePtr getReturnType() const override
+    static DataTypePtr createResultType()
     {
         return std::make_shared<DataTypeArray>(std::make_shared<DataTypeFloat64>());
     }
+
+    bool allocatesMemoryInArena() const override { return false; }
 
     /// This function is called from evalMLMethod function for correct predictValues call
     DataTypePtr getReturnTypeToPredict() const override
@@ -333,62 +360,60 @@ public:
         return std::make_shared<DataTypeNumber<Float64>>();
     }
 
-    void create(AggregateDataPtr place) const override
+    void create(AggregateDataPtr __restrict place) const override /// NOLINT
     {
         std::shared_ptr<IWeightsUpdater> new_weights_updater;
         if (weights_updater_name == "SGD")
             new_weights_updater = std::make_shared<StochasticGradientDescent>();
         else if (weights_updater_name == "Momentum")
-            new_weights_updater = std::make_shared<Momentum>();
+            new_weights_updater = std::make_shared<Momentum>(param_num);
         else if (weights_updater_name == "Nesterov")
-            new_weights_updater = std::make_shared<Nesterov>();
+            new_weights_updater = std::make_shared<Nesterov>(param_num);
         else if (weights_updater_name == "Adam")
-            new_weights_updater = std::make_shared<Adam>();
+            new_weights_updater = std::make_shared<Adam>(param_num);
         else
-            throw Exception("Illegal name of weights updater (should have been checked earlier)", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Illegal name of weights updater (should have been checked earlier)");
 
         new (place) Data(learning_rate, l2_reg_coef, param_num, batch_size, gradient_computer, new_weights_updater);
     }
 
-    void add(AggregateDataPtr place, const IColumn ** columns, size_t row_num, Arena *) const override
+    void add(AggregateDataPtr __restrict place, const IColumn ** columns, size_t row_num, Arena *) const override
     {
         this->data(place).add(columns, row_num);
     }
 
-    void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena *) const override { this->data(place).merge(this->data(rhs)); }
+    void merge(AggregateDataPtr __restrict place, ConstAggregateDataPtr rhs, Arena *) const override { this->data(place).merge(this->data(rhs)); }
 
-    void serialize(ConstAggregateDataPtr place, WriteBuffer & buf) const override { this->data(place).write(buf); }
+    void serialize(ConstAggregateDataPtr __restrict place, WriteBuffer & buf, std::optional<size_t> /* version */) const override { this->data(place).write(buf); }
 
-    void deserialize(AggregateDataPtr place, ReadBuffer & buf, Arena *) const override { this->data(place).read(buf); }
+    void deserialize(AggregateDataPtr __restrict place, ReadBuffer & buf, std::optional<size_t> /* version */, Arena *) const override { this->data(place).read(buf); }
 
     void predictValues(
-        ConstAggregateDataPtr place,
+        ConstAggregateDataPtr __restrict place,
         IColumn & to,
-        Block & block,
+        const ColumnsWithTypeAndName & arguments,
         size_t offset,
         size_t limit,
-        const ColumnNumbers & arguments,
-        const Context & context) const override
+        ContextPtr context) const override
     {
         if (arguments.size() != param_num + 1)
-            throw Exception(
-                "Predict got incorrect number of arguments. Got: " + std::to_string(arguments.size())
-                    + ". Required: " + std::to_string(param_num + 1),
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                "Predict got incorrect number of arguments. Got: {}. Required: {}",
+                arguments.size(), param_num + 1);
 
         /// This cast might be correct because column type is based on getReturnTypeToPredict.
         auto * column = typeid_cast<ColumnFloat64 *>(&to);
         if (!column)
-            throw Exception("Cast of column of predictions is incorrect. getReturnTypeToPredict must return same value as it is casted to",
-                            ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cast of column of predictions is incorrect. "
+                            "getReturnTypeToPredict must return same value as it is cast to");
 
-        this->data(place).predict(column->getData(), block, offset, limit, arguments, context);
+        this->data(place).predict(column->getData(), arguments, offset, limit, context);
     }
 
     /** This function is called if aggregate function without State modifier is selected in a query.
      *  Inserts all weights of the model into the column 'to', so user may use such information if needed
      */
-    void insertResultInto(AggregateDataPtr place, IColumn & to, Arena *) const override
+    void insertResultInto(AggregateDataPtr __restrict place, IColumn & to, Arena *) const override
     {
         this->data(place).returnWeights(to);
     }

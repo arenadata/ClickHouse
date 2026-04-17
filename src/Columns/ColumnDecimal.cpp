@@ -1,20 +1,34 @@
 #include <Common/Exception.h>
-#include <Common/Arena.h>
-#include <Common/SipHash.h>
-#include <Common/assert_cast.h>
-#include <Common/WeakHash.h>
+#include <Common/FieldVisitorToString.h>
+#include <Common/HashTable/HashSet.h>
 #include <Common/HashTable/Hash.h>
+#include <Common/RadixSort.h>
+#include <Common/SipHash.h>
+#include <Common/WeakHash.h>
+#include <Common/assert_cast.h>
+#include <Common/iota.h>
 
-#include <common/unaligned.h>
+#include <Core/DecimalFunctions.h>
+#include <Core/TypeId.h>
 
+#include <IO/Operators.h>
 #include <IO/WriteHelpers.h>
 
 #include <Columns/ColumnsCommon.h>
 #include <Columns/ColumnDecimal.h>
-#include <DataStreams/ColumnGathererStream.h>
+#include <Columns/ColumnCompressed.h>
+#include <Columns/IColumnImpl.h>
+#include <Columns/MaskOperations.h>
+#include <Columns/RadixSortHelper.h>
 
 
-template <typename T> bool decimalLess(T x, T y, UInt32 x_scale, UInt32 y_scale);
+#include <Processors/Transforms/ColumnGathererTransform.h>
+
+#include <base/TypeName.h>
+#include <base/sort.h>
+
+#include <algorithm>
+
 
 namespace DB
 {
@@ -24,11 +38,35 @@ namespace ErrorCodes
     extern const int PARAMETER_OUT_OF_BOUND;
     extern const int SIZES_OF_COLUMNS_DOESNT_MATCH;
     extern const int NOT_IMPLEMENTED;
-    extern const int LOGICAL_ERROR;
 }
 
-template <typename T>
+template <is_decimal T>
+const char * ColumnDecimal<T>::getFamilyName() const
+{
+    return TypeName<T>.data();
+}
+
+template <is_decimal T>
+TypeIndex ColumnDecimal<T>::getDataType() const
+{
+    return TypeToTypeIndex<T>;
+}
+
+template <is_decimal T>
+std::span<char> ColumnDecimal<T>::insertRawUninitialized(size_t count)
+{
+    size_t start = data.size();
+    data.resize(start + count);
+    return {reinterpret_cast<char *>(data.data() + start), count * sizeof(T)};
+}
+
+
+template <is_decimal T>
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
 int ColumnDecimal<T>::compareAt(size_t n, size_t m, const IColumn & rhs_, int) const
+#else
+int ColumnDecimal<T>::doCompareAt(size_t n, size_t m, const IColumn & rhs_, int) const
+#endif
 {
     auto & other = static_cast<const Self &>(rhs_);
     const T & a = data[n];
@@ -39,52 +77,52 @@ int ColumnDecimal<T>::compareAt(size_t n, size_t m, const IColumn & rhs_, int) c
     return decimalLess<T>(b, a, other.scale, scale) ? 1 : (decimalLess<T>(a, b, scale, other.scale) ? -1 : 0);
 }
 
-template <typename T>
-void ColumnDecimal<T>::compareColumn(const IColumn & rhs, size_t rhs_row_num,
-                                     PaddedPODArray<UInt64> * row_indexes, PaddedPODArray<Int8> & compare_results,
-                                     int direction, int nan_direction_hint) const
+template <is_decimal T>
+Float64 ColumnDecimal<T>::getFloat64(size_t n) const
 {
-    return this->template doCompareColumn<ColumnDecimal<T>>(static_cast<const Self &>(rhs), rhs_row_num, row_indexes,
-                                                         compare_results, direction, nan_direction_hint);
+    return DecimalUtils::convertTo<Float64>(data[n], scale);
 }
 
-template <typename T>
-StringRef ColumnDecimal<T>::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const
+template <is_decimal T>
+void ColumnDecimal<T>::deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings *)
 {
-    auto * pos = arena.allocContinue(sizeof(T), begin);
-    memcpy(pos, &data[n], sizeof(T));
-    return StringRef(pos, sizeof(T));
+    T dec;
+    readBinaryLittleEndian(dec, in);
+    data.push_back(std::move(dec));
 }
 
-template <typename T>
-const char * ColumnDecimal<T>::deserializeAndInsertFromArena(const char * pos)
+template <is_decimal T>
+void ColumnDecimal<T>::skipSerializedInArena(ReadBuffer & in) const
 {
-    data.push_back(unalignedLoad<T>(pos));
-    return pos + sizeof(T);
+    in.ignore(sizeof(T));
 }
 
-template <typename T>
-UInt64 ColumnDecimal<T>::get64(size_t n) const
+template <is_decimal T>
+UInt64 ColumnDecimal<T>::get64([[maybe_unused]] size_t n) const
 {
     if constexpr (sizeof(T) > sizeof(UInt64))
-        throw Exception(String("Method get64 is not supported for ") + getFamilyName(), ErrorCodes::NOT_IMPLEMENTED);
-    return static_cast<typename T::NativeType>(data[n]);
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method get64 is not supported for {}", getFamilyName());
+    else
+        return static_cast<NativeT>(data[n]);
 }
 
-template <typename T>
+template <is_decimal T>
 void ColumnDecimal<T>::updateHashWithValue(size_t n, SipHash & hash) const
 {
-    hash.update(data[n]);
+    hash.update(data[n].value);
 }
 
-template <typename T>
-void ColumnDecimal<T>::updateWeakHash32(WeakHash32 & hash) const
+template <is_decimal T>
+void ColumnDecimal<T>::updateHashWithValueRange(size_t begin, size_t end, SipHash & hash) const
+{
+    hash.update(reinterpret_cast<const char *>(&data[begin]), (end - begin) * sizeof(T));
+}
+
+template <is_decimal T>
+WeakHash32 ColumnDecimal<T>::getWeakHash32() const
 {
     auto s = data.size();
-
-    if (hash.getData().size() != s)
-        throw Exception("Size of WeakHash32 does not match size of column: column size is " + std::to_string(s) +
-                        ", hash size is " + std::to_string(hash.getData().size()), ErrorCodes::LOGICAL_ERROR);
+    WeakHash32 hash(s);
 
     const T * begin = data.data();
     const T * end = begin + s;
@@ -92,124 +130,218 @@ void ColumnDecimal<T>::updateWeakHash32(WeakHash32 & hash) const
 
     while (begin < end)
     {
-        *hash_data = intHashCRC32(*begin, *hash_data);
+        *hash_data = static_cast<UInt32>(intHashCRC32(*begin, *hash_data));
         ++begin;
         ++hash_data;
     }
+
+    return hash;
 }
 
-template <typename T>
+template <is_decimal T>
 void ColumnDecimal<T>::updateHashFast(SipHash & hash) const
 {
     hash.update(reinterpret_cast<const char *>(data.data()), size() * sizeof(data[0]));
 }
 
-template <typename T>
-void ColumnDecimal<T>::getPermutation(bool reverse, size_t limit, int , IColumn::Permutation & res) const
+template <is_decimal T>
+void ColumnDecimal<T>::getPermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                                    size_t limit, int, IColumn::Permutation & res) const
 {
-#if 1 /// TODO: perf test
-    if (data.size() <= std::numeric_limits<UInt32>::max())
+    auto comparator_ascending = [this](size_t lhs, size_t rhs) { return data[lhs] < data[rhs]; };
+    auto comparator_ascending_stable = [this](size_t lhs, size_t rhs)
     {
-        PaddedPODArray<UInt32> tmp_res;
-        permutation(reverse, limit, tmp_res);
+        if (unlikely(data[lhs] == data[rhs]))
+            return lhs < rhs;
 
-        res.resize(tmp_res.size());
-        for (size_t i = 0; i < tmp_res.size(); ++i)
-            res[i] = tmp_res[i];
-        return;
-    }
-#endif
+        return data[lhs] < data[rhs];
+    };
+    auto comparator_descending = [this](size_t lhs, size_t rhs) { return data[lhs] > data[rhs]; };
+    auto comparator_descending_stable = [this](size_t lhs, size_t rhs)
+    {
+        if (unlikely(data[lhs] == data[rhs]))
+            return lhs < rhs;
 
-    permutation(reverse, limit, res);
-}
+        return data[lhs] > data[rhs];
+    };
 
-template <typename T>
-void ColumnDecimal<T>::updatePermutation(bool reverse, size_t limit, int, IColumn::Permutation & res, EqualRanges & equal_range) const
-{
-    if (limit >= data.size() || limit >= equal_range.back().second)
+    size_t data_size = data.size();
+    res.resize_exact(data_size);
+
+    if (limit >= data_size)
         limit = 0;
 
-    size_t n = equal_range.size();
-    if (limit)
-        --n;
+    iota(res.data(), data_size, IColumn::Permutation::value_type(0));
 
-    EqualRanges new_ranges;
-    for (size_t i = 0; i < n; ++i)
+    if constexpr (is_arithmetic_v<NativeT> && !is_big_int_v<NativeT>)
     {
-        const auto& [first, last] = equal_range[i];
-        if (reverse)
-            std::partial_sort(res.begin() + first, res.begin() + last, res.begin() + last,
-                [this](size_t a, size_t b) { return data[a] > data[b]; });
-        else
-            std::partial_sort(res.begin() + first, res.begin() + last, res.begin() + last,
-                [this](size_t a, size_t b) { return data[a] < data[b]; });
-        auto new_first = first;
-        for (auto j = first + 1; j < last; ++j)
+        if (!limit)
         {
-            if (data[res[new_first]] != data[res[j]])
-            {
-                if (j - new_first > 1)
-                    new_ranges.emplace_back(new_first, j);
+            /// A case for radix sort
+            /// LSD RadixSort is stable
 
-                new_first = j;
+            bool reverse = direction == IColumn::PermutationSortDirection::Descending;
+            bool ascending = direction == IColumn::PermutationSortDirection::Ascending;
+            bool sort_is_stable = stability == IColumn::PermutationSortStability::Stable;
+
+            /// TODO: LSD RadixSort is currently not stable if direction is descending
+            bool use_radix_sort = (sort_is_stable && ascending) || !sort_is_stable;
+
+            /// Thresholds on size. Lower threshold is arbitrary. Upper threshold is chosen by the type for histogram counters.
+            if (data_size >= 256 && data_size <= std::numeric_limits<UInt32>::max() && use_radix_sort)
+            {
+                iota(res.data(), data_size, IColumn::Permutation::value_type(0));
+
+                bool try_sort = false;
+
+                if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Unstable)
+                    try_sort = trySort(res.begin(), res.end(), comparator_ascending);
+                else if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Stable)
+                    try_sort = trySort(res.begin(), res.end(), comparator_ascending_stable);
+                else if (direction == IColumn::PermutationSortDirection::Descending && stability == IColumn::PermutationSortStability::Unstable)
+                    try_sort = trySort(res.begin(), res.end(), comparator_descending);
+                else
+                    try_sort = trySort(res.begin(), res.end(), comparator_descending_stable);
+
+                if (try_sort)
+                    return;
+
+                PaddedPODArray<ValueWithIndex<NativeT>> pairs(data_size);
+                for (UInt32 i = 0; i < static_cast<UInt32>(data_size); ++i)
+                    pairs[i] = {data[i].value, i};
+
+                RadixSort<RadixSortTraits<NativeT>>::executeLSD(pairs.data(), data_size, reverse, res.data());
+                return;
             }
         }
-        if (last - new_first > 1)
-            new_ranges.emplace_back(new_first, last);
     }
 
-    if (limit)
-    {
-        const auto& [first, last] = equal_range.back();
-        if (reverse)
-            std::partial_sort(res.begin() + first, res.begin() + limit, res.begin() + last,
-                [this](size_t a, size_t b) { return data[a] > data[b]; });
-        else
-            std::partial_sort(res.begin() + first, res.begin() + limit, res.begin() + last,
-                [this](size_t a, size_t b) { return data[a] < data[b]; });
-        auto new_first = first;
-        for (auto j = first + 1; j < limit; ++j)
-        {
-            if (data[res[new_first]] != data[res[j]])
-            {
-                if (j - new_first > 1)
-                    new_ranges.emplace_back(new_first, j);
-
-                new_first = j;
-            }
-        }
-        auto new_last = limit;
-        for (auto j = limit; j < last; ++j)
-        {
-            if (data[res[new_first]] == data[res[j]])
-            {
-                std::swap(res[new_last], res[j]);
-                ++new_last;
-            }
-        }
-        if (new_last - new_first > 1)
-            new_ranges.emplace_back(new_first, new_last);
-    }
-    equal_range = std::move(new_ranges);
+    if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Unstable)
+        this->getPermutationImpl(limit, res, comparator_ascending, DefaultSort(), DefaultPartialSort());
+    else if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Stable)
+        this->getPermutationImpl(limit, res, comparator_ascending_stable, DefaultSort(), DefaultPartialSort());
+    else if (direction == IColumn::PermutationSortDirection::Descending && stability == IColumn::PermutationSortStability::Unstable)
+        this->getPermutationImpl(limit, res, comparator_descending, DefaultSort(), DefaultPartialSort());
+    else
+        this->getPermutationImpl(limit, res, comparator_descending_stable, DefaultSort(), DefaultPartialSort());
 }
 
-template <typename T>
+template <is_decimal T>
+void ColumnDecimal<T>::updatePermutation(IColumn::PermutationSortDirection direction, IColumn::PermutationSortStability stability,
+                                        size_t limit, int, IColumn::Permutation & res, EqualRanges & equal_ranges) const
+{
+    auto comparator_descending = [this](size_t lhs, size_t rhs) { return data[lhs] > data[rhs]; };
+    auto comparator_descending_stable = [this](size_t lhs, size_t rhs)
+    {
+        if (unlikely(data[lhs] == data[rhs]))
+            return lhs < rhs;
+
+        return data[lhs] > data[rhs];
+    };
+
+    auto comparator_ascending = [this](size_t lhs, size_t rhs) { return data[lhs] < data[rhs]; };
+    auto comparator_ascending_stable = [this](size_t lhs, size_t rhs)
+    {
+        if (unlikely(data[lhs] == data[rhs]))
+            return lhs < rhs;
+
+        return data[lhs] < data[rhs];
+    };
+    auto equals_comparator = [this](size_t lhs, size_t rhs) { return data[lhs] == data[rhs]; };
+    auto sort = [&](auto begin, auto end, auto pred)
+    {
+        bool reverse = direction == IColumn::PermutationSortDirection::Descending;
+        bool ascending = direction == IColumn::PermutationSortDirection::Ascending;
+        bool sort_is_stable = stability == IColumn::PermutationSortStability::Stable;
+
+        /// TODO: LSD RadixSort is currently not stable if direction is descending
+        bool use_radix_sort = (sort_is_stable && ascending) || !sort_is_stable;
+        size_t size = end - begin;
+
+        if (size >= 256 && size <= std::numeric_limits<UInt32>::max() && use_radix_sort)
+        {
+            bool try_sort = trySort(begin, end, pred);
+            if (try_sort)
+                return;
+
+            PaddedPODArray<ValueWithIndex<NativeT>> pairs(size);
+            size_t index = 0;
+
+            for (auto * it = begin; it != end; ++it)
+            {
+                pairs[index] = {data[*it].value, static_cast<UInt32>(*it)};
+                ++index;
+            }
+
+            RadixSort<RadixSortTraits<NativeT>>::executeLSD(pairs.data(), size, reverse, begin);
+            return;
+        }
+
+        ::sort(begin, end, pred);
+    };
+    auto partial_sort = [](auto begin, auto mid, auto end, auto pred) { ::partial_sort(begin, mid, end, pred); };
+
+    if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Unstable)
+    {
+        this->updatePermutationImpl(
+            limit, res, equal_ranges,
+            comparator_ascending,
+            equals_comparator, sort, partial_sort);
+    }
+    else if (direction == IColumn::PermutationSortDirection::Ascending && stability == IColumn::PermutationSortStability::Stable)
+    {
+        this->updatePermutationImpl(
+            limit, res, equal_ranges,
+            comparator_ascending_stable,
+            equals_comparator, sort, partial_sort);
+    }
+    else if (direction == IColumn::PermutationSortDirection::Descending && stability == IColumn::PermutationSortStability::Unstable)
+    {
+        this->updatePermutationImpl(
+            limit, res, equal_ranges,
+            comparator_descending,
+            equals_comparator, sort, partial_sort);
+    }
+    else
+    {
+        this->updatePermutationImpl(
+            limit, res, equal_ranges,
+            comparator_descending_stable,
+            equals_comparator, sort, partial_sort);
+    }
+}
+
+template <is_decimal T>
+size_t ColumnDecimal<T>::estimateCardinalityInPermutedRange(const IColumn::Permutation & permutation, const EqualRange & equal_range) const
+{
+    const size_t range_size = equal_range.size();
+    if (range_size <= 1)
+        return range_size;
+
+    /// TODO use sampling if the range is too large (e.g. 16k elements, but configurable)
+    HashSet<T> elements;
+    for (size_t i = equal_range.from; i < equal_range.to; ++i)
+    {
+        size_t permuted_i = permutation[i];
+        elements.insert(data[permuted_i]);
+    }
+    return elements.size();
+}
+
+template <is_decimal T>
+void ColumnDecimal<T>::getValueNameImpl(WriteBufferFromOwnString & name_buf, size_t n, const IColumn::Options &options) const
+{
+    if (options.notFull(name_buf))
+        name_buf << FieldVisitorToString()(data[n], scale);
+}
+
+template <is_decimal T>
 ColumnPtr ColumnDecimal<T>::permute(const IColumn::Permutation & perm, size_t limit) const
 {
-    size_t size = limit ? std::min(data.size(), limit) : data.size();
-    if (perm.size() < size)
-        throw Exception("Size of permutation is less than required.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
-
-    auto res = this->create(size, scale);
-    typename Self::Container & res_data = res->getData();
-
-    for (size_t i = 0; i < size; ++i)
-        res_data[i] = data[perm[i]];
-
-    return res;
+    return permuteImpl(*this, perm, limit);
 }
 
-template <typename T>
+template <is_decimal T>
 MutableColumnPtr ColumnDecimal<T>::cloneResized(size_t size) const
 {
     auto res = this->create(0, scale);
@@ -217,9 +349,10 @@ MutableColumnPtr ColumnDecimal<T>::cloneResized(size_t size) const
     if (size > 0)
     {
         auto & new_col = static_cast<Self &>(*res);
-        new_col.data.resize(size);
+        new_col.data.resize_exact(size);
 
         size_t count = std::min(this->size(), size);
+
         memcpy(new_col.data.data(), data.data(), count * sizeof(data[0]));
 
         if (size > count)
@@ -232,7 +365,17 @@ MutableColumnPtr ColumnDecimal<T>::cloneResized(size_t size) const
     return res;
 }
 
-template <typename T>
+template <is_decimal T>
+bool ColumnDecimal<T>::tryInsert(const Field & x)
+{
+    DecimalField<T> value;
+    if (!x.tryGet<DecimalField<T>>(value))
+        return false;
+    data.push_back(value);
+    return true;
+}
+
+template <is_decimal T>
 void ColumnDecimal<T>::insertData(const char * src, size_t /*length*/)
 {
     T tmp;
@@ -240,37 +383,76 @@ void ColumnDecimal<T>::insertData(const char * src, size_t /*length*/)
     data.emplace_back(tmp);
 }
 
-template <typename T>
+template <is_decimal T>
+#if !defined(DEBUG_OR_SANITIZER_BUILD)
 void ColumnDecimal<T>::insertRangeFrom(const IColumn & src, size_t start, size_t length)
+#else
+void ColumnDecimal<T>::doInsertRangeFrom(const IColumn & src, size_t start, size_t length)
+#endif
 {
     const ColumnDecimal & src_vec = assert_cast<const ColumnDecimal &>(src);
 
     if (start + length > src_vec.data.size())
-        throw Exception("Parameters start = " + toString(start) + ", length = " + toString(length) +
-            " are out of bound in ColumnDecimal<T>::insertRangeFrom method (data.size() = " + toString(src_vec.data.size()) + ").",
-            ErrorCodes::PARAMETER_OUT_OF_BOUND);
+        throw Exception(ErrorCodes::PARAMETER_OUT_OF_BOUND, "Parameters start = {}, length = {} are out of bound "
+                        "in ColumnDecimal<T>::insertRangeFrom method (data.size() = {}).",
+                        toString(start), toString(length), toString(src_vec.data.size()));
 
     size_t old_size = data.size();
     data.resize(old_size + length);
+
     memcpy(data.data() + old_size, &src_vec.data[start], length * sizeof(data[0]));
 }
 
-template <typename T>
+template <is_decimal T>
 ColumnPtr ColumnDecimal<T>::filter(const IColumn::Filter & filt, ssize_t result_size_hint) const
 {
     size_t size = data.size();
     if (size != filt.size())
-        throw Exception("Size of filter doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of filter ({}) doesn't match size of column ({})", filt.size(), size);
 
     auto res = this->create(0, scale);
     Container & res_data = res->getData();
 
     if (result_size_hint)
-        res_data.reserve(result_size_hint > 0 ? result_size_hint : size);
+        res_data.reserve_exact(result_size_hint > 0 ? result_size_hint : size);
 
     const UInt8 * filt_pos = filt.data();
     const UInt8 * filt_end = filt_pos + size;
     const T * data_pos = data.data();
+
+    /** A slightly more optimized version.
+    * Based on the assumption that often pieces of consecutive values
+    *  completely pass or do not pass the filter.
+    * Therefore, we will optimistically check the parts of `SIMD_BYTES` values.
+    */
+    static constexpr size_t SIMD_BYTES = 64;
+    const UInt8 * filt_end_aligned = filt_pos + size / SIMD_BYTES * SIMD_BYTES;
+
+    while (filt_pos < filt_end_aligned)
+    {
+        UInt64 mask = bytes64MaskToBits64Mask(filt_pos);
+
+        if (0xffffffffffffffff == mask)
+        {
+            res_data.insert(data_pos, data_pos + SIMD_BYTES);
+        }
+        else
+        {
+            while (mask)
+            {
+                size_t index = std::countr_zero(mask);
+                res_data.push_back(data_pos[index]);
+            #ifdef __BMI__
+                mask = _blsr_u64(mask);
+            #else
+                mask = mask & (mask-1);
+            #endif
+            }
+        }
+
+        filt_pos += SIMD_BYTES;
+        data_pos += SIMD_BYTES;
+    }
 
     while (filt_pos < filt_end)
     {
@@ -284,71 +466,171 @@ ColumnPtr ColumnDecimal<T>::filter(const IColumn::Filter & filt, ssize_t result_
     return res;
 }
 
-template <typename T>
+template <is_decimal T>
+void ColumnDecimal<T>::filter(const IColumn::Filter & filt)
+{
+    size_t size = data.size();
+    if (size != filt.size())
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of filter ({}) doesn't match size of column ({})", filt.size(), size);
+
+    const UInt8 * filt_pos = filt.data();
+    const UInt8 * filt_end = filt_pos + size;
+    const T * data_pos = data.data();
+    T * res_data = data.data();
+    size_t res_size = 0;
+
+    /** A slightly more optimized version.
+    * Based on the assumption that often pieces of consecutive values
+    *  completely pass or do not pass the filter.
+    * Therefore, we will optimistically check the parts of `SIMD_BYTES` values.
+    */
+    static constexpr size_t SIMD_BYTES = 64;
+    const UInt8 * filt_end_aligned = filt_pos + size / SIMD_BYTES * SIMD_BYTES;
+
+    while (filt_pos < filt_end_aligned)
+    {
+        UInt64 mask = bytes64MaskToBits64Mask(filt_pos);
+
+        if (0xffffffffffffffff == mask)
+        {
+            memmove(res_data + res_size, data_pos, SIMD_BYTES * sizeof(T));
+            res_size += SIMD_BYTES;
+        }
+        else
+        {
+            while (mask)
+            {
+                size_t index = std::countr_zero(mask);
+                res_data[res_size++] = data_pos[index];
+            #ifdef __BMI__
+                mask = _blsr_u64(mask);
+            #else
+                mask = mask & (mask-1);
+            #endif
+            }
+        }
+
+        filt_pos += SIMD_BYTES;
+        data_pos += SIMD_BYTES;
+    }
+
+    while (filt_pos < filt_end)
+    {
+        if (*filt_pos)
+            res_data[res_size++] = *data_pos;
+
+        ++filt_pos;
+        ++data_pos;
+    }
+
+    data.resize_assume_reserved(res_size);
+}
+
+template <is_decimal T>
+void ColumnDecimal<T>::expand(const IColumn::Filter & mask, bool inverted)
+{
+    expandDataByMask<T>(data, mask, inverted);
+}
+
+template <is_decimal T>
 ColumnPtr ColumnDecimal<T>::index(const IColumn & indexes, size_t limit) const
 {
     return selectIndexImpl(*this, indexes, limit);
 }
 
-template <typename T>
+template <is_decimal T>
 ColumnPtr ColumnDecimal<T>::replicate(const IColumn::Offsets & offsets) const
 {
     size_t size = data.size();
     if (size != offsets.size())
-        throw Exception("Size of offsets doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+        throw Exception(ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH, "Size of offsets doesn't match size of column.");
 
     auto res = this->create(0, scale);
-    if (0 == size)
+    if (size == 0 || offsets.back() == 0)
         return res;
 
     typename Self::Container & res_data = res->getData();
-    res_data.reserve(offsets.back());
+    res_data.resize_exact(offsets.back());
+
+    const T * src = data.data();
+    T * dst = res_data.data();
 
     IColumn::Offset prev_offset = 0;
     for (size_t i = 0; i < size; ++i)
     {
-        size_t size_to_replicate = offsets[i] - prev_offset;
+        size_t count = offsets[i] - prev_offset;
         prev_offset = offsets[i];
 
-        for (size_t j = 0; j < size_to_replicate; ++j)
-            res_data.push_back(data[i]);
+        std::fill_n(dst, count, src[i]);
+        dst += count;
     }
 
     return res;
 }
 
-template <typename T>
-void ColumnDecimal<T>::gather(ColumnGathererStream & gatherer)
+template <is_decimal T>
+ColumnPtr ColumnDecimal<T>::compress(bool force_compression) const
 {
-    gatherer.gather(*this);
+    const size_t data_size = data.size();
+    const size_t source_size = data_size * sizeof(T);
+
+    /// Don't compress small blocks.
+    if (source_size < 4096) /// A wild guess.
+        return ColumnCompressed::wrap(this->getPtr());
+
+    auto compressed = ColumnCompressed::compressBuffer(data.data(), source_size, force_compression);
+
+    if (!compressed)
+        return ColumnCompressed::wrap(this->getPtr());
+
+    const size_t compressed_size = compressed->size();
+    return ColumnCompressed::create(data_size, compressed_size,
+        [my_compressed = std::move(compressed), column_size = data_size, my_scale = this->scale]
+        {
+            auto res = ColumnDecimal<T>::create(column_size, my_scale);
+            ColumnCompressed::decompressBuffer(
+                my_compressed->data(), res->getData().data(), my_compressed->size(), column_size * sizeof(T));
+            return res;
+        });
 }
 
-template <typename T>
-void ColumnDecimal<T>::getExtremes(Field & min, Field & max) const
+template <is_decimal T>
+void ColumnDecimal<T>::getExtremes(Field & min, Field & max, size_t start, size_t end) const
 {
-    if (data.empty())
+    if (start >= end)
     {
-        min = NearestFieldType<T>(0, scale);
-        max = NearestFieldType<T>(0, scale);
+        min = NearestFieldType<T>(T(0), scale);
+        max = NearestFieldType<T>(T(0), scale);
         return;
     }
 
-    T cur_min = data[0];
-    T cur_max = data[0];
+    T cur_min = data[start];
+    T cur_max = data[start];
 
-    for (const T & x : data)
+    for (size_t i = start + 1; i < end; ++i)
     {
-        if (x < cur_min)
-            cur_min = x;
-        else if (x > cur_max)
-            cur_max = x;
+        if (data[i] < cur_min)
+            cur_min = data[i];
+        else if (data[i] > cur_max)
+            cur_max = data[i];
     }
 
     min = NearestFieldType<T>(cur_min, scale);
     max = NearestFieldType<T>(cur_max, scale);
 }
 
+template <is_decimal T>
+void ColumnDecimal<T>::updateAt(const IColumn & src, size_t dst_pos, size_t src_pos)
+{
+    const auto & src_data = assert_cast<const Self &>(src).getData();
+    data[dst_pos] = src_data[src_pos];
+}
+
 template class ColumnDecimal<Decimal32>;
 template class ColumnDecimal<Decimal64>;
 template class ColumnDecimal<Decimal128>;
+template class ColumnDecimal<Decimal256>;
+template class ColumnDecimal<DateTime64>;
+template class ColumnDecimal<Time64>;
+
 }

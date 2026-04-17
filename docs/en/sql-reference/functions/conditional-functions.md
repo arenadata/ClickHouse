@@ -1,159 +1,20 @@
 ---
-toc_priority: 43
-toc_title: 'Conditional '
+description: 'Documentation for Conditional Functions'
+sidebar_label: 'Conditional'
+slug: /sql-reference/functions/conditional-functions
+title: 'Conditional Functions'
+doc_type: 'reference'
 ---
 
-# Conditional Functions {#conditional-functions}
+# Conditional functions
 
-## if {#if}
+## Overview {#overview}
 
-Controls conditional branching. Unlike most systems, ClickHouse always evaluate both expressions `then` and `else`.
-
-**Syntax**
-
-``` sql
-SELECT if(cond, then, else)
-```
-
-If the condition `cond` evaluates to a non-zero value, returns the result of the expression `then`, and the result of the expression `else`, if present, is skipped. If the `cond` is zero or `NULL`, then the result of the `then` expression is skipped and the result of the `else` expression, if present, is returned.
-
-**Parameters**
-
--   `cond` – The condition for evaluation that can be zero or not. The type is UInt8, Nullable(UInt8) or NULL.
--   `then` - The expression to return if condition is met.
--   `else` - The expression to return if condition is not met.
-
-**Returned values**
-
-The function executes `then` and `else` expressions and returns its result, depending on whether the condition `cond` ended up being zero or not.
-
-**Example**
-
-Query:
-
-``` sql
-SELECT if(1, plus(2, 2), plus(2, 6))
-```
-
-Result:
-
-``` text
-┌─plus(2, 2)─┐
-│          4 │
-└────────────┘
-```
-
-Query:
-
-``` sql
-SELECT if(0, plus(2, 2), plus(2, 6))
-```
-
-Result:
-
-``` text
-┌─plus(2, 6)─┐
-│          8 │
-└────────────┘
-```
-
--   `then` and `else` must have the lowest common type.
-
-**Example:**
-
-Take this `LEFT_RIGHT` table:
-
-``` sql
-SELECT *
-FROM LEFT_RIGHT
-
-┌─left─┬─right─┐
-│ ᴺᵁᴸᴸ │     4 │
-│    1 │     3 │
-│    2 │     2 │
-│    3 │     1 │
-│    4 │  ᴺᵁᴸᴸ │
-└──────┴───────┘
-```
-
-The following query compares `left` and `right` values:
-
-``` sql
-SELECT
-    left,
-    right,
-    if(left < right, 'left is smaller than right', 'right is greater or equal than left') AS is_smaller
-FROM LEFT_RIGHT
-WHERE isNotNull(left) AND isNotNull(right)
-
-┌─left─┬─right─┬─is_smaller──────────────────────────┐
-│    1 │     3 │ left is smaller than right          │
-│    2 │     2 │ right is greater or equal than left │
-│    3 │     1 │ right is greater or equal than left │
-└──────┴───────┴─────────────────────────────────────┘
-```
-
-Note: `NULL` values are not used in this example, check [NULL values in conditionals](#null-values-in-conditionals) section.
-
-## Ternary Operator {#ternary-operator}
-
-It works same as `if` function.
-
-Syntax: `cond ? then : else`
-
-Returns `then` if the `cond` evaluates to be true (greater than zero), otherwise returns `else`.
-
--   `cond` must be of type of `UInt8`, and `then` and `else` must have the lowest common type.
-
--   `then` and `else` can be `NULL`
-
-**See also**
-
--   [ifNotFinite](../../sql-reference/functions/other-functions.md#ifnotfinite).
-
-## multiIf {#multiif}
-
-Allows you to write the [CASE](../../sql-reference/operators/index.md#operator_case) operator more compactly in the query.
-
-Syntax: `multiIf(cond_1, then_1, cond_2, then_2, ..., else)`
-
-**Parameters:**
-
--   `cond_N` — The condition for the function to return `then_N`.
--   `then_N` — The result of the function when executed.
--   `else` — The result of the function if none of the conditions is met.
-
-The function accepts `2N+1` parameters.
-
-**Returned values**
-
-The function returns one of the values `then_N` or `else`, depending on the conditions `cond_N`.
-
-**Example**
-
-Again using `LEFT_RIGHT` table.
-
-``` sql
-SELECT
-    left,
-    right,
-    multiIf(left < right, 'left is smaller', left > right, 'left is greater', left = right, 'Both equal', 'Null value') AS result
-FROM LEFT_RIGHT
-
-┌─left─┬─right─┬─result──────────┐
-│ ᴺᵁᴸᴸ │     4 │ Null value      │
-│    1 │     3 │ left is smaller │
-│    2 │     2 │ Both equal      │
-│    3 │     1 │ left is greater │
-│    4 │  ᴺᵁᴸᴸ │ Null value      │
-└──────┴───────┴─────────────────┘
-```
-
-## Using Conditional Results Directly {#using-conditional-results-directly}
+### Using Conditional Results Directly {#using-conditional-results-directly}
 
 Conditionals always result to `0`, `1` or `NULL`. So you can use conditional results directly like this:
 
-``` sql
+```sql
 SELECT left < right AS is_small
 FROM LEFT_RIGHT
 
@@ -166,11 +27,11 @@ FROM LEFT_RIGHT
 └──────────┘
 ```
 
-## NULL Values in Conditionals {#null-values-in-conditionals}
+### NULL Values in Conditionals {#null-values-in-conditionals}
 
 When `NULL` values are involved in conditionals, the result will also be `NULL`.
 
-``` sql
+```sql
 SELECT
     NULL < 1,
     2 < NULL,
@@ -186,7 +47,7 @@ So you should construct your queries carefully if the types are `Nullable`.
 
 The following example demonstrates this by failing to add equals condition to `multiIf`.
 
-``` sql
+```sql
 SELECT
     left,
     right,
@@ -202,4 +63,185 @@ FROM LEFT_RIGHT
 └──────┴───────┴──────────────────┘
 ```
 
-[Original article](https://clickhouse.tech/docs/en/query_language/functions/conditional_functions/) <!--hide-->
+### CASE statement {#case-statement}
+
+The CASE expression in ClickHouse provides conditional logic similar to the SQL CASE operator. It evaluates conditions and returns values based on the first matching condition.
+
+ClickHouse supports two forms of CASE:
+
+1. `CASE WHEN ... THEN ... ELSE ... END`
+   <br/>
+   This form allows full flexibility and is internally implemented using the [multiIf](/sql-reference/functions/conditional-functions#multiIf) function. Each condition is evaluated independently, and expressions can include non-constant values.
+
+```sql
+SELECT
+    number,
+    CASE
+        WHEN number % 2 = 0 THEN number + 1
+        WHEN number % 2 = 1 THEN number * 10
+        ELSE number
+    END AS result
+FROM system.numbers
+WHERE number < 5;
+
+-- is translated to
+SELECT
+    number,
+    multiIf((number % 2) = 0, number + 1, (number % 2) = 1, number * 10, number) AS result
+FROM system.numbers
+WHERE number < 5
+
+┌─number─┬─result─┐
+│      0 │      1 │
+│      1 │     10 │
+│      2 │      3 │
+│      3 │     30 │
+│      4 │      5 │
+└────────┴────────┘
+
+5 rows in set. Elapsed: 0.002 sec.
+```
+
+2. `CASE <expr> WHEN <val1> THEN ... WHEN <val2> THEN ... ELSE ... END`
+   <br/>
+   This more compact form is optimized for constant value matching and internally uses `caseWithExpression()`.
+
+
+For example, the following is valid:
+
+```sql
+SELECT
+    number,
+    CASE number
+        WHEN 0 THEN 100
+        WHEN 1 THEN 200
+        ELSE 0
+    END AS result
+FROM system.numbers
+WHERE number < 3;
+
+-- is translated to
+
+SELECT
+    number,
+    caseWithExpression(number, 0, 100, 1, 200, 0) AS result
+FROM system.numbers
+WHERE number < 3
+
+┌─number─┬─result─┐
+│      0 │    100 │
+│      1 │    200 │
+│      2 │      0 │
+└────────┴────────┘
+
+3 rows in set. Elapsed: 0.002 sec.
+```
+
+This form also does not require return expressions to be constants.
+
+```sql
+SELECT
+    number,
+    CASE number
+        WHEN 0 THEN number + 1
+        WHEN 1 THEN number * 10
+        ELSE number
+    END
+FROM system.numbers
+WHERE number < 3;
+
+-- is translated to
+
+SELECT
+    number,
+    caseWithExpression(number, 0, number + 1, 1, number * 10, number)
+FROM system.numbers
+WHERE number < 3
+
+┌─number─┬─caseWithExpr⋯0), number)─┐
+│      0 │                        1 │
+│      1 │                       10 │
+│      2 │                        2 │
+└────────┴──────────────────────────┘
+
+3 rows in set. Elapsed: 0.001 sec.
+```
+
+#### Caveats  {#caveats}
+
+ClickHouse determines the result type of a CASE expression (or its internal equivalent, such as `multiIf`) before evaluating any conditions. This is important when the return expressions differ in type, such as different timezones or numeric types.
+
+- The result type is selected based on the largest compatible type among all branches.
+- Once this type is selected, all other branches are implicitly cast to it - even if their logic would never be executed at runtime.
+- For types like DateTime64, where the timezone is part of the type signature, this can lead to surprising behavior: the first encountered timezone may be used for all branches, even when other branches specify different timezones.
+
+For example, below all rows return the timestamp in the timezone of the first matched branch i.e. `Asia/Kolkata`
+
+```sql
+SELECT
+    number,
+    CASE
+        WHEN number = 0 THEN fromUnixTimestamp64Milli(0, 'Asia/Kolkata')
+        WHEN number = 1 THEN fromUnixTimestamp64Milli(0, 'America/Los_Angeles')
+        ELSE fromUnixTimestamp64Milli(0, 'UTC')
+    END AS tz
+FROM system.numbers
+WHERE number < 3;
+
+-- is translated to
+
+SELECT
+    number,
+    multiIf(number = 0, fromUnixTimestamp64Milli(0, 'Asia/Kolkata'), number = 1, fromUnixTimestamp64Milli(0, 'America/Los_Angeles'), fromUnixTimestamp64Milli(0, 'UTC')) AS tz
+FROM system.numbers
+WHERE number < 3
+
+┌─number─┬──────────────────────tz─┐
+│      0 │ 1970-01-01 05:30:00.000 │
+│      1 │ 1970-01-01 05:30:00.000 │
+│      2 │ 1970-01-01 05:30:00.000 │
+└────────┴─────────────────────────┘
+
+3 rows in set. Elapsed: 0.011 sec.
+```
+
+Here, ClickHouse sees multiple `DateTime64(3, <timezone>)` return types. It infers the common type as `DateTime64(3, 'Asia/Kolkata'` as the first one it sees, implicitly casting other branches to this type.
+
+This can be addressed by converting to a string to preserve intended timezone formatting:
+
+```sql
+SELECT
+    number,
+    multiIf(
+        number = 0, formatDateTime(fromUnixTimestamp64Milli(0), '%F %T', 'Asia/Kolkata'),
+        number = 1, formatDateTime(fromUnixTimestamp64Milli(0), '%F %T', 'America/Los_Angeles'),
+        formatDateTime(fromUnixTimestamp64Milli(0), '%F %T', 'UTC')
+    ) AS tz
+FROM system.numbers
+WHERE number < 3;
+
+-- is translated to
+
+SELECT
+    number,
+    multiIf(number = 0, formatDateTime(fromUnixTimestamp64Milli(0), '%F %T', 'Asia/Kolkata'), number = 1, formatDateTime(fromUnixTimestamp64Milli(0), '%F %T', 'America/Los_Angeles'), formatDateTime(fromUnixTimestamp64Milli(0), '%F %T', 'UTC')) AS tz
+FROM system.numbers
+WHERE number < 3
+
+┌─number─┬─tz──────────────────┐
+│      0 │ 1970-01-01 05:30:00 │
+│      1 │ 1969-12-31 16:00:00 │
+│      2 │ 1970-01-01 00:00:00 │
+└────────┴─────────────────────┘
+
+3 rows in set. Elapsed: 0.002 sec.
+```
+
+<!-- 
+The inner content of the tags below are replaced at doc framework build time with 
+docs generated from system.functions. Please do not modify or remove the tags.
+See: https://github.com/ClickHouse/clickhouse-docs/blob/main/contribute/autogenerated-documentation-from-source.md
+-->
+
+<!--AUTOGENERATED_START-->
+<!--AUTOGENERATED_END-->

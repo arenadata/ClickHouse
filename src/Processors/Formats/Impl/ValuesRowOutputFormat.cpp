@@ -1,23 +1,24 @@
 #include <Processors/Formats/Impl/ValuesRowOutputFormat.h>
-#include <Formats/FormatFactory.h>
 
-#include <IO/WriteHelpers.h>
 #include <Columns/IColumn.h>
 #include <DataTypes/IDataType.h>
+#include <Formats/FormatFactory.h>
+#include <IO/WriteHelpers.h>
+#include <Processors/Port.h>
 
 
 namespace DB
 {
 
 
-ValuesRowOutputFormat::ValuesRowOutputFormat(WriteBuffer & out_, const Block & header_, FormatFactory::WriteCallback callback, const FormatSettings & format_settings_)
-    : IRowOutputFormat(header_, out_, callback), format_settings(format_settings_)
+ValuesRowOutputFormat::ValuesRowOutputFormat(WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_)
+    : IRowOutputFormat(header_, out_), format_settings(format_settings_)
 {
 }
 
-void ValuesRowOutputFormat::writeField(const IColumn & column, const IDataType & type, size_t row_num)
+void ValuesRowOutputFormat::writeField(const IColumn & column, const ISerialization & serialization, size_t row_num)
 {
-    type.serializeAsTextQuoted(column, row_num, out, format_settings);
+    serialization.serializeTextQuoted(column, row_num, out, format_settings);
 }
 
 void ValuesRowOutputFormat::writeFieldDelimiter()
@@ -41,16 +42,18 @@ void ValuesRowOutputFormat::writeRowBetweenDelimiter()
 }
 
 
-void registerOutputFormatProcessorValues(FormatFactory & factory)
+void registerOutputFormatValues(FormatFactory & factory)
 {
-    factory.registerOutputFormatProcessor("Values", [](
+    factory.registerOutputFormat("Values", [](
         WriteBuffer & buf,
         const Block & sample,
-        FormatFactory::WriteCallback callback,
-        const FormatSettings & settings)
+        const FormatSettings & settings,
+        FormatFilterInfoPtr /*format_filter_info*/)
     {
-        return std::make_shared<ValuesRowOutputFormat>(buf, sample, callback, settings);
+        return std::make_shared<ValuesRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings);
     });
+
+    factory.markOutputFormatSupportsParallelFormatting("Values");
 }
 
 }

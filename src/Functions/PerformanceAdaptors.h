@@ -1,10 +1,13 @@
 #pragma once
 
-#include <Functions/TargetSpecific.h>
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 
+#include <Common/TargetSpecific.h>
 #include <Common/Stopwatch.h>
+#include <Core/Settings.h>
 #include <Interpreters/Context.h>
+
+#include <pcg_random.hpp>
 
 #include <mutex>
 #include <random>
@@ -15,6 +18,10 @@
 
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsString function_implementation;
+}
 
 namespace ErrorCodes
 {
@@ -72,7 +79,7 @@ namespace detail
             return size() == 0;
         }
 
-        void emplace_back()
+        void emplace_back() /// NOLINT
         {
             data.emplace_back();
         }
@@ -164,20 +171,20 @@ namespace detail
  * Example of usage:
  *
  * class MyDefaulImpl : public IFunction {...};
- * DECLARE_AVX2_SPECIFIC_CODE(
- * class MyAVX2Impl : public IFunction {...};
+ * DECLARE_X86_64_V3_SPECIFIC_CODE(
+ * class Myv3Impl : public IFunction {...};
  * )
  *
  * /// All methods but execute/executeImpl are usually not bottleneck, so just use them from
  * /// default implementation.
  * class MyFunction : public MyDefaultImpl
  * {
- *     MyFunction(const Context & context) : selector(context) {
+ *     MyFunction(ContextPtr context) : selector(context) {
  *         /// Register all implementations in constructor.
  *         /// There could be as many implementation for every target as you want.
  *         selector.registerImplementation<TargetArch::Default, MyDefaultImpl>();
  *     #if USE_MULTITARGET_CODE
- *         selector.registerImplementation<TargetArch::AVX2, TargetSpecific::AVX2::MyAVX2Impl>();
+ *         selector.registerImplementation<TargetArch::x86_64_v3, TargetSpecific::x86_64_v3::Myv3Impl>();
  *     #endif
  *     }
  *
@@ -185,7 +192,7 @@ namespace detail
  *         selector.selectAndExecute(...);
  *     }
  *
- *     static FunctionPtr create(const Context & context) {
+ *     static FunctionPtr create(ContextPtr context) {
  *         return std::make_shared<MyFunction>(context);
  *     }
  * private:
@@ -198,41 +205,47 @@ class ImplementationSelector
 public:
     using ImplementationPtr = std::shared_ptr<FunctionInterface>;
 
-    ImplementationSelector(const Context & context_) : context(context_) {}
+    explicit ImplementationSelector(ContextPtr context)
+        // TODO(dakovalkov): make this option better.
+        : function_implementation(context->getSettingsRef()[Setting::function_implementation])
+    {}
 
     /* Select the best implementation based on previous runs.
      * If FunctionInterface is IFunction, then "executeImpl" method of the implementation will be called
      * and "execute" otherwise.
      */
-    void selectAndExecute(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count)
+    ColumnPtr selectAndExecute(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
     {
         if (implementations.empty())
-            throw Exception("There are no available implementations for function " "TODO(dakovalkov): add name",
-                            ErrorCodes::NO_SUITABLE_FUNCTION_IMPLEMENTATION);
+            throw Exception(ErrorCodes::NO_SUITABLE_FUNCTION_IMPLEMENTATION,
+                            "There are no available implementations for function " "TODO(dakovalkov): add name");
 
-        /// Statistics shouldn't rely on small blocks.
+        /// Statistics shouldn't rely on small columns.
         bool considerable = (input_rows_count > 1000);
+        ColumnPtr res;
 
         size_t id = statistics.select(considerable);
         Stopwatch watch;
 
         if constexpr (std::is_same_v<FunctionInterface, IFunction>)
-            implementations[id]->executeImpl(block, arguments, result, input_rows_count);
+            res = implementations[id]->executeImpl(arguments, result_type, input_rows_count);
         else
-            implementations[id]->execute(block, arguments, result, input_rows_count);
+            res = implementations[id]->execute(arguments, result_type, input_rows_count);
 
         watch.stop();
 
         if (considerable)
         {
             // TODO(dakovalkov): Calculate something more informative than rows count.
-            statistics.complete(id, watch.elapsedSeconds(), input_rows_count);
+            statistics.complete(id, watch.elapsedSeconds(), static_cast<double>(input_rows_count));
         }
+
+        return res;
     }
 
     /* Register new implementation for function.
      *
-     * Arch - required instruction set for running the implementation. It's guarantied that no method would
+     * Arch - required instruction set for running the implementation. It's guaranteed that no method would
      * be called (even the constructor and static methods) if the processor doesn't support this instruction set.
      *
      * FunctionImpl - implementation, should be inherited from template argument FunctionInterface.
@@ -244,9 +257,7 @@ public:
     {
         if (isArchSupported(Arch))
         {
-            // TODO(dakovalkov): make this option better.
-            const auto & choose_impl = context.getSettingsRef().function_implementation.value;
-            if (choose_impl.empty() || choose_impl == detail::getImplementationTag<FunctionImpl>(Arch))
+            if (function_implementation.empty() || function_implementation == detail::getImplementationTag<FunctionImpl>(Arch))
             {
                 implementations.emplace_back(std::make_shared<FunctionImpl>(std::forward<Args>(args)...));
                 statistics.emplace_back();
@@ -255,9 +266,9 @@ public:
     }
 
 private:
-    const Context & context;
+    const std::string function_implementation;
     std::vector<ImplementationPtr> implementations;
-    detail::PerformanceStatistics statistics;
+    mutable detail::PerformanceStatistics statistics; /// It is protected by internal mutex.
 };
 
 }

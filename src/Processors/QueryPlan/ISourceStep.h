@@ -8,17 +8,21 @@ namespace DB
 class ISourceStep : public IQueryPlanStep
 {
 public:
-    explicit ISourceStep(DataStream output_stream_);
+    explicit ISourceStep(SharedHeader output_header_);
 
-    QueryPipelinePtr updatePipeline(QueryPipelines pipelines) override;
+    ISourceStep(const ISourceStep &) = default;
+    ISourceStep(ISourceStep &&) = default;
 
-    virtual void initializePipeline(QueryPipeline & pipeline) = 0;
+    QueryPipelineBuilderPtr updatePipeline(QueryPipelineBuilders pipelines, const BuildQueryPipelineSettings & settings) override;
+
+    virtual void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings & settings) = 0;
 
     void describePipeline(FormatSettings & settings) const override;
 
-private:
-    /// We collect processors got after pipeline transformation.
-    Processors processors;
+    bool hasCorrelatedExpressions() const override { return false; }
+
+protected:
+    void updateOutputHeader() override {}
 };
 
 }

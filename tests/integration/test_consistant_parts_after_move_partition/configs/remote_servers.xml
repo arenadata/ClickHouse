@@ -1,4 +1,4 @@
-<yandex>
+<clickhouse>
     <remote_servers>
         <test_cluster>
             <shard>
@@ -16,4 +16,5 @@
             </shard>
         </test_cluster>
     </remote_servers>
-</yandex>
+    <allow_remove_stale_moving_parts>true</allow_remove_stale_moving_parts>
+</clickhouse>

@@ -1,5 +1,6 @@
 #include <IO/LimitReadBuffer.h>
 #include <Common/Exception.h>
+#include <Core/Settings.h>
 
 
 namespace DB
@@ -8,50 +9,75 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LIMIT_EXCEEDED;
+    extern const int CANNOT_READ_ALL_DATA;
 }
 
 
 bool LimitReadBuffer::nextImpl()
 {
-    /// Let underlying buffer calculate read bytes in `next()` call.
-    in.position() = position();
+    chassert(position() >= in->position());
 
-    if (bytes >= limit)
+    /// Let underlying buffer calculate read bytes in `next()` call.
+    in->position() = position();
+
+    if (bytes >= settings.read_no_less)
     {
-        if (throw_exception)
-            throw Exception("Limit for LimitReadBuffer exceeded: " + exception_message, ErrorCodes::LIMIT_EXCEEDED);
-        else
+        if (settings.expect_eof && bytes > settings.read_no_more)
+            throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Limit for LimitReadBuffer exceeded: {}", settings.excetion_hint);
+
+        if (bytes >= settings.read_no_more)
             return false;
+
+        //throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Unexpected data, got {} bytes, expected {}", bytes, settings.read_atmost);
     }
 
-    if (!in.next())
+    if (!in->next())
+    {
+        if (bytes < settings.read_no_less)
+            throw Exception(ErrorCodes::CANNOT_READ_ALL_DATA, "Unexpected EOF, got {} of {} bytes", bytes, settings.read_no_less);
+
+        /// Clearing the buffer with existing data.
+        BufferBase::set(in->position(), 0, 0);
+
         return false;
+    }
 
-    working_buffer = in.buffer();
-
-    if (limit - bytes < working_buffer.size())
-        working_buffer.resize(limit - bytes);
+    BufferBase::set(in->position(), std::min(in->available(), getEffectiveBufferSize() - bytes), 0);
 
     return true;
 }
 
 
-LimitReadBuffer::LimitReadBuffer(ReadBuffer & in_, UInt64 limit_, bool throw_exception_, std::string exception_message_)
-    : ReadBuffer(in_.position(), 0), in(in_), limit(limit_), throw_exception(throw_exception_), exception_message(std::move(exception_message_))
+LimitReadBuffer::LimitReadBuffer(ReadBuffer & in_, Settings settings_)
+    : ReadBuffer(in_.position(), 0)
+    , in(&in_)
+    , settings(std::move(settings_))
 {
-    size_t remaining_bytes_in_buffer = in.buffer().end() - in.position();
-    if (remaining_bytes_in_buffer > limit)
-        remaining_bytes_in_buffer = limit;
+    chassert(in);
+    chassert(settings.read_no_less <= settings.read_no_more);
 
-    working_buffer = Buffer(in.position(), in.position() + remaining_bytes_in_buffer);
+    BufferBase::set(in->position(), std::min(in->available(), getEffectiveBufferSize()), 0);
+}
+
+
+LimitReadBuffer::LimitReadBuffer(std::unique_ptr<ReadBuffer> in_, Settings settings_)
+    : LimitReadBuffer(*in_, std::move(settings_))
+{
+    holder = std::move(in_);
 }
 
 
 LimitReadBuffer::~LimitReadBuffer()
 {
     /// Update underlying buffer's position in case when limit wasn't reached.
-    if (working_buffer.size() != 0)
-        in.position() = position();
+    if (!working_buffer.empty())
+        in->position() = position();
 }
 
+size_t LimitReadBuffer::getEffectiveBufferSize() const
+{
+    if (settings.read_no_less)
+        return settings.read_no_less;
+    return settings.read_no_more;
+}
 }

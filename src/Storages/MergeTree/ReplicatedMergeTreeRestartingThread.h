@@ -1,11 +1,12 @@
 #pragma once
 
 #include <Poco/Event.h>
-#include <common/logger_useful.h>
-#include <Core/BackgroundSchedulePool.h>
-#include <Core/Types.h>
+#include <Core/BackgroundSchedulePoolTaskHolder.h>
+#include <base/types.h>
 #include <thread>
 #include <atomic>
+#include <Common/logger_useful.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
 
 
 namespace DB
@@ -22,29 +23,32 @@ class StorageReplicatedMergeTree;
 class ReplicatedMergeTreeRestartingThread
 {
 public:
-    ReplicatedMergeTreeRestartingThread(StorageReplicatedMergeTree & storage_);
+    explicit ReplicatedMergeTreeRestartingThread(StorageReplicatedMergeTree & storage_);
 
-    void start() { task->activateAndSchedule(); }
+    void start(bool schedule);
 
-    void wakeup() { task->schedule(); }
+    void wakeup();
 
-    void shutdown();
+    void shutdown(bool part_of_full_shutdown);
+
+    void run();
 
 private:
     StorageReplicatedMergeTree & storage;
     String log_name;
-    Poco::Logger * log;
+    LoggerPtr log;
     std::atomic<bool> need_stop {false};
 
     /// The random data we wrote into `/replicas/me/is_active`.
     String active_node_identifier;
 
-    BackgroundSchedulePool::TaskHolder task;
+    BackgroundSchedulePoolTaskHolder task;
     Int64 check_period_ms;                  /// The frequency of checking expiration of session in ZK.
+    UInt32 consecutive_check_failures = 0;  /// How many consecutive checks have failed
     bool first_time = true;                 /// Activate replica for the first time.
-    bool startup_completed = false;
 
-    void run();
+    /// Restarts table if needed, returns false if it failed to restart replica.
+    bool runImpl();
 
     /// Start or stop background threads. Used for partial reinitialization when re-creating a session in ZooKeeper.
     bool tryStartup(); /// Returns false if ZooKeeper is not available.
@@ -58,7 +62,16 @@ private:
     /// If there is an unreachable quorum, and we have a part, then add this replica to the quorum.
     void updateQuorumIfWeHavePart();
 
-    void partialShutdown();
+    void partialShutdown(bool part_of_full_shutdown = false);
+
+    /// Set readonly mode for table
+    void setReadonly(bool on_shutdown = false);
+
+    /// Disable readonly mode for table
+    void setNotReadonly();
+
+    /// Fix replica metadata_version if needed
+    Int32 fixReplicaMetadataVersionIfNeeded(zkutil::ZooKeeperPtr zookeeper);
 };
 
 

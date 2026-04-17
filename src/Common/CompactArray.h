@@ -1,10 +1,7 @@
 #pragma once
 
+#include <Common/Exception.h>
 #include <IO/ReadBuffer.h>
-#include <IO/WriteBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
-#include <Core/Defines.h>
 
 namespace DB
 {
@@ -28,7 +25,6 @@ public:
     class Reader;
     class Locus;
 
-public:
     CompactArray() = default;
 
     UInt8 ALWAYS_INLINE operator[](BucketIndex bucket_index) const
@@ -37,8 +33,7 @@ public:
 
         if (locus.index_l == locus.index_r)
             return locus.read(bitset[locus.index_l]);
-        else
-            return locus.read(bitset[locus.index_l], bitset[locus.index_r]);
+        return locus.read(bitset[locus.index_l], bitset[locus.index_r]);
     }
 
     Locus ALWAYS_INLINE operator[](BucketIndex bucket_index)
@@ -55,31 +50,9 @@ public:
         return locus;
     }
 
-    /// Used only in arcadia/metrika
-    void readText(ReadBuffer & in)
-    {
-        for (size_t i = 0; i < BITSET_SIZE; ++i)
-        {
-            if (i != 0)
-                assertChar(',', in);
-            readIntText(bitset[i], in);
-        }
-    }
-
-    /// Used only in arcadia/metrika
-    void writeText(WriteBuffer & out) const
-    {
-        for (size_t i = 0; i < BITSET_SIZE; ++i)
-        {
-            if (i != 0)
-                writeCString(",", out);
-            writeIntText(bitset[i], out);
-        }
-    }
-
 private:
     /// number of bytes in bitset
-    static constexpr size_t BITSET_SIZE = (static_cast<size_t>(bucket_count) * content_width + 7) / 8;
+    static constexpr size_t BITSET_SIZE = (bucket_count * content_width + 7) / 8;
     UInt8 bitset[BITSET_SIZE] = { 0 };
 };
 
@@ -89,7 +62,7 @@ template <typename BucketIndex, UInt8 content_width, size_t bucket_count>
 class CompactArray<BucketIndex, content_width, bucket_count>::Reader final
 {
 public:
-    Reader(ReadBuffer & in_)
+    explicit Reader(ReadBuffer & in_)
         : in(in_)
     {
     }
@@ -139,32 +112,31 @@ public:
 
     /** Return the current cell number and the corresponding content.
       */
-    inline std::pair<BucketIndex, UInt8> get() const
+    std::pair<BucketIndex, UInt8> get() const
     {
         if ((current_bucket_index == 0) || is_eof)
-            throw Exception("No available data.", ErrorCodes::NO_AVAILABLE_DATA);
+            throw Exception(ErrorCodes::NO_AVAILABLE_DATA, "No available data.");
 
         if (fits_in_byte)
             return std::make_pair(current_bucket_index - 1, locus.read(value_l));
-        else
-            return std::make_pair(current_bucket_index - 1, locus.read(value_l, value_r));
+        return std::make_pair(current_bucket_index - 1, locus.read(value_l, value_r));
     }
 
 private:
     ReadBuffer & in;
     /// The physical location of the current cell.
-    Locus locus;
+    Locus locus{};
     /// The current position in the file as a cell number.
     BucketIndex current_bucket_index = 0;
     /// The number of bytes read.
     size_t read_count = 0;
     /// The content in the current position.
-    UInt8 value_l;
-    UInt8 value_r;
+    UInt8 value_l = 0;
+    UInt8 value_r = 0;
     ///
     bool is_eof = false;
     /// Does the cell fully fit into one byte?
-    bool fits_in_byte;
+    bool fits_in_byte = false;
 };
 
 /** TODO This code looks very suboptimal.
@@ -182,12 +154,11 @@ class CompactArray<BucketIndex, content_width, bucket_count>::Locus final
     friend class CompactArray::Reader;
 
 public:
-    ALWAYS_INLINE operator UInt8() const
+    ALWAYS_INLINE operator UInt8() const /// NOLINT
     {
         if (content_l == content_r)
             return read(*content_l);
-        else
-            return read(*content_l, *content_r);
+        return read(*content_l, *content_r);
     }
 
     Locus ALWAYS_INLINE & operator=(UInt8 content)
@@ -216,7 +187,7 @@ public:
 private:
     Locus() = default;
 
-    Locus(BucketIndex bucket_index)
+    explicit Locus(BucketIndex bucket_index)
     {
         init(bucket_index);
     }
@@ -237,6 +208,9 @@ private:
 
         /// offset in bits to the next to the rightmost bit at that byte; or zero if the rightmost bit is the rightmost bit in that byte.
         offset_r = (l + content_width) % 8;
+
+        content_l = nullptr;
+        content_r = nullptr;
     }
 
     UInt8 ALWAYS_INLINE read(UInt8 value_l) const
@@ -248,11 +222,11 @@ private:
     UInt8 ALWAYS_INLINE read(UInt8 value_l, UInt8 value_r) const
     {
         /// The cell overlaps two bytes.
-        return ((value_l >> offset_l) & ((1 << (8 - offset_l)) - 1))
-            | ((value_r & ((1 << offset_r) - 1)) << (8 - offset_l));
+        return static_cast<UInt8>(
+            ((value_l >> offset_l) & ((1 << (8 - offset_l)) - 1))
+             | ((value_r & ((1 << offset_r) - 1)) << (8 - offset_l)));
     }
 
-private:
     size_t index_l;
     size_t offset_l;
     size_t index_r;
@@ -267,4 +241,3 @@ private:
 };
 
 }
-

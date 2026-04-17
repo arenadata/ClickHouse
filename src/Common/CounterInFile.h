@@ -4,19 +4,18 @@
 #include <sys/file.h>
 
 #include <string>
-#include <iostream>
 #include <mutex>
+#include <filesystem>
 
-#include <Poco/File.h>
 #include <Poco/Exception.h>
 
 #include <IO/ReadBufferFromFileDescriptor.h>
 #include <IO/WriteBufferFromFileDescriptor.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
 
 #include <Common/Exception.h>
-#include <common/types.h>
+#include <Common/ErrnoException.h>
+#include <base/defines.h>
+#include <base/types.h>
 
 
 namespace DB
@@ -29,6 +28,7 @@ namespace DB
     }
 }
 
+namespace fs = std::filesystem;
 
 /** Stores a number in the file.
  * Designed for rare calls (not designed for performance).
@@ -36,11 +36,11 @@ namespace DB
 class CounterInFile
 {
 private:
-    static inline constexpr size_t SMALL_READ_WRITE_BUFFER_SIZE = 16;
+    static constexpr size_t SMALL_READ_WRITE_BUFFER_SIZE = 16;
 
 public:
     /// path - the name of the file, including the path
-    CounterInFile(const std::string & path_) : path(path_) {}
+    explicit CounterInFile(const std::string & path_) : path(path_) {}
 
     /** Add `delta` to the number in the file and return the new value.
      * If the `create_if_need` parameter is not set to true, then
@@ -59,22 +59,22 @@ public:
 
         Int64 res = -1;
 
-        bool file_doesnt_exists = !Poco::File(path).exists();
+        bool file_doesnt_exists = !fs::exists(path);
         if (file_doesnt_exists && !create_if_need)
         {
             throw Poco::Exception("File " + path + " does not exist. "
-            "You must create it manulally with appropriate value or 0 for first start.");
+            "You must create it manually with appropriate value or 0 for first start.");
         }
 
         int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
         if (-1 == fd)
-            DB::throwFromErrnoWithPath("Cannot open file " + path, path, DB::ErrorCodes::CANNOT_OPEN_FILE);
+            DB::ErrnoException::throwFromPath(DB::ErrorCodes::CANNOT_OPEN_FILE, path, "Cannot open file {}", path);
 
         try
         {
             int flock_ret = flock(fd, LOCK_EX);
             if (-1 == flock_ret)
-                DB::throwFromErrnoWithPath("Cannot lock file " + path, path, DB::ErrorCodes::CANNOT_OPEN_FILE);
+                DB::ErrnoException::throwFromPath(DB::ErrorCodes::CANNOT_OPEN_FILE, path, "Cannot lock file {}", path);
 
             if (!file_doesnt_exists)
             {
@@ -87,9 +87,8 @@ public:
                 {
                     /// A more understandable error message.
                     if (e.code() == DB::ErrorCodes::CANNOT_READ_ALL_DATA || e.code() == DB::ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF)
-                        throw DB::Exception("File " + path + " is empty. You must fill it manually with appropriate value.", e.code());
-                    else
-                        throw;
+                        throw DB::Exception(e.code(), "File {} is empty. You must fill it manually with appropriate value.", path);
+                    throw;
                 }
             }
             else
@@ -104,6 +103,7 @@ public:
                 wb.truncate(0);
                 DB::writeIntText(res, wb);
                 DB::writeChar('\n', wb);
+                wb.finalize();
                 wb.sync();
             }
 
@@ -111,11 +111,13 @@ public:
         }
         catch (...)
         {
-            close(fd);
+            [[maybe_unused]] int err = close(fd);
+            chassert(!err || errno == EINTR);
             throw;
         }
 
-        close(fd);
+        [[maybe_unused]] int err = close(fd);
+        chassert(!err || errno == EINTR);
         return res;
     }
 
@@ -138,11 +140,11 @@ public:
     // Not thread-safe and not synchronized between processes.
     void fixIfBroken(UInt64 value)
     {
-        bool file_exists = Poco::File(path).exists();
+        bool file_exists = fs::exists(path);
 
         int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
         if (-1 == fd)
-            DB::throwFromErrnoWithPath("Cannot open file " + path, path, DB::ErrorCodes::CANNOT_OPEN_FILE);
+            DB::ErrnoException::throwFromPath(DB::ErrorCodes::CANNOT_OPEN_FILE, path, "Cannot open file {}", path);
 
         try
         {
@@ -174,16 +176,19 @@ public:
                 wb.truncate(0);
                 DB::writeIntText(value, wb);
                 DB::writeChar('\n', wb);
+                wb.finalize();
                 wb.sync();
             }
         }
         catch (...)
         {
-            close(fd);
+            [[maybe_unused]] int err = close(fd);
+            chassert(!err || errno == EINTR);
             throw;
         }
 
-        close(fd);
+        [[maybe_unused]] int err = close(fd);
+        chassert(!err || errno == EINTR);
     }
 
 private:

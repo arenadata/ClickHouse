@@ -1,4 +1,4 @@
-<test max_ignored_relative_change="0.2">
+<test>
     <substitutions>
         <substitution>
            <name>gp_hash_func</name>
@@ -15,6 +15,7 @@
                <value>hiveHash</value>
                <value>xxHash32</value>
                <value>xxHash64</value>
+               <value>xxh3</value>
                <value>CRC32</value>
            </values>
         </substitution>
@@ -35,14 +36,14 @@
            <name>table_slow</name>
            <values>
                <value>zeros(1000000)</value>
-               <value>zeros_mt(10000000)</value>
+               <value>zeros_mt(5000000)</value>
            </values>
         </substitution>
         <substitution>
            <name>table</name>
            <values>
-               <value>numbers(100000000)</value>
-               <value>numbers_mt(1000000000)</value>
+               <value>numbers(10000000)</value>
+               <value>numbers_mt(500000000)</value>
            </values>
         </substitution>
     </substitutions>

@@ -1,6 +1,6 @@
 #pragma once
 #include <Common/Visitor.h>
-#include <Core/TypeListNumber.h>
+#include <base/TypeLists.h>
 
 namespace DB::GatherUtils
 {
@@ -16,16 +16,24 @@ struct NullableValueSource;
 template <typename Base>
 struct ConstSource;
 
-using NumericValueSources = typename TypeListMap<NumericValueSource, TypeListNumbers>::Type;
-using BasicValueSources = typename AppendToTypeList<GenericValueSource, NumericValueSources>::Type;
-using NullableValueSources = typename TypeListMap<NullableValueSource, BasicValueSources>::Type;
-using BasicAndNullableValueSources = typename TypeListConcat<BasicValueSources, NullableValueSources>::Type;
-using ConstValueSources = typename TypeListMap<ConstSource, BasicAndNullableValueSources>::Type;
-using TypeListValueSources = typename TypeListConcat<BasicAndNullableValueSources, ConstValueSources>::Type;
+using NumericValueSources = TypeListMap<NumericValueSource, TypeListNumberWithUUID>;
+using BasicValueSources = TypeListAppend<GenericValueSource, NumericValueSources>;
+using NullableValueSources = TypeListMap<NullableValueSource, BasicValueSources>;
+using BasicAndNullableValueSources = TypeListConcat<BasicValueSources, NullableValueSources>;
+using ConstValueSources = TypeListMap<ConstSource, BasicAndNullableValueSources>;
+using TypeListValueSources = TypeListConcat<BasicAndNullableValueSources, ConstValueSources>;
 
-class ValueSourceVisitor : public ApplyTypeListForClass<Visitor, TypeListValueSources>::Type {};
+class ValueSourceVisitor : public TypeListChangeRoot<Visitor, TypeListValueSources>
+{
+protected:
+    ~ValueSourceVisitor() = default;
+};
 
 template <typename Derived>
-class ValueSourceVisitorImpl : public VisitorImpl<Derived, ValueSourceVisitor> {};
+class ValueSourceVisitorImpl : public VisitorImpl<Derived, ValueSourceVisitor>
+{
+protected:
+    ~ValueSourceVisitorImpl() = default;
+};
 
 }

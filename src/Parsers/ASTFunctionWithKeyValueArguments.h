@@ -1,7 +1,9 @@
 #pragma once
 
 #include <Parsers/IAST.h>
-#include <Core/Types.h>
+#include <base/types.h>
+
+class SipHash;
 
 namespace DB
 {
@@ -15,12 +17,11 @@ public:
     /// Name or key of pair
     String first;
     /// Value of pair, which can be also list of pairs
-    ASTPtr second;
+    IAST * second = nullptr;
     /// Value is closed in brackets (HOST '127.0.0.1')
     bool second_with_brackets;
 
-public:
-    ASTPair(bool second_with_brackets_)
+    explicit ASTPair(bool second_with_brackets_)
         : second_with_brackets(second_with_brackets_)
     {
     }
@@ -29,7 +30,17 @@ public:
 
     ASTPtr clone() const override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    bool hasSecretParts() const override;
+
+    void updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const override;
+
+    void forEachPointerToChild(std::function<void(IAST **, boost::intrusive_ptr<IAST> *)> f) override
+    {
+        f(&second, nullptr);
+    }
+
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 
@@ -47,17 +58,19 @@ public:
     /// Has brackets around arguments
     bool has_brackets;
 
-    ASTFunctionWithKeyValueArguments(bool has_brackets_ = true)
+    explicit ASTFunctionWithKeyValueArguments(bool has_brackets_ = true)
         : has_brackets(has_brackets_)
     {
     }
 
-public:
     String getID(char delim) const override;
 
     ASTPtr clone() const override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const override;
+
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 }

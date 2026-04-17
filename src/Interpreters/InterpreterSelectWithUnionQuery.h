@@ -1,60 +1,65 @@
 #pragma once
 
-#include <Core/QueryProcessingStage.h>
-#include <Interpreters/IInterpreter.h>
-#include <Interpreters/SelectQueryOptions.h>
-#include <Parsers/IAST_fwd.h>
+#include <Core/Block_fwd.h>
+#include <Interpreters/IInterpreterUnionOrSelectQuery.h>
 
 namespace DB
 {
 
-class Context;
 class InterpreterSelectQuery;
 class QueryPlan;
+class Block;
 
-/** Interprets one or multiple SELECT queries inside UNION ALL chain.
+using Blocks = std::vector<Block>;
+
+/** Interprets one or multiple SELECT queries inside UNION/UNION ALL/UNION DISTINCT chain.
   */
-class InterpreterSelectWithUnionQuery : public IInterpreter
+class InterpreterSelectWithUnionQuery : public IInterpreterUnionOrSelectQuery
 {
 public:
+    using IInterpreterUnionOrSelectQuery::getSampleBlock;
+
     InterpreterSelectWithUnionQuery(
         const ASTPtr & query_ptr_,
-        const Context & context_,
+        ContextPtr context_,
+        const SelectQueryOptions &,
+        const Names & required_result_column_names = {});
+
+    InterpreterSelectWithUnionQuery(
+        const ASTPtr & query_ptr_,
+        ContextMutablePtr context_,
         const SelectQueryOptions &,
         const Names & required_result_column_names = {});
 
     ~InterpreterSelectWithUnionQuery() override;
 
     /// Builds QueryPlan for current query.
-    void buildQueryPlan(QueryPlan & query_plan);
+    void buildQueryPlan(QueryPlan & query_plan) override;
 
     BlockIO execute() override;
 
     bool ignoreLimits() const override { return options.ignore_limits; }
     bool ignoreQuota() const override { return options.ignore_quota; }
 
-    Block getSampleBlock();
-
-    static Block getSampleBlock(
+    static SharedHeader getSampleBlock(
         const ASTPtr & query_ptr_,
-        const Context & context_);
+        ContextPtr context_,
+        bool is_subquery = false,
+        bool is_create_parameterized_view = false);
 
-    void ignoreWithTotals();
+    void ignoreWithTotals() override;
 
-    ASTPtr getQuery() const { return query_ptr; }
+    bool supportsTransactions() const override { return true; }
 
 private:
-    SelectQueryOptions options;
-    ASTPtr query_ptr;
-    std::shared_ptr<Context> context;
+    std::vector<std::unique_ptr<IInterpreterUnionOrSelectQuery>> nested_interpreters;
 
-    std::vector<std::unique_ptr<InterpreterSelectQuery>> nested_interpreters;
+    static Block getCommonHeaderForUnion(const SharedHeaders & headers);
 
-    Block result_header;
+    SharedHeader getCurrentChildResultHeader(const ASTPtr & ast_ptr_, const Names & required_result_column_names);
 
-    size_t max_streams = 1;
-
-    static Block getCommonHeaderForUnion(const Blocks & headers);
+    std::unique_ptr<IInterpreterUnionOrSelectQuery>
+    buildCurrentChildInterpreter(const ASTPtr & ast_ptr_, const Names & current_required_result_column_names);
 };
 
 }

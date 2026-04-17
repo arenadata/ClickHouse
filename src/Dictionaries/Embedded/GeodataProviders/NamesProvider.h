@@ -1,8 +1,10 @@
 #pragma once
 
 #include <Common/FileUpdatesTracker.h>
-#include "INamesProvider.h"
+#include <Dictionaries/Embedded/GeodataProviders/INamesProvider.h>
 
+namespace DB
+{
 
 // Represents local file with list of regions ids / names
 class LanguageRegionsNamesDataSource : public ILanguageRegionsNamesDataSource
@@ -39,10 +41,12 @@ private:
     std::string directory;
 
 public:
-    RegionsNamesDataProvider(const std::string & directory_);
+    explicit RegionsNamesDataProvider(const std::string & directory_);
 
     ILanguageRegionsNamesDataSourcePtr getLanguageRegionsNamesSource(const std::string & language) const override;
 
 private:
     std::string getDataFilePath(const std::string & language) const;
 };
+
+}

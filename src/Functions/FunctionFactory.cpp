@@ -1,15 +1,28 @@
 #include <Functions/FunctionFactory.h>
+#include <Functions/IFunctionAdaptors.h>
+
+#include <Functions/DateTimeTransforms.h>
 
 #include <Interpreters/Context.h>
 
 #include <Common/Exception.h>
+#include <Common/CurrentThread.h>
+#include <Core/Settings.h>
 
 #include <Poco/String.h>
 
 #include <IO/WriteHelpers.h>
 
+#include <AggregateFunctions/AggregateFunctionFactory.h>
+
+
 namespace DB
 {
+namespace Setting
+{
+    extern const SettingsBool log_queries;
+    extern const SettingsBool use_legacy_to_time;
+}
 
 namespace ErrorCodes
 {
@@ -17,42 +30,64 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-
-void FunctionFactory::registerFunction(const
-    std::string & name,
-    Value creator,
-    CaseSensitiveness case_sensitiveness)
+const String & getFunctionCanonicalNameIfAny(const String & name)
 {
-    if (!functions.emplace(name, creator).second)
-        throw Exception("FunctionFactory: the function name '" + name + "' is not unique",
-                        ErrorCodes::LOGICAL_ERROR);
+    return FunctionFactory::instance().getCanonicalNameIfAny(name);
+}
+
+void FunctionFactory::registerFunction(
+    const std::string & name,
+    FunctionCreator creator,
+    FunctionDocumentation documentation,
+    Case case_sensitiveness)
+{
+    if (!functions.emplace(name, FunctionFactoryData{creator, documentation}).second)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "FunctionFactory: the function name '{}' is not unique", name);
 
     String function_name_lowercase = Poco::toLower(name);
     if (isAlias(name) || isAlias(function_name_lowercase))
-        throw Exception("FunctionFactory: the function name '" + name + "' is already registered as alias",
-                        ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "FunctionFactory: the function name '{}' is already registered as alias",
+                        name);
 
-    if (case_sensitiveness == CaseInsensitive
-        && !case_insensitive_functions.emplace(function_name_lowercase, creator).second)
-        throw Exception("FunctionFactory: the case insensitive function name '" + name + "' is not unique",
-                        ErrorCodes::LOGICAL_ERROR);
+    if (case_sensitiveness == Case::Insensitive)
+    {
+        if (!case_insensitive_functions.emplace(function_name_lowercase, FunctionFactoryData{creator, documentation}).second)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "FunctionFactory: the case insensitive function name '{}' is not unique",
+                name);
+        case_insensitive_name_mapping[function_name_lowercase] = name;
+    }
+}
+
+void FunctionFactory::registerFunction(
+    const std::string & name,
+    FunctionSimpleCreator creator,
+    FunctionDocumentation documentation,
+    Case case_sensitiveness)
+{
+    registerFunction(name, [my_creator = std::move(creator)](ContextPtr context)
+    {
+        return std::make_unique<FunctionToOverloadResolverAdaptor>(my_creator(context));
+    }, std::move(documentation), std::move(case_sensitiveness));
 }
 
 
-FunctionOverloadResolverImplPtr FunctionFactory::getImpl(
+FunctionOverloadResolverPtr FunctionFactory::getImpl(
     const std::string & name,
-    const Context & context) const
+    ContextPtr context) const
 {
     auto res = tryGetImpl(name, context);
     if (!res)
     {
+        String extra_info;
+        if (AggregateFunctionFactory::instance().hasNameOrAlias(name))
+            extra_info = ". There is an aggregate function with the same name, but ordinary function is expected here";
+
         auto hints = this->getHints(name);
         if (!hints.empty())
-            throw Exception("Unknown function " + name + ". Maybe you meant: " + toString(hints),
-                            ErrorCodes::UNKNOWN_FUNCTION);
-        else
-            throw Exception("Unknown function " + name, ErrorCodes::UNKNOWN_FUNCTION);
+            throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "Unknown function {}{}. Maybe you meant: {}", name, extra_info, toString(hints));
+        throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "Unknown function {}{}", name, extra_info);
     }
+
     return res;
 }
 
@@ -67,41 +102,81 @@ std::vector<std::string> FunctionFactory::getAllNames() const
 
 FunctionOverloadResolverPtr FunctionFactory::get(
     const std::string & name,
-    const Context & context) const
+    ContextPtr context) const
 {
-    return std::make_shared<FunctionOverloadResolverAdaptor>(getImpl(name, context));
+    return getImpl(name, context);
 }
 
-FunctionOverloadResolverImplPtr FunctionFactory::tryGetImpl(
+bool FunctionFactory::has(const std::string & name) const
+{
+    String canonical_name = getAliasToOrName(name);
+    if (functions.contains(canonical_name))
+        return true;
+    canonical_name = Poco::toLower(canonical_name);
+    return case_insensitive_functions.contains(canonical_name);
+}
+
+FunctionOverloadResolverPtr FunctionFactory::tryGetImpl(
     const std::string & name_param,
-    const Context & context) const
+    ContextPtr context) const
 {
     String name = getAliasToOrName(name_param);
+    FunctionOverloadResolverPtr res;
 
     auto it = functions.find(name);
     if (functions.end() != it)
-        return it->second(context);
+        res = it->second.first(context);
+    else
+    {
+        name = Poco::toLower(name);
+        it = case_insensitive_functions.find(name);
+        if (case_insensitive_functions.end() != it)
+            res = it->second.first(context);
+    }
 
-    it = case_insensitive_functions.find(Poco::toLower(name));
-    if (case_insensitive_functions.end() != it)
-        return it->second(context);
+    if (!res)
+        return nullptr;
 
-    return {};
+    if (CurrentThread::isInitialized())
+    {
+        auto query_context = CurrentThread::get().tryGetQueryContext();
+        if (query_context && query_context->getSettingsRef()[Setting::log_queries])
+            query_context->addQueryFactoriesInfo(Context::QueryLogFactories::Function, name);
+
+        /// There is a legacy toTime function that has the same name as toTime function for Time data type, so we need to
+        /// check this setting here and decide if we need to change the function to get
+        if (query_context && Poco::toLower(name) == "totime" && query_context->getSettingsRef()[Setting::use_legacy_to_time])
+        {
+            it = functions.find(ToTimeWithFixedDateImpl::name);
+            if (functions.end() != it)
+                res = it->second.first(context);
+        }
+    }
+
+    return res;
 }
 
 FunctionOverloadResolverPtr FunctionFactory::tryGet(
-        const std::string & name,
-        const Context & context) const
+    const std::string & name,
+    ContextPtr context) const
 {
     auto impl = tryGetImpl(name, context);
-    return impl ? std::make_shared<FunctionOverloadResolverAdaptor>(std::move(impl))
-                : nullptr;
+    return impl ? std::move(impl) : nullptr;
 }
 
 FunctionFactory & FunctionFactory::instance()
 {
     static FunctionFactory ret;
     return ret;
+}
+
+FunctionDocumentation FunctionFactory::getDocumentation(const std::string & name) const
+{
+    auto it = functions.find(name);
+    if (it == functions.end())
+        throw Exception(ErrorCodes::UNKNOWN_FUNCTION, "Unknown function {}", name);
+
+    return it->second.second;
 }
 
 }

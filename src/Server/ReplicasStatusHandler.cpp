@@ -1,53 +1,73 @@
-#include "ReplicasStatusHandler.h"
+#include <Server/ReplicasStatusHandler.h>
 
-#include <Interpreters/Context.h>
-#include <Storages/StorageReplicatedMergeTree.h>
-#include <Common/HTMLForm.h>
-#include <Common/typeid_cast.h>
+#include <Common/quoteString.h>
+#include <Core/ServerSettings.h>
 #include <Databases/IDatabase.h>
 #include <IO/HTTPCommon.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Server/HTTP/HTMLForm.h>
+#include <Server/HTTPHandlerFactory.h>
+#include <Server/HTTPHandlerRequestFilter.h>
+#include <Server/HTTPResponseHeaderWriter.h>
+#include <Server/IServer.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/StorageReplicatedMergeTree.h>
+#include <Common/typeid_cast.h>
 
 #include <Poco/Net/HTTPRequestHandlerFactory.h>
 #include <Poco/Net/HTTPServerRequest.h>
 #include <Poco/Net/HTTPServerResponse.h>
-#include <Server/HTTPHandlerFactory.h>
-#include <Server/HTTPHandlerRequestFilter.h>
 
 
 namespace DB
 {
 
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsUInt64 min_absolute_delay_to_close;
+    extern const MergeTreeSettingsUInt64 min_relative_delay_to_close;
+}
 
-ReplicasStatusHandler::ReplicasStatusHandler(IServer & server)
-    : context(server.context())
+ReplicasStatusHandler::ReplicasStatusHandler(IServer & server) : WithContext(server.context())
 {
 }
 
-
-void ReplicasStatusHandler::handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response)
+void ReplicasStatusHandler::handleRequest(HTTPServerRequest & request, HTTPServerResponse & response, const ProfileEvents::Event & /*write_event*/)
 {
     try
     {
-        HTMLForm params(request);
+        applyHTTPResponseHeaders(response, http_response_headers_override);
+
+        HTMLForm params(getContext()->getSettingsRef(), request);
+
+        const auto & config = getContext()->getConfigRef();
+
+        const MergeTreeSettings & settings = getContext()->getReplicatedMergeTreeSettings();
 
         /// Even if lag is small, output detailed information about the lag.
-        bool verbose = params.get("verbose", "") == "1";
+        bool verbose = false;
+        bool enable_verbose = config.getBool("enable_verbose_replicas_status", true);
 
-        const MergeTreeSettings & settings = context.getMergeTreeSettings();
+        if (params.get("verbose", "") == "1" && enable_verbose)
+            verbose = true;
 
         bool ok = true;
-        std::stringstream message;
+        WriteBufferFromOwnString message;
 
-        auto databases = DatabaseCatalog::instance().getDatabases();
+        auto databases = DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_datalake_catalogs = false});
 
         /// Iterate through all the replicated tables.
         for (const auto & db : databases)
         {
-            /// Lazy database can not contain replicated tables
-            if (db.second->getEngineName() == "Lazy")
+            /// Check if database can contain replicated tables
+            if (db.second->isExternal())
                 continue;
 
-            for (auto iterator = db.second->getTablesIterator(context); iterator->isValid(); iterator->next())
+            // Note that in case `async_load_databases = true` we do not want replica status handler to be hanging
+            // and waiting (in getTablesIterator() call) for every table to be load, so we just skip not-yet-loaded tables.
+            // If they have some lag it will be reflected as soon as they are load.
+            for (auto iterator = db.second->getTablesIterator(getContext(), {}, true); iterator->isValid(); iterator->next())
             {
                 const auto & table = iterator->table();
                 if (!table)
@@ -61,29 +81,40 @@ void ReplicasStatusHandler::handleRequest(Poco::Net::HTTPServerRequest & request
                 time_t absolute_delay = 0;
                 time_t relative_delay = 0;
 
-                table_replicated->getReplicaDelays(absolute_delay, relative_delay);
+                if (!table_replicated->isTableReadOnly())
+                {
+                    table_replicated->getReplicaDelays(absolute_delay, relative_delay);
 
-                if ((settings.min_absolute_delay_to_close && absolute_delay >= static_cast<time_t>(settings.min_absolute_delay_to_close))
-                    || (settings.min_relative_delay_to_close && relative_delay >= static_cast<time_t>(settings.min_relative_delay_to_close)))
-                    ok = false;
+                    if ((settings[MergeTreeSetting::min_absolute_delay_to_close] && absolute_delay >= static_cast<time_t>(settings[MergeTreeSetting::min_absolute_delay_to_close]))
+                        || (settings[MergeTreeSetting::min_relative_delay_to_close] && relative_delay >= static_cast<time_t>(settings[MergeTreeSetting::min_relative_delay_to_close])))
+                        ok = false;
 
-                message << backQuoteIfNeed(db.first) << "." << backQuoteIfNeed(iterator->name())
-                    << ":\tAbsolute delay: " << absolute_delay << ". Relative delay: " << relative_delay << ".\n";
+                    message << backQuoteIfNeed(db.first) << "." << backQuoteIfNeed(iterator->name())
+                        << ":\tAbsolute delay: " << absolute_delay << ". Relative delay: " << relative_delay << ".\n";
+                }
+                else
+                {
+                    message << backQuoteIfNeed(db.first) << "." << backQuoteIfNeed(iterator->name())
+                        << ":\tis readonly. \n";
+                }
             }
         }
 
-        const auto & config = context.getConfigRef();
-        setResponseDefaultHeaders(response, config.getUInt("keep_alive_timeout", 10));
+        setResponseDefaultHeaders(response);
 
-        if (ok && !verbose)
+        if (!ok)
+        {
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_SERVICE_UNAVAILABLE);
+            if (enable_verbose)
+                verbose = true;
+        }
+
+        if (verbose)
+            *response.send() << message.str();
+        else
         {
             const char * data = "Ok.\n";
             response.sendBuffer(data, strlen(data));
-        }
-        else
-        {
-            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_SERVICE_UNAVAILABLE);
-            response.send() << message.rdbuf();
         }
     }
     catch (...)
@@ -97,19 +128,30 @@ void ReplicasStatusHandler::handleRequest(Poco::Net::HTTPServerRequest & request
             if (!response.sent())
             {
                 /// We have not sent anything yet and we don't even know if we need to compress response.
-                response.send() << getCurrentExceptionMessage(false) << std::endl;
+                *response.send() << getCurrentExceptionMessage(false) << '\n';
             }
         }
         catch (...)
         {
-            LOG_ERROR((&Poco::Logger::get("ReplicasStatusHandler")), "Cannot send exception to client");
+            LOG_ERROR((getLogger("ReplicasStatusHandler")), "Cannot send exception to client");
         }
     }
 }
 
-Poco::Net::HTTPRequestHandlerFactory * createReplicasStatusHandlerFactory(IServer & server, const std::string & config_prefix)
+HTTPRequestHandlerFactoryPtr createReplicasStatusHandlerFactory(IServer & server,
+    const Poco::Util::AbstractConfiguration & config,
+    const std::string & config_prefix,
+    std::unordered_map<String, String> & common_headers)
 {
-    return addFiltersFromConfig(new HandlingRuleHTTPHandlerFactory<ReplicasStatusHandler>(server), server.config(), config_prefix);
+    std::unordered_map<String, String> http_response_headers_override
+        = parseHTTPResponseHeadersWithCommons(config, config_prefix, "text/plain; charset=UTF-8", common_headers);
+
+    auto creator = [&server, http_response_headers_override]() -> std::unique_ptr<ReplicasStatusHandler>
+    { return std::make_unique<ReplicasStatusHandler>(server, http_response_headers_override); };
+
+    auto factory = std::make_shared<HandlingRuleHTTPHandlerFactory<ReplicasStatusHandler>>(std::move(creator));
+    factory->addFiltersFromConfig(config, config_prefix);
+    return factory;
 }
 
 }

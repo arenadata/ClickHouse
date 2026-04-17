@@ -2,7 +2,6 @@
 
 #include <Parsers/IAST.h>
 #include <Parsers/ASTFunctionWithKeyValueArguments.h>
-#include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTExpressionList.h>
 
 #include <Parsers/ASTSetQuery.h>
@@ -11,6 +10,8 @@
 
 namespace DB
 {
+
+class ASTLiteral;
 
 /// AST for external dictionary lifetime:
 /// lifetime(min 10 max 100)
@@ -24,7 +25,8 @@ public:
 
     ASTPtr clone() const override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 /// AST for external dictionary layout. Has name and contain single parameter
@@ -36,7 +38,8 @@ public:
     /// flat, cache, hashed, etc.
     String layout_type;
     /// parameters (size_in_cells, ...)
-    std::vector<KeyValue> parameters;
+    /// ASTExpressionList -> ASTPair -> (ASTLiteral key, ASTLiteral value).
+    ASTExpressionList * parameters;
     /// has brackets after layout type
     bool has_brackets = true;
 
@@ -44,7 +47,13 @@ public:
 
     ASTPtr clone() const override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+    void forEachPointerToChild(std::function<void(IAST **, boost::intrusive_ptr<IAST> *)> f) override
+    {
+        f(reinterpret_cast<IAST **>(&parameters), nullptr);
+    }
+
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 
@@ -61,7 +70,8 @@ public:
 
     ASTPtr clone() const override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 class ASTDictionarySettings : public IAST
@@ -73,7 +83,8 @@ public:
 
     ASTPtr clone() const override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 
@@ -82,25 +93,26 @@ class ASTDictionary : public IAST
 {
 public:
     /// Dictionary keys -- one or more
-    ASTExpressionList * primary_key;
+    ASTExpressionList * primary_key = nullptr;
     /// Dictionary external source, doesn't have own AST, because
     /// source parameters absolutely different for different sources
-    ASTFunctionWithKeyValueArguments * source;
+    ASTFunctionWithKeyValueArguments * source = nullptr;
 
     /// Lifetime of dictionary (required part)
-    ASTDictionaryLifetime * lifetime;
+    ASTDictionaryLifetime * lifetime = nullptr;
     /// Layout of dictionary (required part)
-    ASTDictionaryLayout * layout;
+    ASTDictionaryLayout * layout = nullptr;
     /// Range for dictionary (only for range-hashed dictionaries)
-    ASTDictionaryRange * range;
+    ASTDictionaryRange * range = nullptr;
     /// Settings for dictionary (optionally)
-    ASTDictionarySettings * dict_settings;
+    ASTDictionarySettings * dict_settings = nullptr;
 
     String getID(char) const override { return "Dictionary definition"; }
 
     ASTPtr clone() const override;
 
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
 };
 
 }

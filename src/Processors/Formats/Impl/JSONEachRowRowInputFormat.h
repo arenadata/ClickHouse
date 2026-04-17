@@ -1,8 +1,10 @@
 #pragma once
 
-#include <Core/Block.h>
+#include <Core/BlockNameMap.h>
 #include <Processors/Formats/IRowInputFormat.h>
+#include <Processors/Formats/ISchemaReader.h>
 #include <Formats/FormatSettings.h>
+#include <Formats/SchemaInferenceUtils.h>
 #include <Common/HashTable/HashMap.h>
 
 
@@ -20,29 +22,40 @@ class ReadBuffer;
 class JSONEachRowRowInputFormat : public IRowInputFormat
 {
 public:
-    JSONEachRowRowInputFormat(ReadBuffer & in_, const Block & header_, Params params_, const FormatSettings & format_settings_);
+    JSONEachRowRowInputFormat(
+        ReadBuffer & in_,
+        SharedHeader header_,
+        Params params_,
+        const FormatSettings & format_settings_,
+        bool yield_strings_);
 
     String getName() const override { return "JSONEachRowRowInputFormat"; }
+    void resetParser() override;
 
+protected:
     void readPrefix() override;
     void readSuffix() override;
 
+private:
     bool readRow(MutableColumns & columns, RowReadExtension & ext) override;
     bool allowSyncAfterError() const override { return true; }
     void syncAfterError() override;
-    void resetParser() override;
 
-private:
+    size_t countRows(size_t max_block_size) override;
+    bool supportsCountRows() const override { return true; }
+    bool supportsCustomSerializations() const override { return true; }
+
     const String & columnName(size_t i) const;
-    size_t columnIndex(const StringRef & name, size_t key_index);
+    size_t columnIndex(std::string_view name, size_t key_index);
     bool advanceToNextKey(size_t key_index);
-    void skipUnknownField(const StringRef & name_ref);
-    StringRef readColumnName(ReadBuffer & buf);
+    void skipUnknownField(std::string_view name_ref);
+    std::string_view readColumnName(ReadBuffer & buf);
     void readField(size_t index, MutableColumns & columns);
     void readJSONObject(MutableColumns & columns);
     void readNestedData(const String & name, MutableColumns & columns);
 
-    const FormatSettings format_settings;
+    virtual void readRowStart(MutableColumns &) {}
+    virtual void skipRowStart() {}
 
     /// Buffer for the read from the stream field name. Used when you have to copy it.
     /// Also, if processing of Nested data is in progress, it holds the common prefix
@@ -57,24 +70,49 @@ private:
     /// the nested column names are 'n.i' and 'n.s' and the nested prefix is 'n.'
     size_t nested_prefix_length = 0;
 
-    /// Set of columns for which the values were read. The rest will be filled with default values.
-    std::vector<UInt8> read_columns;
-    /// Set of columns which already met in row. Exception is thrown if there are more than one column with the same name.
-    std::vector<UInt8> seen_columns;
     /// These sets may be different, because if null_as_default=1 read_columns[i] will be false and seen_columns[i] will be true
     /// for row like {..., "non-nullable column name" : null, ...}
 
     /// Hash table match `field name -> position in the block`. NOTE You can use perfect hash map.
-    using NameMap = HashMap<StringRef, size_t, StringRefHash>;
-    NameMap name_map;
+    BlockNameMap name_map;
 
     /// Cached search results for previous row (keyed as index in JSON object) - used as a hint.
-    std::vector<NameMap::LookupResult> prev_positions;
+    std::vector<BlockNameMap::const_iterator> prev_positions;
+
+    bool yield_strings;
+
+protected:
+    virtual bool checkEndOfData(bool is_first_row);
+
+    const FormatSettings format_settings;
+
+    /// Set of columns for which the values were read. The rest will be filled with default values.
+    std::vector<UInt8> read_columns;
+    /// Set of columns which already met in row. Exception is thrown if there are more than one column with the same name.
+    std::vector<UInt8> seen_columns;
+    size_t seen_columns_count = 0;
+    size_t total_columns = 0;
 
     /// This flag is needed to know if data is in square brackets.
     bool data_in_square_brackets = false;
 
     bool allow_new_rows = true;
+};
+
+class JSONEachRowSchemaReader : public IRowWithNamesSchemaReader
+{
+public:
+    JSONEachRowSchemaReader(ReadBuffer & in_, const FormatSettings & format_settings_);
+
+private:
+    NamesAndTypesList readRowAndGetNamesAndDataTypes(bool & eof) override;
+    void transformTypesIfNeeded(DataTypePtr & type, DataTypePtr & new_type) override;
+    void transformTypesFromDifferentFilesIfNeeded(DataTypePtr & type, DataTypePtr & new_type) override;
+    void transformFinalTypeIfNeeded(DataTypePtr & type) override;
+
+    bool first_row = true;
+    bool data_in_square_brackets = false;
+    JSONInferenceInfo inference_info;
 };
 
 }

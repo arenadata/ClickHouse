@@ -1,16 +1,23 @@
 ---
-toc_priority: 46
-toc_title: ROLE
+description: 'Documentation for Role'
+sidebar_label: 'ROLE'
+sidebar_position: 46
+slug: /sql-reference/statements/alter/role
+title: 'ALTER ROLE'
+doc_type: 'reference'
 ---
-
-## ALTER ROLE {#alter-role-statement}
 
 Changes roles.
 
 Syntax:
 
-``` sql
-ALTER ROLE [IF EXISTS] name [ON CLUSTER cluster_name]
-    [RENAME TO new_name]
-    [SETTINGS variable [= value] [MIN [=] min_value] [MAX [=] max_value] [READONLY|WRITABLE] | PROFILE 'profile_name'] [,...]
+```sql
+ALTER ROLE [IF EXISTS] name1 [RENAME TO new_name |, name2 [,...]] 
+    [ON CLUSTER cluster_name]
+    [DROP ALL PROFILES]
+    [DROP ALL SETTINGS]
+    [DROP PROFILES 'profile_name' [,...] ]
+    [DROP SETTINGS variable [,...] ]
+    [ADD|MODIFY SETTINGS variable [= value] [MIN [=] min_value] [MAX [=] max_value] [CONST|READONLY|WRITABLE|CHANGEABLE_IN_READONLY] | PROFILE 'profile_name'] [,...]
+    [ADD PROFILES 'profile_name' [,...] ]
 ```

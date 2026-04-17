@@ -1,43 +1,35 @@
 # Contributing to ClickHouse
 
-ClickHouse is an open project, and you can contribute to it in many ways. You can help with ideas, code, or documentation. We appreciate any efforts that help us to make the project better.
+ClickHouse is an open project to which you can contribute in many ways, for example, with ideas, code, or documentation.
+We appreciate all efforts that help to make the project better.
 
-Thank you.
-
-## Technical Info
-
-We have a [developer's guide](https://clickhouse.yandex/docs/en/development/developer_instruction/) for writing code for ClickHouse. Besides this guide, you can find [Overview of ClickHouse Architecture](https://clickhouse.yandex/docs/en/development/architecture/) and instructions on how to build ClickHouse in different environments.
-
-If you want to contribute to documentation, read the [Contributing to ClickHouse Documentation](docs/README.md) guide.
+Thank you!
 
 ## Legal Info
 
-In order for us (YANDEX LLC) to accept patches and other contributions from you, you may adopt our Yandex Contributor License Agreement (the "**CLA**"). The current version of the CLA you may find here:
-1) https://yandex.ru/legal/cla/?lang=en (in English) and
-2) https://yandex.ru/legal/cla/?lang=ru (in Russian).
+When you open your first pull request in the ClickHouse repository, a bot will ask to accept the ClickHouse Individual CLA (Contributor License Agreement).
+Please review and sign it.
 
-By adopting the CLA, you state the following:
+Optionally, to make contributions more legally binding, your employer as a legal entity may want to sign a ClickHouse Corporate CLA with ClickHouse, Inc.
+If you're interested to do so, contact us at [legal@clickhouse.com](mailto:legal@clickhouse.com).
 
-* You obviously wish and are willingly licensing your contributions to us for our open source projects under the terms of the CLA,
-* You have read the terms and conditions of the CLA and agree with them in full,
-* You are legally able to provide and license your contributions as stated,
-* We may use your contributions for our open source projects and for any other our project too,
-* We rely on your assurances concerning the rights of third parties in relation to your contributions.
+## Technical Information
 
-If you agree with these principles, please read and adopt our CLA. By providing us your contributions, you hereby declare that you have already read and adopt our CLA, and we may freely merge your contributions with our corresponding open source project and use it in further in accordance with terms and conditions of the CLA.
+For an overview of ClickHouse internals, see:
+- [VLDB 2024 research paper (PDF): ClickHouse - Lightning Fast Analytics for Everyone](https://www.vldb.org/pvldb/vol17/p3731-schulze.pdf)
+- [Architecture Overview](https://clickhouse.com/docs/development/architecture/)
 
-If you have already adopted terms and conditions of the CLA, you are able to provide your contributes. When you submit your pull request, please add the following information into it:
+For an overview of the contributor-facing development documentation, start here: [Development and contributing](https://clickhouse.com/docs/development/)
 
-```
-I hereby agree to the terms of the CLA available at: [link].
-```
+Common entry points:
+- [Developer prerequisites and setup](https://clickhouse.com/docs/development/developer-instruction)
+- [Build on Linux](https://clickhouse.com/docs/development/build)
+- [Build on macOS for macOS](https://clickhouse.com/docs/development/build-osx)
+- [Testing ClickHouse](https://clickhouse.com/docs/development/tests)
+- [C++ Style Guide](https://clickhouse.com/docs/development/style)
 
-Replace the bracketed text as follows:
-* [link] is the link at the current version of the CLA (you may add here a link https://yandex.ru/legal/cla/?lang=en (in English) or a link https://yandex.ru/legal/cla/?lang=ru (in Russian).
+If you want to contribute to documentation, please see the [documentation repository](https://github.com/ClickHouse/clickhouse-docs).
 
-It is enough to provide us such notification once.
+## See Also
 
-As an alternative, you can provide DCO instead of CLA. You can find the text of DCO here: https://developercertificate.org/
-It is enough to read and copy it verbatim to your pull request.
-
-If you don't agree with the CLA and don't want to provide DCO, you still can open a pull request to provide your contributions.
+See also [ClickHouse AI Policy](AI_POLICY.md).

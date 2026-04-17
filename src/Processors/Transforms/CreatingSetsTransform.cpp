@@ -1,15 +1,18 @@
 #include <Processors/Transforms/CreatingSetsTransform.h>
-
-#include <DataStreams/BlockStreamProfileInfo.h>
-#include <DataStreams/IBlockInputStream.h>
-#include <DataStreams/IBlockOutputStream.h>
+#include <Processors/Executors/PushingPipelineExecutor.h>
+#include <Processors/Sinks/SinkToStorage.h>
 
 #include <Interpreters/Set.h>
 #include <Interpreters/IJoin.h>
+#include <Interpreters/Context.h>
 #include <Storages/IStorage.h>
 
-#include <iomanip>
-#include <DataStreams/materializeBlock.h>
+#include <Common/CurrentThread.h>
+#include <Common/Exception.h>
+#include <Common/logger_useful.h>
+
+#include <exception>
+
 
 namespace DB
 {
@@ -18,86 +21,170 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int SET_SIZE_LIMIT_EXCEEDED;
+    extern const int UNKNOWN_EXCEPTION;
 }
 
-
-CreatingSetsTransform::CreatingSetsTransform(
-    Block out_header_,
-    SubqueriesForSets subqueries_for_sets_,
-    SizeLimits network_transfer_limits_,
-    const Context & context_)
-    : IProcessor({}, {std::move(out_header_)})
-    , subqueries_for_sets(std::move(subqueries_for_sets_))
-    , cur_subquery(subqueries_for_sets.begin())
-    , network_transfer_limits(std::move(network_transfer_limits_))
-    , context(context_)
+CreatingSetsTransform::~CreatingSetsTransform()
 {
-}
-
-IProcessor::Status CreatingSetsTransform::prepare()
-{
-    auto & output = outputs.front();
-
-    if (finished)
+    if (promise_to_build)
     {
-        output.finish();
-        return Status::Finished;
+        /// set_exception can also throw
+        try
+        {
+            promise_to_build->set_exception(std::make_exception_ptr(
+                Exception(ErrorCodes::UNKNOWN_EXCEPTION, "Failed to build set, most likely pipeline executor was stopped")));
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Failed to set_exception for promise");
+        }
     }
 
-    /// Check can output.
-    if (output.isFinished())
-        return Status::Finished;
-
-    if (!output.canPush())
-        return Status::PortFull;
-
-    return Status::Ready;
+    if (executor)
+    {
+        try
+        {
+            executor->cancel();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Failed to cancel PushingPipelineExecutor");
+        }
+    }
 }
 
-void CreatingSetsTransform::startSubquery(SubqueryForSet & subquery)
+CreatingSetsTransform::CreatingSetsTransform(
+    SharedHeader in_header_,
+    SharedHeader out_header_,
+    SetAndKeyPtr set_and_key_,
+    SizeLimits network_transfer_limits_,
+    PreparedSetsCachePtr prepared_sets_cache_)
+    : IAccumulatingTransform(std::move(in_header_), std::move(out_header_))
+    , set_and_key(std::move(set_and_key_))
+    , network_transfer_limits(std::move(network_transfer_limits_))
+    , prepared_sets_cache(std::move(prepared_sets_cache_))
 {
-    if (subquery.set)
-        LOG_TRACE(log, "Creating set.");
-    if (subquery.join)
-        LOG_TRACE(log, "Creating join.");
-    if (subquery.table)
+}
+
+void CreatingSetsTransform::work()
+{
+    try
+    {
+        if (!is_initialized)
+            init();
+
+        if (done_with_set && done_with_table)
+        {
+            finishConsume();
+            input.close();
+        }
+
+        IAccumulatingTransform::work();
+    }
+    catch (...)
+    {
+        if (promise_to_build)
+        {
+            /// set_exception can also throw
+            try
+            {
+                promise_to_build->set_exception(std::current_exception());
+                promise_to_build.reset();
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, "Failed to set_exception for promise");
+            }
+        }
+        throw;
+    }
+}
+
+void CreatingSetsTransform::startSubquery()
+{
+    /// Lookup the set in the cache if we don't need to build table.
+    if (prepared_sets_cache && !set_and_key->external_table)
+    {
+        /// Try to find the set in the cache and wait for it to be built.
+        /// Retry if the set from cache fails to be built.
+        while (true)
+        {
+            try
+            {
+                auto from_cache = prepared_sets_cache->findOrPromiseToBuild(set_and_key->key);
+                if (from_cache.index() == 0)
+                {
+                    LOG_TRACE(log, "Building set, key: {}", set_and_key->key);
+                    promise_to_build = std::move(std::get<0>(from_cache));
+                }
+                else
+                {
+                    LOG_TRACE(log, "Waiting for set to be built by another thread, key: {}", set_and_key->key);
+                    SharedSet set_built_by_another_thread = std::move(std::get<1>(from_cache));
+                    const SetPtr & ready_set = set_built_by_another_thread.get();
+                    if (!ready_set)
+                    {
+                        LOG_TRACE(log, "Failed to use set from cache, key: {}", set_and_key->key);
+                        continue;
+                    }
+
+                    set_and_key->set = ready_set;
+                    done_with_set = true;
+                    set_from_cache = true;
+                }
+                break;
+            }
+            /// Exception that is thrown by the shared_future::get() is shared across all waiters and cannot be modified from multiple threads.
+            /// Re-create exception to allow later concurrent modify (i.e. addMessage() during pipeline execution)
+            ///
+            /// Note, that findOrPromiseToBuild() can also call shared_future::get()
+            catch (const Exception & e)
+            {
+                throw Exception(e);
+            }
+            catch (...)
+            {
+                throw Exception::createRuntime(ErrorCodes::UNKNOWN_EXCEPTION, getExceptionMessage(std::current_exception(), /* with_stacktrace= */ false));
+            }
+        }
+    }
+
+    if (set_and_key->set && !set_from_cache)
+        LOG_TRACE(log, "Creating set, key: {}", set_and_key->key);
+    if (set_and_key->external_table)
         LOG_TRACE(log, "Filling temporary table.");
 
-    elapsed_nanoseconds = 0;
+    if (set_and_key->external_table)
+        /// TODO: make via port
+        table_out = QueryPipeline(set_and_key->external_table->write({}, set_and_key->external_table->getInMemoryMetadataPtr(CurrentThread::tryGetQueryContext(), false), nullptr, /*async_insert=*/false));
 
-    if (subquery.table)
-        table_out = subquery.table->write({}, subquery.table->getInMemoryMetadataPtr(), context);
+    done_with_set = !set_and_key->set || set_from_cache;
+    done_with_table = !set_and_key->external_table;
 
-    done_with_set = !subquery.set;
-    done_with_join = !subquery.join;
-    done_with_table = !subquery.table;
+    if ((done_with_set && !set_from_cache) && done_with_table)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Nothing to do with subquery");
 
-    if (done_with_set && done_with_join && done_with_table)
-        throw Exception("Logical error: nothing to do with subquery", ErrorCodes::LOGICAL_ERROR);
-
-    if (table_out)
-        table_out->writePrefix();
+    if (table_out.initialized())
+    {
+        executor = std::make_unique<PushingPipelineExecutor>(table_out);
+        executor->start();
+    }
 }
 
-void CreatingSetsTransform::finishSubquery(SubqueryForSet & subquery)
+void CreatingSetsTransform::finishSubquery()
 {
-    size_t head_rows = 0;
-    const BlockStreamProfileInfo & profile_info = subquery.source->getProfileInfo();
+    auto seconds = static_cast<double>(watch.elapsedNanoseconds()) / 1e9;
 
-    head_rows = profile_info.rows;
-
-    subquery.setTotals();
-
-    if (head_rows != 0)
+    if (set_from_cache)
     {
-        auto seconds = elapsed_nanoseconds / 1e9;
-
-        if (subquery.set)
-            LOG_DEBUG(log, "Created Set with {} entries from {} rows in {} sec.", subquery.set->getTotalRowCount(), head_rows, seconds);
-        if (subquery.join)
-            LOG_DEBUG(log, "Created Join with {} entries from {} rows in {} sec.", subquery.join->getTotalRowCount(), head_rows, seconds);
-        if (subquery.table)
-            LOG_DEBUG(log, "Created Table with {} rows in {} sec.", head_rows, seconds);
+        LOG_DEBUG(log, "Got set from cache in {} sec.", seconds);
+    }
+    else if (read_rows != 0)
+    {
+        if (set_and_key->set)
+            LOG_DEBUG(log, "Created Set with {} entries from {} rows in {} sec.", set_and_key->set->getTotalRowCount(), read_rows, seconds);
+        if (set_and_key->external_table)
+            LOG_DEBUG(log, "Created Table with {} rows in {} sec.", read_rows, seconds);
     }
     else
     {
@@ -109,81 +196,25 @@ void CreatingSetsTransform::init()
 {
     is_initialized = true;
 
-    for (auto & elem : subqueries_for_sets)
-        if (elem.second.source && elem.second.set)
-            elem.second.set->setHeader(elem.second.source->getHeader());
+    watch.restart();
+    startSubquery();
 }
 
-void CreatingSetsTransform::work()
+void CreatingSetsTransform::consume(Chunk chunk)
 {
-    if (!is_initialized)
-        init();
-
-    Stopwatch watch;
-
-    while (cur_subquery != subqueries_for_sets.end() && cur_subquery->second.source == nullptr)
-        ++cur_subquery;
-
-    if (cur_subquery == subqueries_for_sets.end())
-    {
-        finished = true;
-        return;
-    }
-
-    SubqueryForSet & subquery = cur_subquery->second;
-
-    if (!started_cur_subquery)
-    {
-        startSubquery(subquery);
-        started_cur_subquery = true;
-    }
-
-    auto finish_current_subquery = [&]()
-    {
-        if (subquery.set)
-            subquery.set->finishInsert();
-
-        if (table_out)
-            table_out->writeSuffix();
-
-        watch.stop();
-        elapsed_nanoseconds += watch.elapsedNanoseconds();
-
-        finishSubquery(subquery);
-
-        ++cur_subquery;
-        started_cur_subquery = false;
-
-        while (cur_subquery != subqueries_for_sets.end() && cur_subquery->second.source == nullptr)
-            ++cur_subquery;
-
-        if (cur_subquery == subqueries_for_sets.end())
-            finished = true;
-    };
-
-    auto block = subquery.source->read();
-    if (!block)
-    {
-        finish_current_subquery();
-        return;
-    }
+    read_rows += chunk.getNumRows();
+    auto block = getInputPort().getHeader().cloneWithColumns(chunk.detachColumns());
 
     if (!done_with_set)
     {
-        if (!subquery.set->insertFromBlock(block))
+        if (!set_and_key->set->insertFromBlock(block.getColumnsWithTypeAndName()))
             done_with_set = true;
-    }
-
-    if (!done_with_join)
-    {
-        if (!subquery.insertJoinedBlock(block))
-            done_with_join = true;
     }
 
     if (!done_with_table)
     {
         block = materializeBlock(block);
-        table_out->write(block);
+        executor->push(block);
 
         rows_to_transfer += block.rows();
         bytes_to_transfer += block.bytes();
@@ -193,27 +224,31 @@ void CreatingSetsTransform::work()
             done_with_table = true;
     }
 
-    if (done_with_set && done_with_join && done_with_table)
+    if (done_with_set && done_with_table)
+        finishConsume();
+}
+
+Chunk CreatingSetsTransform::generate()
+{
+    if (set_and_key->set && !set_from_cache)
     {
-        subquery.source->cancel(false);
-        finish_current_subquery();
+        set_and_key->set->finishInsert();
+        if (promise_to_build)
+        {
+            promise_to_build->set_value(set_and_key->set);
+            promise_to_build.reset();
+        }
     }
-    else
-        elapsed_nanoseconds += watch.elapsedNanoseconds();
-}
 
-void CreatingSetsTransform::setProgressCallback(const ProgressCallback & callback)
-{
-    for (auto & elem : subqueries_for_sets)
-        if (elem.second.source)
-            elem.second.source->setProgressCallback(callback);
-}
+    if (table_out.initialized())
+    {
+        executor->finish();
+        executor.reset();
+        table_out.reset();
+    }
 
-void CreatingSetsTransform::setProcessListElement(QueryStatus * status)
-{
-    for (auto & elem : subqueries_for_sets)
-        if (elem.second.source)
-            elem.second.source->setProcessListElement(status);
+    finishSubquery();
+    return {};
 }
 
 }

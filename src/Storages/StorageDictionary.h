@@ -1,37 +1,26 @@
 #pragma once
 
-#include <Storages/IStorage.h>
-#include <ext/shared_ptr_helper.h>
+#include <atomic>
+
+#include <Storages/StorageWithCommonVirtualColumns.h>
+#include <Interpreters/IExternalLoaderConfigRepository.h>
+#include <base/scope_guard.h>
 
 
 namespace DB
 {
+
 struct DictionaryStructure;
+class TableFunctionDictionary;
+class IDictionary;
 
-class StorageDictionary final : public ext::shared_ptr_helper<StorageDictionary>, public IStorage
+class StorageDictionary final : public StorageWithCommonVirtualColumns, public WithContext
 {
-    friend struct ext::shared_ptr_helper<StorageDictionary>;
+friend class TableFunctionDictionary;
+
 public:
-    std::string getName() const override { return "Dictionary"; }
-
-    void checkTableCanBeDropped() const override;
-
-    Pipes read(
-        const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
-        const SelectQueryInfo & query_info,
-        const Context & context,
-        QueryProcessingStage::Enum processed_stage,
-        size_t max_block_size,
-        unsigned threads) override;
-
-    static NamesAndTypesList getNamesAndTypes(const DictionaryStructure & dictionary_structure);
-    static String generateNamesAndTypesDescription(const NamesAndTypesList & list);
-
-    const String & dictionaryName() const { return dictionary_name; }
-
     /// Specifies where the table is located relative to the dictionary.
-    enum class Location
+    enum class Location : uint8_t
     {
         /// Table was created automatically as an element of a database with the Dictionary engine.
         DictionaryDatabase,
@@ -48,22 +37,80 @@ public:
         Custom,
     };
 
-private:
-    const String dictionary_name;
-    const Location location;
-
-protected:
     StorageDictionary(
         const StorageID & table_id_,
         const String & dictionary_name_,
         const ColumnsDescription & columns_,
-        Location location_);
+        const String & comment,
+        Location location_,
+        ContextPtr context_);
 
     StorageDictionary(
         const StorageID & table_id_,
         const String & dictionary_name_,
         const DictionaryStructure & dictionary_structure,
-        Location location_);
+        const String & comment,
+        Location location_,
+        ContextPtr context_);
+
+    StorageDictionary(
+        const StorageID & table_id_,
+        LoadablesConfigurationPtr dictionary_configuration_,
+        ContextPtr context_);
+
+    std::string getName() const override { return "Dictionary"; }
+
+    static VirtualColumnsDescription createVirtuals();
+
+    ~StorageDictionary() override;
+
+    void checkTableCanBeDropped([[ maybe_unused ]] ContextPtr query_context) const override;
+    void checkTableCanBeDetached() const override;
+
+    using StorageWithCommonVirtualColumns::read;
+
+    Pipe read(
+        const Names & column_names,
+        const StorageSnapshotPtr & /*storage_snapshot*/,
+        SelectQueryInfo & /*query_info*/,
+        ContextPtr local_context,
+        QueryProcessingStage::Enum /*processed_stage*/,
+        size_t max_block_size,
+        size_t threads) override;
+
+    /// FIXME: processing after reading from dictionaries are not parallelized due to some bug:
+    /// count() can return wrong result, see test_dictionaries_redis/test_long.py::test_redis_dict_long
+    bool parallelizeOutputAfterReading(ContextPtr) const override { return false; }
+
+    std::shared_ptr<const IDictionary> getDictionary() const;
+
+    static NamesAndTypesList getNamesAndTypes(const DictionaryStructure & dictionary_structure, bool validate_id_type);
+
+    bool isDictionary() const override { return true; }
+    bool supportsColumnsWithDynamicStructure() const override { return true; }
+    void shutdown(bool is_drop) override;
+    void startup() override;
+
+    void renameInMemory(const StorageID & new_table_id) override;
+
+    void checkAlterIsPossible(const AlterCommands & commands, ContextPtr /* context */) const override;
+
+    void alter(const AlterCommands & params, ContextPtr alter_context, AlterLockHolder &) override;
+
+    LoadablesConfigurationPtr getConfiguration() const;
+
+    String getDictionaryName() const { return dictionary_name; }
+
+private:
+    String dictionary_name;
+    const Location location;
+
+    mutable std::mutex dictionary_config_mutex;
+    LoadablesConfigurationPtr configuration TSA_GUARDED_BY(dictionary_config_mutex);
+
+    scope_guard remove_repository_callback;
+
+    void removeDictionaryConfigurationFromRepository();
 };
 
 }

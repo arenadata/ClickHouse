@@ -1,26 +1,23 @@
+#include <DataTypes/IDataType.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferValidUTF8.h>
 #include <Processors/Formats/Impl/XMLRowOutputFormat.h>
+#include <Processors/Port.h>
 #include <Formats/FormatFactory.h>
 
 
 namespace DB
 {
 
-XMLRowOutputFormat::XMLRowOutputFormat(WriteBuffer & out_, const Block & header_, FormatFactory::WriteCallback callback, const FormatSettings & format_settings_)
-    : IRowOutputFormat(header_, out_, callback), format_settings(format_settings_)
+XMLRowOutputFormat::XMLRowOutputFormat(WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_)
+    : RowOutputFormatWithExceptionHandlerAdaptor<RowOutputFormatWithUTF8ValidationAdaptor, bool>(header_, out_, format_settings_.xml.valid_output_on_exception, true), fields(header_->getNamesAndTypes()), format_settings(format_settings_)
 {
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
     const auto & sample = getPort(PortKind::Main).getHeader();
-    NamesAndTypesList columns(sample.getNamesAndTypesList());
-    fields.assign(columns.begin(), columns.end());
     field_tag_names.resize(sample.columns());
 
-    bool need_validate_utf8 = false;
     for (size_t i = 0; i < sample.columns(); ++i)
     {
-        if (!sample.getByPosition(i).type->textCanContainOnlyValidUTF8())
-            need_validate_utf8 = true;
-
         /// As element names, we will use the column name if it has a valid form, or "field", otherwise.
         /// The condition below is more strict than the XML standard requires.
         bool is_column_name_suitable = true;
@@ -44,14 +41,6 @@ XMLRowOutputFormat::XMLRowOutputFormat(WriteBuffer & out_, const Block & header_
             ? fields[i].name
             : "field";
     }
-
-    if (need_validate_utf8)
-    {
-        validating_ostr = std::make_unique<WriteBufferValidUTF8>(out);
-        ostr = validating_ostr.get();
-    }
-    else
-        ostr = &out;
 }
 
 
@@ -67,10 +56,10 @@ void XMLRowOutputFormat::writePrefix()
         writeCString("\t\t\t<column>\n", *ostr);
 
         writeCString("\t\t\t\t<name>", *ostr);
-        writeXMLString(field.name, *ostr);
+        writeXMLStringForTextElement(field.name, *ostr);
         writeCString("</name>\n", *ostr);
         writeCString("\t\t\t\t<type>", *ostr);
-        writeXMLString(field.type->getName(), *ostr);
+        writeXMLStringForTextElement(field.type->getName(), *ostr);
         writeCString("</type>\n", *ostr);
 
         writeCString("\t\t\t</column>\n", *ostr);
@@ -82,12 +71,12 @@ void XMLRowOutputFormat::writePrefix()
 }
 
 
-void XMLRowOutputFormat::writeField(const IColumn & column, const IDataType & type, size_t row_num)
+void XMLRowOutputFormat::writeField(const IColumn & column, const ISerialization & serialization, size_t row_num)
 {
     writeCString("\t\t\t<", *ostr);
     writeString(field_tag_names[field_number], *ostr);
     writeCString(">", *ostr);
-    type.serializeAsTextXML(column, row_num, *ostr, format_settings);
+    serialization.serializeTextXML(column, row_num, *ostr, format_settings);
     writeCString("</", *ostr);
     writeString(field_tag_names[field_number], *ostr);
     writeCString(">\n", *ostr);
@@ -108,11 +97,9 @@ void XMLRowOutputFormat::writeRowEndDelimiter()
     ++row_count;
 }
 
-
 void XMLRowOutputFormat::writeSuffix()
 {
     writeCString("\t</data>\n", *ostr);
-
 }
 
 
@@ -132,7 +119,7 @@ void XMLRowOutputFormat::writeTotals(const Columns & columns, size_t row_num)
         writeCString("\t\t<", *ostr);
         writeString(field_tag_names[i], *ostr);
         writeCString(">", *ostr);
-        column.type->serializeAsTextXML(*columns[i], row_num, *ostr, format_settings);
+        column.type->getDefaultSerialization()->serializeTextXML(*columns[i], row_num, *ostr, format_settings);
         writeCString("</", *ostr);
         writeString(field_tag_names[i], *ostr);
         writeCString(">\n", *ostr);
@@ -181,7 +168,7 @@ void XMLRowOutputFormat::writeExtremesElement(const char * title, const Columns 
         writeCString("\t\t\t<", *ostr);
         writeString(field_tag_names[i], *ostr);
         writeCString(">", *ostr);
-        column.type->serializeAsTextXML(*columns[i], row_num, *ostr, format_settings);
+        column.type->getDefaultSerialization()->serializeTextXML(*columns[i], row_num, *ostr, format_settings);
         writeCString("</", *ostr);
         writeString(field_tag_names[i], *ostr);
         writeCString(">\n", *ostr);
@@ -193,34 +180,50 @@ void XMLRowOutputFormat::writeExtremesElement(const char * title, const Columns 
 }
 
 
-void XMLRowOutputFormat::onProgress(const Progress & value)
+void XMLRowOutputFormat::finalizeImpl()
 {
-    progress.incrementPiecewiseAtomically(value);
-}
-
-void XMLRowOutputFormat::writeLastSuffix()
-{
-
     writeCString("\t<rows>", *ostr);
     writeIntText(row_count, *ostr);
     writeCString("</rows>\n", *ostr);
 
-    writeRowsBeforeLimitAtLeast();
 
-    if (format_settings.write_statistics)
+    writeRowsBeforeLimitAtLeast();
+    writeRowsBeforeAggregationAtLeast();
+
+    if (!exception_message.empty())
+        writeException();
+    else if (format_settings.write_statistics)
         writeStatistics();
 
     writeCString("</result>\n", *ostr);
     ostr->next();
 }
 
+void XMLRowOutputFormat::resetFormatterImpl()
+{
+    RowOutputFormatWithExceptionHandlerAdaptor::resetFormatterImpl();
+    ostr = RowOutputFormatWithExceptionHandlerAdaptor::getWriteBufferPtr();
+    row_count = 0;
+    statistics = Statistics();
+}
+
 void XMLRowOutputFormat::writeRowsBeforeLimitAtLeast()
 {
-    if (applied_limit)
+    if (statistics.applied_limit)
     {
         writeCString("\t<rows_before_limit_at_least>", *ostr);
-        writeIntText(rows_before_limit, *ostr);
+        writeIntText(statistics.rows_before_limit, *ostr);
         writeCString("</rows_before_limit_at_least>\n", *ostr);
+    }
+}
+
+void XMLRowOutputFormat::writeRowsBeforeAggregationAtLeast()
+{
+    if (statistics.applied_aggregation)
+    {
+        writeCString("\t<rows_before_aggregation>", *ostr);
+        writeIntText(statistics.rows_before_aggregation, *ostr);
+        writeCString("</rows_before_aggregation>\n", *ostr);
     }
 }
 
@@ -228,28 +231,38 @@ void XMLRowOutputFormat::writeStatistics()
 {
     writeCString("\t<statistics>\n", *ostr);
     writeCString("\t\t<elapsed>", *ostr);
-    writeText(watch.elapsedSeconds(), *ostr);
+    writeText(statistics.watch.elapsedSeconds(), *ostr);
     writeCString("</elapsed>\n", *ostr);
     writeCString("\t\t<rows_read>", *ostr);
-    writeText(progress.read_rows.load(), *ostr);
+    writeText(statistics.progress.read_rows.load(), *ostr);
     writeCString("</rows_read>\n", *ostr);
     writeCString("\t\t<bytes_read>", *ostr);
-    writeText(progress.read_bytes.load(), *ostr);
+    writeText(statistics.progress.read_bytes.load(), *ostr);
     writeCString("</bytes_read>\n", *ostr);
     writeCString("\t</statistics>\n", *ostr);
 }
 
-
-void registerOutputFormatProcessorXML(FormatFactory & factory)
+void XMLRowOutputFormat::writeException()
 {
-    factory.registerOutputFormatProcessor("XML", [](
+    writeCString("\t<exception>", *ostr);
+    writeXMLStringForTextElement(exception_message, *ostr);
+    writeCString("</exception>\n", *ostr);
+}
+
+void registerOutputFormatXML(FormatFactory & factory)
+{
+    factory.registerOutputFormat("XML", [](
         WriteBuffer & buf,
         const Block & sample,
-        FormatFactory::WriteCallback callback,
-        const FormatSettings & settings)
+        const FormatSettings & settings,
+        FormatFilterInfoPtr /*format_filter_info*/)
     {
-        return std::make_shared<XMLRowOutputFormat>(buf, sample, callback, settings);
+        return std::make_shared<XMLRowOutputFormat>(buf, std::make_shared<const Block>(sample), settings);
     });
+
+    factory.markOutputFormatSupportsParallelFormatting("XML");
+    factory.markFormatHasNoAppendSupport("XML");
+    factory.setContentType("XML", "application/xml; charset=UTF-8");
 }
 
 }

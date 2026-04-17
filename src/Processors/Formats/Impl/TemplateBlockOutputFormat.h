@@ -1,7 +1,5 @@
 #pragma once
 
-#include <Common/Stopwatch.h>
-#include <Core/Block.h>
 #include <Formats/FormatSettings.h>
 #include <Processors/Formats/IOutputFormat.h>
 #include <Formats/ParsedTemplateFormatString.h>
@@ -10,20 +8,31 @@
 namespace DB
 {
 
+class ISerialization;
+using SerializationPtr = std::shared_ptr<const ISerialization>;
+using Serializations = std::vector<SerializationPtr>;
+
 class TemplateBlockOutputFormat : public IOutputFormat
 {
-    using ColumnFormat = ParsedTemplateFormatString::ColumnFormat;
+    using EscapingRule = FormatSettings::EscapingRule;
 public:
-    TemplateBlockOutputFormat(const Block & header_, WriteBuffer & out_, const FormatSettings & settings_,
+    TemplateBlockOutputFormat(SharedHeader header_, WriteBuffer & out_, const FormatSettings & settings_,
                               ParsedTemplateFormatString format_, ParsedTemplateFormatString row_format_,
                               std::string row_between_delimiter_);
 
     String getName() const override { return "TemplateBlockOutputFormat"; }
 
-    void doWritePrefix() override;
+    void setRowsBeforeLimit(size_t rows_before_limit_) override
+    {
+        statistics.rows_before_limit = rows_before_limit_;
+        statistics.applied_limit = true;
+    }
 
-    void setRowsBeforeLimit(size_t rows_before_limit_) override { rows_before_limit = rows_before_limit_; rows_before_limit_set = true; }
-    void onProgress(const Progress & progress_) override { progress.incrementPiecewiseAtomically(progress_); }
+    void setRowsBeforeAggregation(size_t rows_before_aggregation_) override
+    {
+        statistics.rows_before_aggregation = rows_before_aggregation_;
+        statistics.applied_aggregation = true;
+    }
 
     enum class ResultsetPart : size_t
     {
@@ -35,37 +44,33 @@ public:
         RowsBeforeLimit,
         TimeElapsed,
         RowsRead,
-        BytesRead
+        BytesRead,
+        RowsBeforeAggregation
     };
 
     static ResultsetPart stringToResultsetPart(const String & part);
 
-protected:
+private:
+    void writePrefix() override;
     void consume(Chunk chunk) override;
-    void consumeTotals(Chunk chunk) override { totals = std::move(chunk); }
-    void consumeExtremes(Chunk chunk) override { extremes = std::move(chunk); }
-    void finalize() override;
+    void consumeTotals(Chunk chunk) override { statistics.totals = std::move(chunk); }
+    void consumeExtremes(Chunk chunk) override { statistics.extremes = std::move(chunk); }
+    void finalizeImpl() override;
+    void resetFormatterImpl() override;
 
     void writeRow(const Chunk & chunk, size_t row_num);
-    void serializeField(const IColumn & column, const IDataType & type, size_t row_num, ColumnFormat format);
-    template <typename U, typename V> void writeValue(U value, ColumnFormat col_format);
+    template <typename U, typename V> void writeValue(U value, EscapingRule escaping_rule);
 
-protected:
+    void onRowsReadBeforeUpdate() override { row_count = getRowsReadBefore(); }
+    bool areTotalsAndExtremesUsedInFinalize() const override { return true; }
+
     const FormatSettings settings;
-    DataTypes types;
+    Serializations serializations;
 
     ParsedTemplateFormatString format;
     ParsedTemplateFormatString row_format;
 
-    size_t rows_before_limit = 0;
-    bool rows_before_limit_set = false;
-    Chunk totals;
-    Chunk extremes;
-    Progress progress;
-    Stopwatch watch;
-
     size_t row_count = 0;
-    bool need_write_prefix = true;
 
     std::string row_between_delimiter;
 };

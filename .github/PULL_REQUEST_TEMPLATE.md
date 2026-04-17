@@ -1,26 +1,35 @@
-I hereby agree to the terms of the CLA available at: https://yandex.ru/legal/cla/?lang=en
-
-Changelog category (leave one):
+### Changelog category (leave one):
 - New Feature
-- Bug Fix
+- Experimental Feature
 - Improvement
 - Performance Improvement
 - Backward Incompatible Change
 - Build/Testing/Packaging Improvement
 - Documentation (changelog entry is not required)
-- Other
+- Critical Bug Fix (crash, data loss, RBAC)
+- Bug Fix (user-visible misbehavior in an official stable release)
+- CI Fix or Improvement (changelog entry is not required)
 - Not for changelog (changelog entry is not required)
 
 
-Changelog entry (a user-readable short description of the changes that goes to CHANGELOG.md):
-
+### Changelog entry (a [user-readable short description](https://github.com/ClickHouse/ClickHouse/blob/master/docs/changelog_entry_guidelines.md) of the changes that goes into CHANGELOG.md):
 ...
 
+### Documentation entry for user-facing changes
 
-Detailed description / Documentation draft:
+- [ ] Documentation is written (mandatory for new features)
 
-...
+<!---
+Directly edit documentation source files in the "docs" folder with the same pull-request as code changes
 
-By adding documentation, you'll allow users to try your new feature immediately, not when someone else will have time to document it later. Documentation is necessary for all features that affect user experience in any way. You can add brief documentation draft above, or add documentation right into your patch as Markdown files in [docs](https://github.com/ClickHouse/ClickHouse/tree/master/docs) folder.
+or
 
-If you are doing this for the first time, it's recommended to read the lightweight [Contributing to ClickHouse Documentation](https://github.com/ClickHouse/ClickHouse/tree/master/docs/README.md) guide first.
+Add a user-readable short description of the changes that should be added to docs.clickhouse.com below.
+
+At a minimum, the following information should be added (but add more as needed).
+- Motivation: Why is this function, table engine, etc. useful to ClickHouse users?
+
+- Parameters: If the feature being added takes arguments, options or is influenced by settings, please list them below with a brief explanation.
+
+- Example use: A query or command.
+-->

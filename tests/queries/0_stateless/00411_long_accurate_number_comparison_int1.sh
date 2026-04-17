@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# Tags: long, no-msan
+# no-msan: it is too slow
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
 # We should have correct env vars from shell_config.sh to run this test
 
-python $CURDIR/00411_long_accurate_number_comparison.python int1
+python3 "$CURDIR"/00411_long_accurate_number_comparison.python int1

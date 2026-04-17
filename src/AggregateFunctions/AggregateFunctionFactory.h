@@ -1,8 +1,9 @@
 #pragma once
 
 #include <AggregateFunctions/IAggregateFunction.h>
+#include <Parsers/NullsAction.h>
+#include <Common/FunctionDocumentation.h>
 #include <Common/IFactoryWithAliases.h>
-
 
 #include <functional>
 #include <memory>
@@ -14,31 +15,37 @@
 
 namespace DB
 {
+struct Settings;
 
 class Context;
 class IDataType;
 
 using DataTypePtr = std::shared_ptr<const IDataType>;
-using DataTypes = std::vector<DataTypePtr>;
+using DataTypes = std::vector<DataTypePtr>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
 
-/** Creator have arguments: name of aggregate function, types of arguments, values of parameters.
+class ASTFunction;
+
+/**
+ * The invoker has arguments: name of aggregate function, types of arguments, values of parameters.
  * Parameters are for "parametric" aggregate functions.
  * For example, in quantileWeighted(0.9)(x, weight), 0.9 is "parameter" and x, weight are "arguments".
  */
-using AggregateFunctionCreator = std::function<AggregateFunctionPtr(const String &, const DataTypes &, const Array &)>;
+using AggregateFunctionCreator = std::function<AggregateFunctionPtr(const String &, const DataTypes &, const Array &, const Settings *)>;
 
 struct AggregateFunctionWithProperties
 {
     AggregateFunctionCreator creator;
+    FunctionDocumentation documentation;
     AggregateFunctionProperties properties;
 
     AggregateFunctionWithProperties() = default;
     AggregateFunctionWithProperties(const AggregateFunctionWithProperties &) = default;
     AggregateFunctionWithProperties & operator = (const AggregateFunctionWithProperties &) = default;
 
-    template <typename Creator, std::enable_if_t<!std::is_same_v<Creator, AggregateFunctionWithProperties>> * = nullptr>
-    AggregateFunctionWithProperties(Creator creator_, AggregateFunctionProperties properties_ = {})
-        : creator(std::forward<Creator>(creator_)), properties(std::move(properties_))
+    template <typename Creator>
+    requires (!std::is_same_v<Creator, AggregateFunctionWithProperties>)
+    AggregateFunctionWithProperties(Creator creator_, FunctionDocumentation documentation_, AggregateFunctionProperties properties_ = {}) /// NOLINT
+        : creator(std::forward<Creator>(creator_)), documentation(std::move(documentation_)), properties(std::move(properties_))
     {
     }
 };
@@ -56,43 +63,48 @@ public:
     void registerFunction(
         const String & name,
         Value creator,
-        CaseSensitiveness case_sensitiveness = CaseSensitive);
+        Case case_sensitiveness = Case::Sensitive);
+
+    /// Register how to transform from one aggregate function to other based on NullsAction
+    /// Registers them both ways:
+    /// SOURCE + RESPECT NULLS will be transformed to TARGET
+    /// TARGET + IGNORE NULLS will be transformed to SOURCE
+    void registerNullsActionTransformation(const String & source_ignores_nulls, const String & target_respect_nulls);
 
     /// Throws an exception if not found.
-    AggregateFunctionPtr get(
-        const String & name,
-        const DataTypes & argument_types,
-        const Array & parameters,
-        AggregateFunctionProperties & out_properties,
-        int recursion_level = 0) const;
-
-    /// Returns nullptr if not found.
-    AggregateFunctionPtr tryGet(
-        const String & name,
+    AggregateFunctionPtr
+    get(const String & name,
+        NullsAction action,
         const DataTypes & argument_types,
         const Array & parameters,
         AggregateFunctionProperties & out_properties) const;
 
     /// Get properties if the aggregate function exists.
-    std::optional<AggregateFunctionProperties> tryGetProperties(const String & name) const;
+    std::optional<AggregateFunctionProperties> tryGetProperties(String name, NullsAction action) const;
 
-    bool isAggregateFunctionName(const String & name, int recursion_level = 0) const;
+    bool isAggregateFunctionName(const String & name) const;
+
+    FunctionDocumentation getDocumentation(const String & name) const;
 
 private:
     AggregateFunctionPtr getImpl(
         const String & name,
+        NullsAction action,
         const DataTypes & argument_types,
         const Array & parameters,
         AggregateFunctionProperties & out_properties,
-        bool has_null_arguments,
-        int recursion_level) const;
+        bool has_null_arguments) const;
 
-    std::optional<AggregateFunctionProperties> tryGetPropertiesImpl(const String & name, int recursion_level) const;
-
-private:
-    using AggregateFunctions = std::unordered_map<String, Value>;
+    using AggregateFunctions = std::unordered_map<String, Value>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
+    using ActionMap = std::unordered_map<String, String>; // STYLE_CHECK_ALLOW_STD_CONTAINERS
 
     AggregateFunctions aggregate_functions;
+    /// Mapping from functions with `RESPECT NULLS` modifier to actual aggregate function names
+    /// Example: `any(x) RESPECT NULLS` should be executed as function `any_respect_nulls`
+    ActionMap respect_nulls;
+    /// Same as above for `IGNORE NULLS` modifier
+    ActionMap ignore_nulls;
+    std::optional<AggregateFunctionWithProperties> getAssociatedFunctionByNullsAction(const String & name, NullsAction action) const;
 
     /// Case insensitive aggregate functions will be additionally added here with lowercased name.
     AggregateFunctions case_insensitive_aggregate_functions;
@@ -104,5 +116,12 @@ private:
     String getFactoryName() const override { return "AggregateFunctionFactory"; }
 
 };
+
+struct AggregateUtils
+{
+    static bool isAggregateFunction(const ASTFunction & node);
+};
+
+const String & getAggregateFunctionCanonicalNameIfAny(const String & name);
 
 }

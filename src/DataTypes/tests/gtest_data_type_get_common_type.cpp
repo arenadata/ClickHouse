@@ -3,7 +3,6 @@
 #include <DataTypes/getMostSubtype.h>
 
 #include <sstream>
-#pragma GCC diagnostic ignored "-Wmissing-declarations"
 #include <gtest/gtest.h>
 
 namespace DB
@@ -22,22 +21,22 @@ static auto typeFromString(const std::string & str)
 {
     auto & data_type_factory = DataTypeFactory::instance();
     return data_type_factory.get(str);
-};
+}
 
 static auto typesFromString(const std::string & str)
 {
-    std::istringstream data_types_stream(str);
+    std::istringstream data_types_stream(str);      // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     DataTypes data_types;
     std::string data_type;
     while (data_types_stream >> data_type)
         data_types.push_back(typeFromString(data_type));
 
     return data_types;
-};
+}
 
 struct TypesTestCase
 {
-    const char * from_types;
+    const char * from_types = nullptr;
     const char * expected_type = nullptr;
 };
 

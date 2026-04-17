@@ -1,81 +1,77 @@
 #pragma once
 
-#include <Common/config.h>
+#include <IO/HTTPHeaderEntries.h>
+#include <IO/S3/Client.h>
+#include <base/types.h>
+#include <Common/Exception.h>
+
+#include "config.h"
 
 #if USE_AWS_S3
 
-#include <Core/Types.h>
-#include <Interpreters/Context.h>
+#include <IO/S3/URI.h>
+#include <IO/S3/Credentials.h>
 #include <aws/core/Aws.h>
-
-namespace Aws::S3
-{
-    class S3Client;
-}
+#include <aws/s3/S3Errors.h>
 
 namespace DB
 {
-    struct HttpHeader;
-    using HeaderCollection = std::vector<HttpHeader>;
+
+namespace ErrorCodes
+{
+    extern const int S3_ERROR;
 }
 
-namespace DB::S3
-{
+struct Settings;
 
-class ClientFactory
+class S3Exception : public Exception
 {
 public:
-    ~ClientFactory();
 
-    static ClientFactory & instance();
+    // Format message with fmt::format, like the logging functions.
+    template <typename... Args>
+    S3Exception(Aws::S3::S3Errors code_, FormatStringHelper<Args...> fmt, Args &&... args)
+        : Exception(PreformattedMessage{fmt.format(std::forward<Args>(args)...)}, ErrorCodes::S3_ERROR), code(code_)
+    {
+    }
 
-    std::shared_ptr<Aws::S3::S3Client> create(
-        const String & endpoint,
-        bool is_virtual_hosted_style,
-        const String & access_key_id,
-        const String & secret_access_key);
+    S3Exception(const std::string & msg, Aws::S3::S3Errors code_)
+        : Exception(msg, ErrorCodes::S3_ERROR)
+        , code(code_)
+    {}
 
-    std::shared_ptr<Aws::S3::S3Client> create(
-        Aws::Client::ClientConfiguration & cfg,
-        bool is_virtual_hosted_style,
-        const String & access_key_id,
-        const String & secret_access_key);
+    Aws::S3::S3Errors getS3ErrorCode() const
+    {
+        return code;
+    }
 
-    std::shared_ptr<Aws::S3::S3Client> create(
-        const String & endpoint,
-        bool is_virtual_hosted_style,
-        const String & access_key_id,
-        const String & secret_access_key,
-        HeaderCollection headers);
+    bool isRetryableError() const;
+    bool isAccessTokenExpiredError() const;
 
-private:
-    ClientFactory();
+    S3Exception * clone() const override { return new S3Exception(*this); }
+    void rethrow() const override { throw *this; } /// NOLINT(cert-err60-cpp)
 
 private:
-    Aws::SDKOptions aws_options;
+    Aws::S3::S3Errors code;
 };
-
-/**
- * Represents S3 URI.
- *
- * The following patterns are allowed:
- * s3://bucket/key
- * http(s)://endpoint/bucket/key
- */
-struct URI
-{
-    Poco::URI uri;
-    // Custom endpoint if URI scheme is not S3.
-    String endpoint;
-    String bucket;
-    String key;
-    String storage_name;
-
-    bool is_virtual_hosted_style;
-
-    explicit URI(const Poco::URI & uri_);
-};
-
 }
 
 #endif
+
+namespace Poco::Util
+{
+    class AbstractConfiguration;
+};
+
+namespace DB
+{
+struct ProxyConfigurationResolver;
+
+namespace S3
+{
+
+HTTPHeaderEntries getHTTPHeaders(const std::string & config_elem, const Poco::Util::AbstractConfiguration & config, std::string header_key = "header");
+ServerSideEncryptionKMSConfig getSSEKMSConfig(const std::string & config_elem, const Poco::Util::AbstractConfiguration & config);
+
+}
+}

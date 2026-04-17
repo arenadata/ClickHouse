@@ -1,24 +1,22 @@
 #pragma once
 
 #include <Storages/System/IStorageSystemOneBlock.h>
-#include <ext/shared_ptr_helper.h>
 
 namespace DB
 {
-class StorageSystemFormats final : public ext::shared_ptr_helper<StorageSystemFormats>, public IStorageSystemOneBlock<StorageSystemFormats>
+class StorageSystemFormats final : public IStorageSystemOneBlock
 {
-    friend struct ext::shared_ptr_helper<StorageSystemFormats>;
 protected:
-    void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo & query_info) const override;
+    void fillData(MutableColumns & res_columns, ContextPtr, const ActionsDAG::Node *, std::vector<UInt8>) const override;
 
     using IStorageSystemOneBlock::IStorageSystemOneBlock;
-public:
 
+public:
     std::string getName() const override
     {
         return "SystemFormats";
     }
 
-    static NamesAndTypesList getNamesAndTypes();
+    static ColumnsDescription getColumnsDescription();
 };
 }

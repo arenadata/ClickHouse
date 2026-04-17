@@ -1,9 +1,12 @@
-#include <Functions/IFunctionImpl.h>
+#include <DataTypes/IDataType.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Core/Field.h>
 
 
 namespace DB
+{
+namespace
 {
 
 /// Returns global default value for type of passed argument (example: 0 for numeric types, '' for String).
@@ -11,7 +14,7 @@ class FunctionDefaultValueOfArgumentType : public IFunction
 {
 public:
     static constexpr auto name = "defaultValueOfArgumentType";
-    static FunctionPtr create(const Context &)
+    static FunctionPtr create(ContextPtr)
     {
         return std::make_shared<FunctionDefaultValueOfArgumentType>();
     }
@@ -19,6 +22,11 @@ public:
     String getName() const override
     {
         return name;
+    }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override
+    {
+        return false;
     }
 
     bool useDefaultImplementationForNulls() const override { return false; }
@@ -34,23 +42,61 @@ public:
         return arguments[0];
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        const IDataType & type = *block.getByPosition(arguments[0]).type;
-        block.getByPosition(result).column = type.createColumnConst(input_rows_count, type.getDefault());
+        const IDataType & type = *arguments[0].type;
+        return type.createColumnConst(input_rows_count, type.getDefault());
     }
 
-    ColumnPtr getResultIfAlwaysReturnsConstantAndHasArguments(const Block & block, const ColumnNumbers & arguments) const override
+    ColumnPtr getConstantResultForNonConstArguments(const ColumnsWithTypeAndName & arguments, const DataTypePtr &) const override
     {
-        const IDataType & type = *block.getByPosition(arguments[0]).type;
+        const IDataType & type = *arguments[0].type;
         return type.createColumnConst(1, type.getDefault());
     }
 };
 
+}
 
-void registerFunctionDefaultValueOfArgumentType(FunctionFactory & factory)
+REGISTER_FUNCTION(DefaultValueOfArgumentType)
 {
-    factory.registerFunction<FunctionDefaultValueOfArgumentType>();
+    FunctionDocumentation::Description description = R"(
+Returns the default value for a given data type.
+Does not include default values for custom columns set by the user.
+)";
+    FunctionDocumentation::Syntax syntax = "defaultValueOfArgumentType(expression)";
+    FunctionDocumentation::Arguments arguments = {
+        {"expression", "Arbitrary type of value or an expression that results in a value of an arbitrary type.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns `0` for numbers, an empty string for strings or `NULL` for Nullable types.", {"UInt8", "String", "NULL"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Usage example",
+        R"(
+SELECT defaultValueOfArgumentType(CAST(1 AS Int8));
+        )",
+        R"(
+┌─defaultValueOfArgumentType(CAST(1, 'Int8'))─┐
+│                                           0 │
+└─────────────────────────────────────────────┘
+        )"
+    },
+    {
+        "Nullable example",
+        R"(
+SELECT defaultValueOfArgumentType(CAST(1 AS Nullable(Int8)));
+        )",
+        R"(
+┌─defaultValueOfArgumentType(CAST(1, 'Nullable(Int8)'))─┐
+│                                                  ᴺᵁᴸᴸ │
+└───────────────────────────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<FunctionDefaultValueOfArgumentType>(documentation);
 }
 
 }

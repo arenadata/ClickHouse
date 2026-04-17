@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Processors/Sources/SourceFromSingleChunk.h>
-#include <Processors/NullSink.h>
+#include <Processors/Sinks/NullSink.h>
 #include <Processors/Executors/PipelineExecutor.h>
 
 #include <Columns/ColumnsNumber.h>
@@ -11,59 +11,57 @@ using namespace DB;
 
 TEST(Processors, PortsConnected)
 {
-    auto col = ColumnUInt8::create(1, 1);
+    auto col = ColumnUInt8::create(1, static_cast<UInt8>(1));
     Columns columns;
     columns.emplace_back(std::move(col));
     Chunk chunk(std::move(columns), 1);
 
-    Block header = {ColumnWithTypeAndName(ColumnUInt8::create(), std::make_shared<DataTypeUInt8>(), "x")};
+    SharedHeader header = std::make_shared<Block>(Block{ColumnWithTypeAndName(ColumnUInt8::create(), std::make_shared<DataTypeUInt8>(), "x")});
 
     auto source = std::make_shared<SourceFromSingleChunk>(std::move(header), std::move(chunk));
-    auto sink = std::make_shared<NullSink>(source->getPort().getHeader());
+    auto sink = std::make_shared<NullSink>(source->getPort().getSharedHeader());
 
     connect(source->getPort(), sink->getPort());
 
-    Processors processors;
-    processors.emplace_back(std::move(source));
-    processors.emplace_back(std::move(sink));
+    auto processors = std::make_shared<Processors>();
+    processors->emplace_back(std::move(source));
+    processors->emplace_back(std::move(sink));
 
-    PipelineExecutor executor(processors);
-    executor.execute(1);
+    QueryStatusPtr element;
+    PipelineExecutor executor(processors, element);
+    executor.execute(1, false);
 }
 
 TEST(Processors, PortsNotConnected)
 {
-    auto col = ColumnUInt8::create(1, 1);
+    auto col = ColumnUInt8::create(1, static_cast<UInt8>(1));
     Columns columns;
     columns.emplace_back(std::move(col));
     Chunk chunk(std::move(columns), 1);
 
-    Block header = {ColumnWithTypeAndName(ColumnUInt8::create(), std::make_shared<DataTypeUInt8>(), "x")};
+    SharedHeader header = std::make_shared<Block>(Block{ColumnWithTypeAndName(ColumnUInt8::create(), std::make_shared<DataTypeUInt8>(), "x")});
 
     auto source = std::make_shared<SourceFromSingleChunk>(std::move(header), std::move(chunk));
-    auto sink = std::make_shared<NullSink>(source->getPort().getHeader());
+    auto sink = std::make_shared<NullSink>(source->getPort().getSharedHeader());
 
     /// connect(source->getPort(), sink->getPort());
 
-    Processors processors;
-    processors.emplace_back(std::move(source));
-    processors.emplace_back(std::move(sink));
+    auto processors = std::make_shared<Processors>();
+    processors->emplace_back(std::move(source));
+    processors->emplace_back(std::move(sink));
 
-    auto exec = [&]()
+#ifndef DEBUG_OR_SANITIZER_BUILD
+    try
     {
-
-        try
-        {
-            PipelineExecutor executor(processors);
-            executor.execute(1);
-        }
-        catch (DB::Exception & e)
-        {
-            std::cout << e.displayText() << std::endl;
-            ASSERT_TRUE(e.displayText().find("pipeline") != std::string::npos);
-            throw;
-        }
-    };
-
-    ASSERT_THROW(exec(), DB::Exception);
+        QueryStatusPtr element;
+        PipelineExecutor executor(processors, element);
+        executor.execute(1, false);
+        ASSERT_TRUE(false) << "Should have thrown.";
+    }
+    catch (DB::Exception & e)
+    {
+        std::cout << e.displayText() << std::endl;
+        ASSERT_TRUE(e.displayText().find("pipeline") != std::string::npos) << "Expected 'pipeline', got: " << e.displayText();
+    }
+#endif
 }

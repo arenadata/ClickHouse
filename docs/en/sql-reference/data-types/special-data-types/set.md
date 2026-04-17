@@ -1,10 +1,12 @@
 ---
-toc_priority: 59
-toc_title: Set
+description: 'Documentation for the Set special data type used in IN expressions'
+sidebar_label: 'Set'
+sidebar_position: 59
+slug: /sql-reference/data-types/special-data-types/set
+title: 'Set'
+doc_type: 'reference'
 ---
 
-# Set {#set}
+# Set
 
-Used for the right half of an [IN](../../../sql-reference/operators/in.md#select-in-operators) expression.
-
-[Original article](https://clickhouse.tech/docs/en/data_types/special_data_types/set/) <!--hide-->
+Used for the right half of an [IN](/sql-reference/operators/in) expression.

@@ -1,4 +1,4 @@
-<test max_ignored_relative_change="0.2">
+<test>
     <settings>
         <output_format_pretty_max_rows>1000000</output_format_pretty_max_rows>
         <max_threads>1</max_threads>
@@ -36,13 +36,11 @@
                 <value>Avro</value>
                 <value>MsgPack</value>
                 <value>ORC</value>
+                <value>Parquet</value>
+                <value>Arrow</value>
             </values>
         </substitution>
     </substitutions>
-
-    <preconditions>
-        <table_exists>test.hits</table_exists>
-    </preconditions>
 
     <create_query>CREATE TABLE IF NOT EXISTS table_{format_slow} ENGINE = File({format_slow}, '/dev/null') AS test.hits</create_query>
     <create_query>CREATE TABLE IF NOT EXISTS table_{format_fast} ENGINE = File({format_fast}, '/dev/null') AS test.hits</create_query>

@@ -1,7 +1,6 @@
 #pragma once
 
-#include <Common/SipHash.h>
-#include <Core/Types.h>
+#include <base/types.h>
 #include <unordered_set>
 
 namespace DB
@@ -9,7 +8,7 @@ namespace DB
 
 /// Represents dependency from other column.
 /// Used to determine, which columns we have to read, if we want to update some other column.
-/// Necessary, because table can have some depenendecies, which requires several columns for calculation.
+/// Necessary, because table can have some dependencies, which requires several columns for calculation.
 struct ColumnDependency
 {
     enum Kind : UInt8
@@ -17,11 +16,17 @@ struct ColumnDependency
         /// Exists any skip index, that requires @column_name
         SKIP_INDEX,
 
+        /// Exists any projection, that requires @column_name
+        PROJECTION,
+
         /// Exists any TTL expression, that requires @column_name
         TTL_EXPRESSION,
 
         /// TTL is set for @column_name.
-        TTL_TARGET
+        TTL_TARGET,
+
+        /// Exists any statistics, that requires @column_name
+        STATISTICS,
     };
 
     ColumnDependency(const String & column_name_, Kind kind_)
@@ -32,7 +37,7 @@ struct ColumnDependency
 
     bool isReadOnly() const
     {
-        return kind == SKIP_INDEX || kind == TTL_EXPRESSION;
+        return kind == SKIP_INDEX || kind == PROJECTION || kind == TTL_EXPRESSION || kind == STATISTICS;
     }
 
     bool operator==(const ColumnDependency & other) const
@@ -42,13 +47,7 @@ struct ColumnDependency
 
     struct Hash
     {
-        UInt64 operator()(const ColumnDependency & dependency) const
-        {
-            SipHash hash;
-            hash.update(dependency.column_name);
-            hash.update(dependency.kind);
-            return hash.get64();
-        }
+        UInt64 operator()(const ColumnDependency & dependency) const;
     };
 };
 

@@ -1,26 +1,25 @@
 #pragma once
 
-#include <Core/Block.h>
+#include <Common/Logger.h>
 #include <Interpreters/IInterpreter.h>
 #include <Parsers/IAST_fwd.h>
 
 namespace DB
 {
 
-class Context;
 class Cluster;
 
-class InterpreterCheckQuery : public IInterpreter
+class InterpreterCheckQuery : public IInterpreter, WithContext
 {
 public:
-    InterpreterCheckQuery(const ASTPtr & query_ptr_, const Context & context_);
+    InterpreterCheckQuery(const ASTPtr & query_ptr_, ContextPtr context_);
 
     BlockIO execute() override;
 
 private:
     ASTPtr query_ptr;
 
-    const Context & context;
+    LoggerPtr log = getLogger("InterpreterCheckQuery");
 };
 
 }

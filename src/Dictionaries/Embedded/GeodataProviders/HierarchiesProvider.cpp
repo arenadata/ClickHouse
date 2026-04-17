@@ -1,11 +1,16 @@
-#include "HierarchiesProvider.h"
+#include <Dictionaries/Embedded/GeodataProviders/HierarchiesProvider.h>
 
 #include <IO/ReadBufferFromFile.h>
 #include <Poco/DirectoryIterator.h>
 #include <Poco/Exception.h>
 #include <Poco/Util/Application.h>
-#include "HierarchyFormatReader.h"
+#include <Dictionaries/Embedded/GeodataProviders/HierarchyFormatReader.h>
+#include <filesystem>
 
+namespace fs = std::filesystem;
+
+namespace DB
+{
 
 bool RegionsHierarchyDataSource::isModified() const
 {
@@ -15,7 +20,7 @@ bool RegionsHierarchyDataSource::isModified() const
 IRegionsHierarchyReaderPtr RegionsHierarchyDataSource::createReader()
 {
     updates_tracker.fixCurrentVersion();
-    auto file_reader = std::make_shared<DB::ReadBufferFromFile>(path);
+    auto file_reader = std::make_shared<ReadBufferFromFile>(path);
     return std::make_unique<RegionsHierarchyFormatReader>(std::move(file_reader));
 }
 
@@ -27,14 +32,13 @@ RegionsHierarchiesDataProvider::RegionsHierarchiesDataProvider(const std::string
 
 void RegionsHierarchiesDataProvider::discoverFilesWithCustomHierarchies()
 {
-    std::string basename = Poco::Path(path).getBaseName();
+    std::string basename = fs::path(path).stem();
+    fs::path dir_path = fs::canonical(path).parent_path();
 
-    Poco::Path dir_path = Poco::Path(path).absolute().parent();
-
-    Poco::DirectoryIterator dir_end;
-    for (Poco::DirectoryIterator dir_it(dir_path); dir_it != dir_end; ++dir_it)
+    fs::directory_iterator dir_end;
+    for (fs::directory_iterator dir_it(dir_path); dir_it != dir_end; ++dir_it)
     {
-        std::string candidate_basename = dir_it.path().getBaseName();
+        std::string candidate_basename = dir_it->path().stem();
 
         if (candidate_basename.starts_with(basename)
             && (candidate_basename.size() > basename.size() + 1)
@@ -46,9 +50,9 @@ void RegionsHierarchiesDataProvider::discoverFilesWithCustomHierarchies()
     }
 }
 
-std::vector<std::string> RegionsHierarchiesDataProvider::listCustomHierarchies() const
+VectorWithMemoryTracking<std::string> RegionsHierarchiesDataProvider::listCustomHierarchies() const
 {
-    std::vector<std::string> names;
+    VectorWithMemoryTracking<std::string> names;
     names.reserve(hierarchy_files.size());
     for (const auto & it : hierarchy_files)
         names.push_back(it.first);
@@ -71,4 +75,6 @@ IRegionsHierarchyDataSourcePtr RegionsHierarchiesDataProvider::getHierarchySourc
     }
 
     throw Poco::Exception("Regions hierarchy '" + name + "' not found");
+}
+
 }

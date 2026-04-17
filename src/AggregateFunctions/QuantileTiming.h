@@ -1,19 +1,20 @@
 #pragma once
 
-#include <Common/HashTable/Hash.h>
-#include <Common/PODArray.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
+#include <Common/HashTable/Hash.h>
+#include <Common/PODArray.h>
+#include <base/sort.h>
 
 
 namespace DB
 {
+struct Settings;
 
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int INCORRECT_DATA;
 }
 
 /** Calculates quantile for time in milliseconds, less than 30 seconds.
@@ -31,6 +32,8 @@ namespace ErrorCodes
   * - a histogram (that is, value -> number), consisting of two parts
   * -- for values from 0 to 1023 - in increments of 1;
   * -- for values from 1024 to 30,000 - in increments of 16;
+  *
+  * NOTE: 64-bit integer weight can overflow, see also QuantileExactWeighted.h::get()
   */
 
 #define TINY_MAX_ELEMS 31
@@ -57,7 +60,7 @@ namespace detail
             if (unlikely(x > BIG_THRESHOLD))
                 x = BIG_THRESHOLD;
 
-            elems[count] = x;
+            elems[count] = static_cast<UInt16>(x);
             ++count;
         }
 
@@ -73,20 +76,24 @@ namespace detail
 
         void serialize(WriteBuffer & buf) const
         {
-            writeBinary(count, buf);
+            writeBinaryLittleEndian(count, buf);
             buf.write(reinterpret_cast<const char *>(elems), count * sizeof(elems[0]));
         }
 
         void deserialize(ReadBuffer & buf)
         {
-            readBinary(count, buf);
-            buf.readStrict(reinterpret_cast<char *>(elems), count * sizeof(elems[0]));
+            UInt16 new_count = 0;
+            readBinaryLittleEndian(new_count, buf);
+            if (new_count > TINY_MAX_ELEMS)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "The number of elements {} for the 'tiny' kind of quantileTiming is exceeding the maximum of {}", new_count, TINY_MAX_ELEMS);
+            buf.readStrict(reinterpret_cast<char *>(elems), new_count * sizeof(elems[0]));
+            count = new_count;
         }
 
         /** This function must be called before get-functions. */
         void prepare() const
         {
-            std::sort(elems, elems + count);
+            ::sort(elems, elems + count);
         }
 
         UInt16 get(double level) const
@@ -137,7 +144,7 @@ namespace detail
         using Array = PODArray<UInt16, 128>;
         mutable Array elems;    /// mutable because array sorting is not considered a state change.
 
-        QuantileTimingMedium() {}
+        QuantileTimingMedium() = default;
         QuantileTimingMedium(const UInt16 * begin, const UInt16 * end) : elems(begin, end) {}
 
         void insert(UInt64 x)
@@ -145,7 +152,7 @@ namespace detail
             if (unlikely(x > BIG_THRESHOLD))
                 x = BIG_THRESHOLD;
 
-            elems.emplace_back(x);
+            elems.emplace_back(static_cast<UInt16>(x));
         }
 
         void merge(const QuantileTimingMedium & rhs)
@@ -155,14 +162,17 @@ namespace detail
 
         void serialize(WriteBuffer & buf) const
         {
-            writeBinary(elems.size(), buf);
+            writeBinaryLittleEndian(elems.size(), buf);
             buf.write(reinterpret_cast<const char *>(elems.data()), elems.size() * sizeof(elems[0]));
         }
 
         void deserialize(ReadBuffer & buf)
         {
             size_t size = 0;
-            readBinary(size, buf);
+            readBinaryLittleEndian(size, buf);
+            if (size > 10'000)
+                throw Exception(ErrorCodes::INCORRECT_DATA, "The number of elements {} for the 'medium' kind of quantileTiming is too large", size);
+
             elems.resize(size);
             buf.readStrict(reinterpret_cast<char *>(elems.data()), size * sizeof(elems[0]));
         }
@@ -174,12 +184,12 @@ namespace detail
             if (!elems.empty())
             {
                 size_t n = level < 1
-                    ? level * elems.size()
+                    ? static_cast<size_t>(level * static_cast<double>(elems.size()))
                     : (elems.size() - 1);
 
                 /// Sorting an array will not be considered a violation of constancy.
                 auto & array = elems;
-                std::nth_element(array.begin(), array.begin() + n, array.end());
+                ::nth_element(array.begin(), array.begin() + n, array.end());
                 quantile = array[n];
             }
 
@@ -197,10 +207,10 @@ namespace detail
                 auto level = levels[level_index];
 
                 size_t n = level < 1
-                    ? level * elems.size()
+                    ? static_cast<size_t>(level * static_cast<double>(elems.size()))
                     : (elems.size() - 1);
 
-                std::nth_element(array.begin() + prev_n, array.begin() + n, array.end());
+                ::nth_element(array.begin() + prev_n, array.begin() + n, array.end());
 
                 result[level_index] = array[n];
                 prev_n = n;
@@ -250,10 +260,11 @@ namespace detail
         UInt64 count_big[BIG_SIZE];
 
         /// Get value of quantile by index in array `count_big`.
-        static inline UInt16 indexInBigToValue(size_t i)
+        static UInt16 indexInBigToValue(size_t i)
         {
-            return (i * BIG_PRECISION) + SMALL_THRESHOLD
-                + (intHash32<0>(i) % BIG_PRECISION - (BIG_PRECISION / 2));    /// A small randomization so that it is not noticeable that all the values are even.
+            return static_cast<UInt16>(
+                (i * BIG_PRECISION) + SMALL_THRESHOLD
+                + (intHash32<0>(i) % BIG_PRECISION - (BIG_PRECISION / 2)));    /// A small randomization so that it is not noticeable that all the values are even.
         }
 
         /// Lets you scroll through the histogram values, skipping zeros.
@@ -271,7 +282,7 @@ namespace detail
             }
 
         public:
-            Iterator(const QuantileTimingLarge & parent)
+            explicit Iterator(const QuantileTimingLarge & parent)
                 : begin(parent.count_small), pos(begin), end(&parent.count_big[BIG_SIZE])
             {
                 adjust();
@@ -290,7 +301,7 @@ namespace detail
             UInt16 key() const
             {
                 return pos - begin < SMALL_THRESHOLD
-                    ? pos - begin
+                    ? static_cast<UInt16>(pos - begin)
                     : indexInBigToValue(pos - begin - SMALL_THRESHOLD);
             }
         };
@@ -329,7 +340,7 @@ namespace detail
 
         void serialize(WriteBuffer & buf) const
         {
-            writeBinary(count, buf);
+            writeBinaryLittleEndian(count, buf);
 
             if (count * 2 > SMALL_THRESHOLD + BIG_SIZE)
             {
@@ -344,8 +355,8 @@ namespace detail
                 {
                     if (count_small[i])
                     {
-                        writeBinary(UInt16(i), buf);
-                        writeBinary(count_small[i], buf);
+                        writeBinaryLittleEndian(UInt16(i), buf);
+                        writeBinaryLittleEndian(count_small[i], buf);
                     }
                 }
 
@@ -353,19 +364,19 @@ namespace detail
                 {
                     if (count_big[i])
                     {
-                        writeBinary(UInt16(i + SMALL_THRESHOLD), buf);
-                        writeBinary(count_big[i], buf);
+                        writeBinaryLittleEndian(UInt16(i + SMALL_THRESHOLD), buf);
+                        writeBinaryLittleEndian(count_big[i], buf);
                     }
                 }
 
                 /// Symbolizes end of data.
-                writeBinary(UInt16(BIG_THRESHOLD), buf);
+                writeBinaryLittleEndian(UInt16(BIG_THRESHOLD), buf);
             }
         }
 
         void deserialize(ReadBuffer & buf)
         {
-            readBinary(count, buf);
+            readBinaryLittleEndian(count, buf);
 
             if (count * 2 > SMALL_THRESHOLD + BIG_SIZE)
             {
@@ -376,12 +387,12 @@ namespace detail
                 while (true)
                 {
                     UInt16 index = 0;
-                    readBinary(index, buf);
+                    readBinaryLittleEndian(index, buf);
                     if (index == BIG_THRESHOLD)
                         break;
 
                     UInt64 elem_count = 0;
-                    readBinary(elem_count, buf);
+                    readBinaryLittleEndian(elem_count, buf);
 
                     if (index < SMALL_THRESHOLD)
                         count_small[index] = elem_count;
@@ -395,14 +406,14 @@ namespace detail
         /// Get the value of the `level` quantile. The level must be between 0 and 1.
         UInt16 get(double level) const
         {
-            UInt64 pos = std::ceil(count * level);
+            double pos = std::ceil(static_cast<double>(count) * level);
 
-            UInt64 accumulated = 0;
+            double accumulated = 0;
             Iterator it(*this);
 
             while (it.isValid())
             {
-                accumulated += it.count();
+                accumulated += static_cast<double>(it.count());
 
                 if (accumulated >= pos)
                     break;
@@ -418,17 +429,17 @@ namespace detail
         template <typename ResultType>
         void getMany(const double * levels, const size_t * indices, size_t size, ResultType * result) const
         {
-            const auto indices_end = indices + size;
-            auto index = indices;
+            const auto * indices_end = indices + size;
+            const auto * index = indices;
 
-            UInt64 pos = std::ceil(count * levels[*index]);
+            double pos = std::ceil(static_cast<double>(count) * levels[*index]);
 
-            UInt64 accumulated = 0;
+            double accumulated = 0;
             Iterator it(*this);
 
             while (it.isValid())
             {
-                accumulated += it.count();
+                accumulated += static_cast<double>(it.count());
 
                 while (accumulated >= pos)
                 {
@@ -438,7 +449,7 @@ namespace detail
                     if (index == indices_end)
                         return;
 
-                    pos = std::ceil(count * levels[*index]);
+                    pos = std::ceil(static_cast<double>(count) * levels[*index]);
                 }
 
                 it.next();
@@ -559,8 +570,11 @@ public:
         }
     }
 
-    void add(UInt64 x)
+    template <typename T>
+    void add(T x_)
     {
+        UInt64 x = static_cast<UInt64>(x_);
+
         if (tiny.count < TINY_MAX_ELEMS)
         {
             tiny.insert(x);
@@ -585,8 +599,11 @@ public:
         }
     }
 
-    void add(UInt64 x, size_t weight)
+    template <typename T>
+    void add(T x_, size_t weight)
     {
+        UInt64 x = static_cast<UInt64>(x_);
+
         /// NOTE: First condition is to avoid overflow.
         if (weight < TINY_MAX_ELEMS && tiny.count + weight <= TINY_MAX_ELEMS)
         {
@@ -660,7 +677,7 @@ public:
                     large->insert(elem);
             }
             else
-                throw Exception("Logical error in QuantileTiming::merge function: not all cases are covered", ErrorCodes::LOGICAL_ERROR);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Logical error in QuantileTiming::merge function: not all cases are covered");
 
             /// For determinism, we should always convert to `large` when size condition is reached
             ///  - regardless of merge order.
@@ -674,7 +691,7 @@ public:
     void serialize(WriteBuffer & buf) const
     {
         auto kind = which();
-        DB::writePODBinary(kind, buf);
+        writeBinaryLittleEndian(kind, buf);
 
         if (kind == Kind::Tiny)
             tiny.serialize(buf);
@@ -688,7 +705,7 @@ public:
     void deserialize(ReadBuffer & buf)
     {
         Kind kind;
-        DB::readPODBinary(kind, buf);
+        readBinaryLittleEndian(kind, buf);
 
         if (kind == Kind::Tiny)
         {
@@ -704,6 +721,8 @@ public:
             tinyToLarge();
             large->deserialize(buf);
         }
+        else
+            throw Exception(ErrorCodes::INCORRECT_DATA, "Incorrect kind of QuantileTiming");
     }
 
     /// Get the value of the `level` quantile. The level must be between 0 and 1.
@@ -716,14 +735,12 @@ public:
             tiny.prepare();
             return tiny.get(level);
         }
-        else if (kind == Kind::Medium)
+        if (kind == Kind::Medium)
         {
             return medium.get(level);
         }
-        else
-        {
-            return large->get(level);
-        }
+
+        return large->get(level);
     }
 
     /// Get the size values of the quantiles of the `levels` levels. Record `size` results starting with `result` address.
@@ -762,6 +779,16 @@ public:
         else
             for (size_t i = 0; i < size; ++i)
                 result[i] = std::numeric_limits<float>::quiet_NaN();
+    }
+
+    friend void writeBinary(const Kind & x, WriteBuffer & buf)
+    {
+        writePODBinary(x, buf);
+    }
+
+    friend void readBinary(Kind & x, ReadBuffer & buf)
+    {
+        readPODBinary(x, buf);
     }
 };
 

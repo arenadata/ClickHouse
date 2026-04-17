@@ -1,4 +1,5 @@
-#include <Functions/IFunctionImpl.h>
+#pragma once
+#include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -6,7 +7,7 @@
 #include <Columns/ColumnNullable.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnString.h>
-#include <Interpreters/AggregationCommon.h>
+#include <Interpreters/Context_fwd.h>
 #include <Common/HashTable/ClearableHashMap.h>
 #include <Common/ColumnsHashing.h>
 
@@ -16,10 +17,10 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int TOO_FEW_ARGUMENTS_FOR_FUNCTION;
     extern const int ILLEGAL_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int SIZES_OF_ARRAYS_DOESNT_MATCH;
+    extern const int SIZES_OF_ARRAYS_DONT_MATCH;
 }
 
 class FunctionArrayEnumerateUniq;
@@ -29,37 +30,39 @@ template <typename Derived>
 class FunctionArrayEnumerateExtended : public IFunction
 {
 public:
-    static FunctionPtr create(const Context &) { return std::make_shared<Derived>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<Derived>(); }
 
     String getName() const override { return Derived::name; }
 
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.empty())
-            throw Exception("Number of arguments for function " + getName() + " doesn't match: passed "
-                + toString(arguments.size()) + ", should be at least 1.",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::TOO_FEW_ARGUMENTS_FOR_FUNCTION,
+                "Number of arguments for function {} doesn't match: passed {}, should be at least 1.",
+                getName(), arguments.size());
 
         for (size_t i = 0; i < arguments.size(); ++i)
         {
             const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[i].get());
             if (!array_type)
-                throw Exception("All arguments for function " + getName() + " must be arrays but argument " +
-                    toString(i + 1) + " has type " + arguments[i]->getName() + ".", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                                "All arguments for function {} must be arrays but argument {} has type {}.",
+                                getName(), i + 1, arguments[i]->getName());
         }
 
         return std::make_shared<DataTypeArray>(std::make_shared<DataTypeUInt32>());
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override;
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override;
 
 private:
-    /// Initially allocate a piece of memory for 512 elements. NOTE: This is just a guess.
-    static constexpr size_t INITIAL_SIZE_DEGREE = 9;
+    /// Initially allocate a piece of memory for 64 elements. NOTE: This is just a guess.
+    static constexpr size_t INITIAL_SIZE_DEGREE = 6;
 
     template <typename T>
     struct MethodOneNumber
@@ -72,7 +75,7 @@ private:
 
     struct MethodString
     {
-        using Set = ClearableHashMapWithStackMemory<StringRef, UInt32, StringRefHash,
+        using Set = ClearableHashMapWithStackMemory<std::string_view, UInt32, StringViewHash,
             INITIAL_SIZE_DEGREE>;
 
         using Method = ColumnsHashing::HashMethodString<typename Set::value_type, UInt32, false, false>;
@@ -80,7 +83,7 @@ private:
 
     struct MethodFixedString
     {
-        using Set = ClearableHashMapWithStackMemory<StringRef, UInt32, StringRefHash,
+        using Set = ClearableHashMapWithStackMemory<std::string_view, UInt32, StringViewHash,
             INITIAL_SIZE_DEGREE>;
 
         using Method = ColumnsHashing::HashMethodFixedString<typename Set::value_type, UInt32, false, false>;
@@ -104,23 +107,23 @@ private:
 
     template <typename Method>
     void executeMethod(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, const Sizes & key_sizes,
-                       const NullMap * null_map, ColumnUInt32::Container & res_values);
+                       const NullMap * null_map, ColumnUInt32::Container & res_values) const;
 
     template <typename Method, bool has_null_map>
     void executeMethodImpl(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, const Sizes & key_sizes,
-                           const NullMap * null_map, ColumnUInt32::Container & res_values);
+                           const NullMap * null_map, ColumnUInt32::Container & res_values) const;
 
     template <typename T>
-    bool executeNumber(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values);
-    bool executeString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values);
-    bool executeFixedString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values);
-    bool execute128bit(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values);
-    void executeHashed(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values);
+    bool executeNumber(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const;
+    bool executeString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const;
+    bool executeFixedString(const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const;
+    bool execute128bit(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values) const;
+    void executeHashed(const ColumnArray::Offsets & offsets, const ColumnRawPtrs & columns, ColumnUInt32::Container & res_values) const;
 };
 
 
 template <typename Derived>
-void FunctionArrayEnumerateExtended<Derived>::executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/)
+ColumnPtr FunctionArrayEnumerateExtended<Derived>::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t /*input_rows_count*/) const
 {
     const ColumnArray::Offsets * offsets = nullptr;
     size_t num_arguments = arguments.size();
@@ -130,16 +133,15 @@ void FunctionArrayEnumerateExtended<Derived>::executeImpl(Block & block, const C
     ColumnPtr offsets_column;
     for (size_t i = 0; i < num_arguments; ++i)
     {
-        const ColumnPtr & array_ptr = block.getByPosition(arguments[i]).column;
+        const ColumnPtr & array_ptr = arguments[i].column;
         const ColumnArray * array = checkAndGetColumn<ColumnArray>(array_ptr.get());
         if (!array)
         {
             const ColumnConst * const_array = checkAndGetColumnConst<ColumnArray>(
-                block.getByPosition(arguments[i]).column.get());
+                arguments[i].column.get());
             if (!const_array)
-                throw Exception("Illegal column " + block.getByPosition(arguments[i]).column->getName()
-                    + " of " + toString(i + 1) + "-th argument of function " + getName(),
-                    ErrorCodes::ILLEGAL_COLUMN);
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of {}-th argument of function {}",
+                    arguments[i].column->getName(), i + 1, getName());
             array_holders.emplace_back(const_array->convertToFullColumn());
             array = checkAndGetColumn<ColumnArray>(array_holders.back().get());
         }
@@ -151,10 +153,10 @@ void FunctionArrayEnumerateExtended<Derived>::executeImpl(Block & block, const C
             offsets_column = array->getOffsetsPtr();
         }
         else if (offsets_i != *offsets)
-            throw Exception("Lengths of all arrays passed to " + getName() + " must be equal.",
-                ErrorCodes::SIZES_OF_ARRAYS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::SIZES_OF_ARRAYS_DONT_MATCH, "Lengths of all arrays passed to {} must be equal.",
+                getName());
 
-        auto * array_data = &array->getData();
+        const auto * array_data = &array->getData();
         data_columns[i] = array_data;
     }
 
@@ -162,7 +164,7 @@ void FunctionArrayEnumerateExtended<Derived>::executeImpl(Block & block, const C
 
     for (size_t i = 0; i < num_arguments; ++i)
     {
-        if (auto * nullable_col = checkAndGetColumn<ColumnNullable>(*data_columns[i]))
+        if (const auto * nullable_col = checkAndGetColumn<ColumnNullable>(data_columns[i]))
         {
             if (num_arguments == 1)
                 data_columns[i] = &nullable_col->getNestedColumn();
@@ -200,7 +202,7 @@ void FunctionArrayEnumerateExtended<Derived>::executeImpl(Block & block, const C
             executeHashed(*offsets, data_columns, res_values);
     }
 
-    block.getByPosition(result).column = ColumnArray::create(std::move(res_nested), offsets_column);
+    return ColumnArray::create(std::move(res_nested), offsets_column);
 }
 
 template <typename Derived>
@@ -210,7 +212,7 @@ void FunctionArrayEnumerateExtended<Derived>::executeMethodImpl(
         const ColumnRawPtrs & columns,
         const Sizes & key_sizes,
         [[maybe_unused]] const NullMap * null_map,
-        ColumnUInt32::Container & res_values)
+        ColumnUInt32::Container & res_values) const
 {
     typename Method::Set indices;
     typename Method::Method method(columns, key_sizes, nullptr);
@@ -290,7 +292,7 @@ void FunctionArrayEnumerateExtended<Derived>::executeMethod(
     const ColumnRawPtrs & columns,
     const Sizes & key_sizes,
     const NullMap * null_map,
-    ColumnUInt32::Container & res_values)
+    ColumnUInt32::Container & res_values) const
 {
     if (null_map)
         executeMethodImpl<Method, true>(offsets, columns, key_sizes, null_map, res_values);
@@ -302,7 +304,7 @@ void FunctionArrayEnumerateExtended<Derived>::executeMethod(
 template <typename Derived>
 template <typename T>
 bool FunctionArrayEnumerateExtended<Derived>::executeNumber(
-    const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values)
+    const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const
 {
     const auto * nested = checkAndGetColumn<ColumnVector<T>>(&data);
     if (!nested)
@@ -314,7 +316,7 @@ bool FunctionArrayEnumerateExtended<Derived>::executeNumber(
 
 template <typename Derived>
 bool FunctionArrayEnumerateExtended<Derived>::executeString(
-    const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values)
+    const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const
 {
     const auto * nested = checkAndGetColumn<ColumnString>(&data);
     if (nested)
@@ -325,7 +327,7 @@ bool FunctionArrayEnumerateExtended<Derived>::executeString(
 
 template <typename Derived>
 bool FunctionArrayEnumerateExtended<Derived>::executeFixedString(
-        const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values)
+        const ColumnArray::Offsets & offsets, const IColumn & data, const NullMap * null_map, ColumnUInt32::Container & res_values) const
 {
     const auto * nested = checkAndGetColumn<ColumnString>(&data);
     if (nested)
@@ -338,7 +340,7 @@ template <typename Derived>
 bool FunctionArrayEnumerateExtended<Derived>::execute128bit(
     const ColumnArray::Offsets & offsets,
     const ColumnRawPtrs & columns,
-    ColumnUInt32::Container & res_values)
+    ColumnUInt32::Container & res_values) const
 {
     size_t count = columns.size();
     size_t keys_bytes = 0;
@@ -352,6 +354,9 @@ bool FunctionArrayEnumerateExtended<Derived>::execute128bit(
         keys_bytes += key_sizes[j];
     }
 
+    if (keys_bytes > 16)
+        return false;
+
     executeMethod<MethodFixed>(offsets, columns, key_sizes, nullptr, res_values);
     return true;
 }
@@ -360,7 +365,7 @@ template <typename Derived>
 void FunctionArrayEnumerateExtended<Derived>::executeHashed(
     const ColumnArray::Offsets & offsets,
     const ColumnRawPtrs & columns,
-    ColumnUInt32::Container & res_values)
+    ColumnUInt32::Container & res_values) const
 {
     executeMethod<MethodHashed>(offsets, columns, {}, nullptr, res_values);
 }

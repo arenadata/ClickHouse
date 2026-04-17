@@ -1,6 +1,7 @@
-#include <string>
-#include <Processors/Formats/IRowOutputFormat.h>
 #include <IO/WriteHelpers.h>
+#include <Processors/Formats/IRowOutputFormat.h>
+#include <Processors/Port.h>
+#include <DataTypes/IDataType.h>
 
 
 namespace DB
@@ -10,36 +11,41 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+IRowOutputFormat::IRowOutputFormat(SharedHeader header, WriteBuffer & out_)
+    : IOutputFormat(header, out_)
+    , num_columns(header->columns())
+    , types(header->getDataTypes())
+    , serializations(header->getSerializations())
+{
+}
+
 void IRowOutputFormat::consume(DB::Chunk chunk)
 {
-    writePrefixIfNot();
-
     auto num_rows = chunk.getNumRows();
     const auto & columns = chunk.getColumns();
+    updateSerializationsIfNeeded(columns);
 
     for (size_t row = 0; row < num_rows; ++row)
     {
-        if (!first_row)
+        if (haveWrittenData())
             writeRowBetweenDelimiter();
-        first_row = false;
 
         write(columns, row);
-
-        if (write_single_row_callback)
-            write_single_row_callback(columns, row);
+        first_row = false;
     }
 }
 
 void IRowOutputFormat::consumeTotals(DB::Chunk chunk)
 {
-    writePrefixIfNot();
-    writeSuffixIfNot();
+    if (!supportTotals())
+        return;
 
     auto num_rows = chunk.getNumRows();
     if (num_rows != 1)
-        throw Exception("Got " + toString(num_rows) + " in totals chunk, expected 1", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Got {} in totals chunk, expected 1", num_rows);
 
     const auto & columns = chunk.getColumns();
+    updateSerializationsIfNeeded(columns);
 
     writeBeforeTotals();
     writeTotals(columns, 0);
@@ -48,13 +54,15 @@ void IRowOutputFormat::consumeTotals(DB::Chunk chunk)
 
 void IRowOutputFormat::consumeExtremes(DB::Chunk chunk)
 {
-    writePrefixIfNot();
-    writeSuffixIfNot();
+    if (!supportExtremes())
+        return;
 
     auto num_rows = chunk.getNumRows();
     const auto & columns = chunk.getColumns();
+    updateSerializationsIfNeeded(columns);
+
     if (num_rows != 2)
-        throw Exception("Got " + toString(num_rows) + " in extremes chunk, expected 2", ErrorCodes::LOGICAL_ERROR);
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Got {} in extremes chunk, expected 2", num_rows);
 
     writeBeforeExtremes();
     writeMinExtreme(columns, 0);
@@ -63,17 +71,8 @@ void IRowOutputFormat::consumeExtremes(DB::Chunk chunk)
     writeAfterExtremes();
 }
 
-void IRowOutputFormat::finalize()
-{
-    writePrefixIfNot();
-    writeSuffixIfNot();
-    writeLastSuffix();
-}
-
 void IRowOutputFormat::write(const Columns & columns, size_t row_num)
 {
-    size_t num_columns = columns.size();
-
     writeRowStartDelimiter();
 
     for (size_t i = 0; i < num_columns; ++i)
@@ -81,7 +80,7 @@ void IRowOutputFormat::write(const Columns & columns, size_t row_num)
         if (i != 0)
             writeFieldDelimiter();
 
-        writeField(*columns[i], *types[i], row_num);
+        writeField(*columns[i], *serializations[i], row_num);
     }
 
     writeRowEndDelimiter();
@@ -100,6 +99,15 @@ void IRowOutputFormat::writeMaxExtreme(const DB::Columns & columns, size_t row_n
 void IRowOutputFormat::writeTotals(const DB::Columns & columns, size_t row_num)
 {
     write(columns, row_num);
+}
+
+void IRowOutputFormat::updateSerializationsIfNeeded(const Columns & columns)
+{
+    if (supportsSpecialSerializationKinds())
+    {
+        for (size_t i = 0; i != columns.size(); ++i)
+            serializations[i] = types[i]->getSerialization(*types[i]->getSerializationInfo(*columns[i]));
+    }
 }
 
 }

@@ -5,7 +5,9 @@ set (CLICKHOUSE_FORMAT_LINK
         boost::program_options
         clickhouse_common_io
         clickhouse_parsers
-        dbms
+        clickhouse_functions
+        clickhouse_aggregate_functions
+        clickhouse_table_functions
 )
 
 clickhouse_program_add(format)

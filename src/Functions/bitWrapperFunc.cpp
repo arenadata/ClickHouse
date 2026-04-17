@@ -1,52 +1,71 @@
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionUnaryArithmetic.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/NumberTraits.h>
 
 namespace DB
 {
-    namespace ErrorCodes
+namespace ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+}
+
+namespace
+{
+
+/// Working with UInt8: last bit = can be true, previous = can be false (Like src/Storages/MergeTree/BoolMask.h).
+/// This function wraps bool atomic functions
+/// and transforms their boolean return value to the BoolMask ("can be false" and "can be true" bits).
+template <typename A>
+struct BitWrapperFuncImpl
+{
+    using ResultType = UInt8;
+    static constexpr const bool allow_string_or_fixed_string = false;
+
+    static ResultType NO_SANITIZE_UNDEFINED apply(A a [[maybe_unused]])
     {
-        extern const int BAD_ARGUMENTS;
+        // Should be a logical error, but this function is callable from SQL.
+        // Need to investigate this.
+        if constexpr (!is_integer<A>)
+            throw DB::Exception(ErrorCodes::BAD_ARGUMENTS, "It's a bug! Only integer types are supported by __bitWrapperFunc.");
+        return a == 0 ? static_cast<ResultType>(0b10) : static_cast<ResultType>(0b01);
     }
-
-    /// Working with UInt8: last bit = can be true, previous = can be false (Like src/Storages/MergeTree/BoolMask.h).
-    /// This function wraps bool atomic functions
-    /// and transforms their boolean return value to the BoolMask ("can be false" and "can be true" bits).
-    template <typename A>
-    struct BitWrapperFuncImpl
-    {
-        using ResultType = UInt8;
-        static constexpr const bool allow_fixed_string = false;
-
-        static inline ResultType NO_SANITIZE_UNDEFINED apply(A a)
-        {
-            // Should be a logical error, but this function is callable from SQL.
-            // Need to investigate this.
-            if constexpr (!is_integral_v<A>)
-                throw DB::Exception("It's a bug! Only integer types are supported by __bitWrapperFunc.", ErrorCodes::BAD_ARGUMENTS);
-            return a == 0 ? static_cast<ResultType>(0b10) : static_cast<ResultType >(0b1);
-        }
 
 #if USE_EMBEDDED_COMPILER
-        static constexpr bool compilable = false;
+    static constexpr bool compilable = false;
 #endif
-    };
+};
 
-    struct NameBitWrapperFunc { static constexpr auto name = "__bitWrapperFunc"; };
-    using FunctionBitWrapperFunc = FunctionUnaryArithmetic<BitWrapperFuncImpl, NameBitWrapperFunc, true>;
+struct NameBitWrapperFunc { static constexpr auto name = "__bitWrapperFunc"; };
 
-    template <> struct FunctionUnaryArithmeticMonotonicity<NameBitWrapperFunc>
+/// The result of this function is always UInt8 regardless of the argument type.
+/// Override `getReturnTypeForDefaultImplementationForDynamic` so that Dynamic arguments
+/// produce Nullable(UInt8) instead of Dynamic. This is needed for set index evaluation
+/// where the result column must be UInt8.
+class FunctionBitWrapperFunc : public FunctionUnaryArithmetic<BitWrapperFuncImpl, NameBitWrapperFunc, false>
+{
+public:
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionBitWrapperFunc>(); }
+
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
     {
-        static bool has() { return false; }
-        static IFunction::Monotonicity get(const Field &, const Field &)
-        {
-            return {};
-        }
-    };
-
-    void registerFunctionBitWrapperFunc(FunctionFactory & factory)
-    {
-        factory.registerFunction<FunctionBitWrapperFunc>();
+        return std::make_shared<DataTypeUInt8>();
     }
+};
 
+}
+
+template <> struct FunctionUnaryArithmeticMonotonicity<NameBitWrapperFunc>
+{
+    static bool has() { return false; }
+    static IFunction::Monotonicity get(const IDataType &, const Field &, const Field &)
+    {
+        return {};
+    }
+};
+
+REGISTER_FUNCTION(BitWrapperFunc)
+{
+    factory.registerFunction<FunctionBitWrapperFunc>(FunctionDocumentation::INTERNAL_FUNCTION_DOCS);
+}
 }

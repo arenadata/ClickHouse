@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ext/shared_ptr_helper.h>
 #include <Storages/System/IStorageSystemOneBlock.h>
 
 
@@ -12,18 +11,18 @@ class Context;
 
 /// Implements the `mutations` system table, which provides information about the status of mutations
 /// in the MergeTree tables.
-class StorageSystemMutations final : public ext::shared_ptr_helper<StorageSystemMutations>, public IStorageSystemOneBlock<StorageSystemMutations>
+class StorageSystemMutations final : public IStorageSystemOneBlock
 {
-    friend struct ext::shared_ptr_helper<StorageSystemMutations>;
 public:
     String getName() const override { return "SystemMutations"; }
 
-    static NamesAndTypesList getNamesAndTypes();
+    static ColumnsDescription getColumnsDescription();
 
 protected:
     using IStorageSystemOneBlock::IStorageSystemOneBlock;
 
-    void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo & query_info) const override;
+    void fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node * predicate, std::vector<UInt8>) const override;
+    Block getFilterSampleBlock() const override;
 };
 
 }

@@ -1,5 +1,6 @@
 #include <Parsers/ASTNameTypePair.h>
 #include <Common/quoteString.h>
+#include <IO/Operators.h>
 
 
 namespace DB
@@ -7,7 +8,7 @@ namespace DB
 
 ASTPtr ASTNameTypePair::clone() const
 {
-    auto res = std::make_shared<ASTNameTypePair>(*this);
+    auto res = make_intrusive<ASTNameTypePair>(*this);
     res->children.clear();
 
     if (type)
@@ -20,14 +21,10 @@ ASTPtr ASTNameTypePair::clone() const
 }
 
 
-void ASTNameTypePair::formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
+void ASTNameTypePair::formatImpl(WriteBuffer & ostr, const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
 {
-    std::string indent_str = settings.one_line ? "" : std::string(4 * frame.indent, ' ');
-
-    settings.ostr << indent_str << backQuoteIfNeed(name) << ' ';
-    type->formatImpl(settings, state, frame);
+    ostr << backQuoteIfNeed(name) << ' ';
+    type->format(ostr, settings, state, frame);
 }
 
 }
-
-

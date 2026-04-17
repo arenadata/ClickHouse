@@ -1,18 +1,17 @@
 #pragma once
 
-#include <common/types.h>
+#include <base/types.h>
 #include <Common/HyperLogLogBiasEstimator.h>
 #include <Common/CompactArray.h>
 #include <Common/HashTable/Hash.h>
+#include <Common/transformEndianness.h>
 
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
-#include <Core/Defines.h>
 
+#include <bit>
 #include <cmath>
-#include <cstring>
+#include <string>
 
 
 namespace DB
@@ -25,7 +24,7 @@ namespace ErrorCodes
 
 
 /// Sets denominator type.
-enum class DenominatorMode
+enum class DenominatorMode : uint8_t
 {
     Compact,        /// Compact denominator.
     StableIfBig,    /// Stable denominator falling back to Compact if rank storage is not big enough.
@@ -50,8 +49,7 @@ struct LogLUT
     {
         if (x <= M)
             return log_table[x];
-        else
-            return log(static_cast<double>(x));
+        return log(static_cast<double>(x));
     }
 
 private:
@@ -78,12 +76,8 @@ template <UInt64 MaxValue> struct MinCounterType
 };
 
 /// Denominator of expression for HyperLogLog algorithm.
-template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
-    DenominatorMode denominator_mode, typename Enable = void>
-class __attribute__ ((packed)) Denominator;
-
-namespace
-{
+template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType, DenominatorMode denominator_mode>
+class Denominator;
 
 /// Returns true if rank storage is big.
 constexpr bool isBigRankStore(UInt8 precision)
@@ -91,14 +85,13 @@ constexpr bool isBigRankStore(UInt8 precision)
     return precision >= 12;
 }
 
-}
-
 /// Used to deduce denominator type depending on options provided.
-template <typename HashValueType, typename DenominatorType, DenominatorMode denominator_mode, typename Enable = void>
+template <typename HashValueType, typename DenominatorType, DenominatorMode denominator_mode>
 struct IntermediateDenominator;
 
 template <typename DenominatorType, DenominatorMode denominator_mode>
-struct IntermediateDenominator<UInt32, DenominatorType, denominator_mode, std::enable_if_t<denominator_mode != DenominatorMode::ExactType>>
+requires (denominator_mode != DenominatorMode::ExactType)
+struct IntermediateDenominator<UInt32, DenominatorType, denominator_mode>
 {
     using Type = double;
 };
@@ -118,29 +111,26 @@ struct IntermediateDenominator<HashValueType, DenominatorType, DenominatorMode::
 /// "Lightweight" implementation of expression's denominator for HyperLogLog algorithm.
 /// Uses minimum amount of memory, but estimates may be unstable.
 /// Satisfiable when rank storage is small enough.
-template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
-    DenominatorMode denominator_mode>
-class __attribute__ ((packed)) Denominator<precision, max_rank, HashValueType, DenominatorType,
-    denominator_mode,
-    std::enable_if_t<!details::isBigRankStore(precision) || !(denominator_mode == DenominatorMode::StableIfBig)>>
+template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType, DenominatorMode denominator_mode>
+requires (!details::isBigRankStore(precision)) || (!(denominator_mode == DenominatorMode::StableIfBig))
+class __attribute__((__packed__)) Denominator<precision, max_rank, HashValueType, DenominatorType, denominator_mode>
 {
 private:
     using T = typename IntermediateDenominator<HashValueType, DenominatorType, denominator_mode>::Type;
 
 public:
-    Denominator(DenominatorType initial_value)
+    Denominator(DenominatorType initial_value) /// NOLINT
         : denominator(initial_value)
     {
     }
 
-public:
-    inline void update(UInt8 cur_rank, UInt8 new_rank)
+    void update(UInt8 cur_rank, UInt8 new_rank)
     {
         denominator -= static_cast<T>(1.0) / (1ULL << cur_rank);
         denominator += static_cast<T>(1.0) / (1ULL << new_rank);
     }
 
-    inline void update(UInt8 rank)
+    void update(UInt8 rank)
     {
         denominator += static_cast<T>(1.0) / (1ULL << rank);
     }
@@ -162,25 +152,23 @@ private:
 /// Fully-functional version of expression's denominator for HyperLogLog algorithm.
 /// Spends more space that lightweight version. Estimates will always be stable.
 /// Used when rank storage is big.
-template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType,
-    DenominatorMode denominator_mode>
-class __attribute__ ((packed)) Denominator<precision, max_rank, HashValueType, DenominatorType,
-    denominator_mode,
-    std::enable_if_t<details::isBigRankStore(precision) && denominator_mode == DenominatorMode::StableIfBig>>
+template <UInt8 precision, int max_rank, typename HashValueType, typename DenominatorType, DenominatorMode denominator_mode>
+requires (details::isBigRankStore(precision)) && (denominator_mode == DenominatorMode::StableIfBig)
+class __attribute__((__packed__)) Denominator<precision, max_rank, HashValueType, DenominatorType, denominator_mode>
 {
 public:
-    Denominator(DenominatorType initial_value)
+    Denominator(DenominatorType initial_value) /// NOLINT
     {
-        rank_count[0] = initial_value;
+        rank_count[0] = static_cast<UInt32>(initial_value);
     }
 
-    inline void update(UInt8 cur_rank, UInt8 new_rank)
+    void update(UInt8 cur_rank, UInt8 new_rank)
     {
         --rank_count[cur_rank];
         ++rank_count[new_rank];
     }
 
-    inline void update(UInt8 rank)
+    void update(UInt8 rank)
     {
         ++rank_count[rank];
     }
@@ -198,7 +186,7 @@ public:
             val /= 2.0;
             val += rank_count[i];
         }
-        return val;
+        return static_cast<DenominatorType>(val);
     }
 
 private:
@@ -215,7 +203,7 @@ struct TrailingZerosCounter<UInt32>
 {
     static int apply(UInt32 val)
     {
-        return __builtin_ctz(val);
+        return std::countr_zero(val);
     }
 };
 
@@ -224,7 +212,7 @@ struct TrailingZerosCounter<UInt64>
 {
     static int apply(UInt64 val)
     {
-        return __builtin_ctzll(val);
+        return std::countr_zero(val);
     }
 };
 
@@ -252,8 +240,9 @@ struct RankWidth<UInt64>
 
 }
 
+
 /// Sets behavior of HyperLogLog class.
-enum class HyperLogLogMode
+enum class HyperLogLogMode : uint8_t
 {
     Raw,            /// No error correction.
     LinearCounting, /// LinearCounting error correction.
@@ -272,7 +261,8 @@ enum class HyperLogLogMode
 /// of Algorithms).
 template <
     UInt8 precision,
-    typename Hash = IntHash32<UInt64>,
+    typename Key = UInt64,
+    typename Hash = IntHash32<Key>,
     typename HashValueType = UInt32,
     typename DenominatorType = double,
     typename BiasEstimator = TrivialBiasEstimator,
@@ -325,7 +315,7 @@ public:
 
         double final_estimate = fixRawEstimate(raw_estimate);
 
-        return static_cast<UInt64>(final_estimate + 0.5);
+        return static_cast<UInt64>(final_estimate + 0.5); /// NOLINT
     }
 
     void merge(const HyperLogLogCounter & rhs)
@@ -337,19 +327,26 @@ public:
 
     void read(DB::ReadBuffer & in)
     {
-        in.readStrict(reinterpret_cast<char *>(this), sizeof(*this));
-    }
-
-    void readAndMerge(DB::ReadBuffer & in)
-    {
-        typename RankStore::Reader reader(in);
-        while (reader.next())
+        if constexpr (std::endian::native == std::endian::little)
+            in.readStrict(reinterpret_cast<char *>(this), sizeof(*this));
+        else
         {
-            const auto & data = reader.get();
-            update(data.first, data.second);
-        }
+            in.readStrict(reinterpret_cast<char *>(&rank_store), sizeof(RankStore));
 
-        in.ignore(sizeof(DenominatorCalculatorType) + sizeof(ZerosCounterType));
+            constexpr size_t denom_size = sizeof(DenominatorCalculatorType);
+            std::array<char, denom_size> denominator_copy;
+            in.readStrict(denominator_copy.data(), denom_size);
+
+            for (size_t i = 0; i < denominator_copy.size(); i += (sizeof(UInt32) / sizeof(char)))
+            {
+                UInt32 * cur = reinterpret_cast<UInt32 *>(&denominator_copy[i]);
+                DB::transformEndianness<std::endian::native, std::endian::little>(*cur);
+            }
+            memcpy(reinterpret_cast<char *>(&denominator), denominator_copy.data(), denom_size);
+
+            in.readStrict(reinterpret_cast<char *>(&zeros), sizeof(ZerosCounterType));
+            DB::transformEndianness<std::endian::native, std::endian::little>(zeros);
+        }
     }
 
     static void skip(DB::ReadBuffer & in)
@@ -359,7 +356,27 @@ public:
 
     void write(DB::WriteBuffer & out) const
     {
-        out.write(reinterpret_cast<const char *>(this), sizeof(*this));
+       if constexpr (std::endian::native == std::endian::little)
+            out.write(reinterpret_cast<const char *>(this), sizeof(*this));
+       else
+       {
+            out.write(reinterpret_cast<const char *>(&rank_store), sizeof(RankStore));
+
+            constexpr size_t denom_size = sizeof(DenominatorCalculatorType);
+            std::array<char, denom_size> denominator_copy;
+            memcpy(denominator_copy.data(), reinterpret_cast<const char *>(&denominator), denom_size);
+
+            for (size_t i = 0; i < denominator_copy.size(); i += (sizeof(UInt32) / sizeof(char)))
+            {
+                UInt32 * cur = reinterpret_cast<UInt32 *>(&denominator_copy[i]);
+                DB::transformEndianness<std::endian::little, std::endian::native>(*cur);
+            }
+            out.write(denominator_copy.data(), denom_size);
+
+            auto zeros_copy = zeros;
+            DB::transformEndianness<std::endian::little, std::endian::native>(zeros_copy);
+            out.write(reinterpret_cast<const char *>(&zeros_copy), sizeof(ZerosCounterType));
+       }
     }
 
     /// Read and write in text mode is suboptimal (but compatible with OLAPServer and Metrage).
@@ -396,13 +413,13 @@ public:
 
 private:
     /// Extract subset of bits in [begin, end[ range.
-    inline HashValueType extractBitSequence(HashValueType val, UInt8 begin, UInt8 end) const
+    HashValueType extractBitSequence(HashValueType val, UInt8 begin, UInt8 end) const
     {
         return (val >> begin) & ((1ULL << (end - begin)) - 1);
     }
 
     /// Rank is number of trailing zeros.
-    inline UInt8 calculateRank(HashValueType val) const
+    UInt8 calculateRank(HashValueType val) const
     {
         if (unlikely(val == 0))
             return max_rank;
@@ -412,12 +429,14 @@ private:
         if (unlikely(zeros_plus_one) > max_rank)
             return max_rank;
 
-        return zeros_plus_one;
+        return static_cast<UInt8>(zeros_plus_one);
     }
 
-    inline HashValueType getHash(Value key) const
+    HashValueType getHash(Value key) const
     {
-        return Hash::operator()(key);
+        /// NOTE: this should be OK, since value is the same as key for HLL.
+        return static_cast<HashValueType>(
+            Hash::operator()(static_cast<Key>(key)));
     }
 
     /// Update maximum rank for current bucket.
@@ -440,11 +459,11 @@ private:
     {
         if ((mode == HyperLogLogMode::Raw) || ((mode == HyperLogLogMode::BiasCorrected) && BiasEstimator::isTrivial()))
             return raw_estimate;
-        else if (mode == HyperLogLogMode::LinearCounting)
+        if (mode == HyperLogLogMode::LinearCounting)
             return applyLinearCorrection(raw_estimate);
-        else if ((mode == HyperLogLogMode::BiasCorrected) && !BiasEstimator::isTrivial())
+        if ((mode == HyperLogLogMode::BiasCorrected) && !BiasEstimator::isTrivial())
             return applyBiasCorrection(raw_estimate);
-        else if (mode == HyperLogLogMode::FullFeatured)
+        if (mode == HyperLogLogMode::FullFeatured)
         {
             static constexpr double pow2_32 = 4294967296.0;
 
@@ -457,11 +476,10 @@ private:
 
             return fixed_estimate;
         }
-        else
-            throw Poco::Exception("Internal error", DB::ErrorCodes::LOGICAL_ERROR);
+        throw Poco::Exception("Internal error", DB::ErrorCodes::LOGICAL_ERROR);
     }
 
-    inline double applyCorrection(double raw_estimate) const
+    double applyCorrection(double raw_estimate) const
     {
         double fixed_estimate;
 
@@ -490,7 +508,7 @@ private:
     /// Correction used in HyperLogLog++ algorithm.
     /// Source: "HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm"
     /// (S. Heule et al., Proceedings of the EDBT 2013 Conference).
-    inline double applyBiasCorrection(double raw_estimate) const
+    double applyBiasCorrection(double raw_estimate) const
     {
         double fixed_estimate;
 
@@ -505,7 +523,7 @@ private:
     /// Calculation of unique values using LinearCounting algorithm.
     /// Source: "A Linear-time Probabilistic Counting Algorithm for Database Applications"
     /// (Whang et al., ACM Trans. Database Syst., pp. 208-229, 1990).
-    inline double applyLinearCorrection(double raw_estimate) const
+    double applyLinearCorrection(double raw_estimate) const
     {
         double fixed_estimate;
 
@@ -517,7 +535,6 @@ private:
         return fixed_estimate;
     }
 
-private:
     static constexpr int max_rank = sizeof(HashValueType) * 8 - precision + 1;
 
     RankStore rank_store;
@@ -541,6 +558,7 @@ private:
 template
 <
     UInt8 precision,
+    typename Key,
     typename Hash,
     typename HashValueType,
     typename DenominatorType,
@@ -551,6 +569,7 @@ template
 details::LogLUT<precision> HyperLogLogCounter
 <
     precision,
+    Key,
     Hash,
     HashValueType,
     DenominatorType,
@@ -564,6 +583,7 @@ details::LogLUT<precision> HyperLogLogCounter
 /// Serialization format must not be changed.
 using HLL12 = HyperLogLogCounter<
     12,
+    UInt64,
     IntHash32<UInt64>,
     UInt32,
     double,

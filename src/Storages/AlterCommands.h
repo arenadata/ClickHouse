@@ -1,7 +1,6 @@
 #pragma once
 
 #include <optional>
-#include <Core/NamesAndTypes.h>
 #include <Storages/IStorage_fwd.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/MutationCommands.h>
@@ -13,6 +12,8 @@ namespace DB
 {
 
 class ASTAlterCommand;
+class IDatabase;
+using DatabasePtr = std::shared_ptr<IDatabase>;
 
 /// Operation from the ALTER query (except for manipulation with PART/PARTITION).
 /// Adding Nested columns is not expanded to add individual columns.
@@ -23,22 +24,53 @@ struct AlterCommand
 
     enum Type
     {
+        UNKNOWN,
         ADD_COLUMN,
         DROP_COLUMN,
         MODIFY_COLUMN,
         COMMENT_COLUMN,
         MODIFY_ORDER_BY,
+        MODIFY_SAMPLE_BY,
         ADD_INDEX,
         DROP_INDEX,
         ADD_CONSTRAINT,
         DROP_CONSTRAINT,
+        ADD_PROJECTION,
+        DROP_PROJECTION,
+        ADD_STATISTICS,
+        DROP_STATISTICS,
+        MODIFY_STATISTICS,
         MODIFY_TTL,
         MODIFY_SETTING,
+        RESET_SETTING,
         MODIFY_QUERY,
+        MODIFY_REFRESH,
         RENAME_COLUMN,
+        REMOVE_TTL,
+        MODIFY_DATABASE_SETTING,
+        MODIFY_DATABASE_COMMENT,
+        COMMENT_TABLE,
+        REMOVE_SAMPLE_BY,
+        MODIFY_SQL_SECURITY,
     };
 
-    Type type;
+    /// Which property user wants to remove from column
+    enum class RemoveProperty : uint8_t
+    {
+        NO_PROPERTY,
+        /// Default specifiers
+        DEFAULT,
+        MATERIALIZED,
+        ALIAS,
+
+        /// Other properties
+        COMMENT,
+        CODEC,
+        TTL,
+        SETTINGS
+    };
+
+    Type type = UNKNOWN;
 
     String column_name;
 
@@ -51,16 +83,16 @@ struct AlterCommand
     ColumnDefaultKind default_kind{};
     ASTPtr default_expression{};
 
-    /// For COMMENT column
+    /// For COMMENT column or table
     std::optional<String> comment;
 
     /// For ADD or MODIFY - after which column to add a new one. If an empty string, add to the end.
     String after_column;
 
-    /// For ADD_COLUMN, MODIFY_COLUMN - Add to the begin if it is true.
+    /// For ADD_COLUMN, MODIFY_COLUMN, ADD_INDEX - Add to the begin if it is true.
     bool first = false;
 
-    /// For DROP_COLUMN, MODIFY_COLUMN, COMMENT_COLUMN
+    /// For DROP_COLUMN, MODIFY_COLUMN, COMMENT_COLUMN, RESET_SETTING
     bool if_exists = false;
 
     /// For ADD_COLUMN
@@ -68,6 +100,9 @@ struct AlterCommand
 
     /// For MODIFY_ORDER_BY
     ASTPtr order_by = nullptr;
+
+    /// For MODIFY_SAMPLE_BY
+    ASTPtr sample_by = nullptr;
 
     /// For ADD INDEX
     ASTPtr index_decl = nullptr;
@@ -82,6 +117,17 @@ struct AlterCommand
     // For ADD/DROP CONSTRAINT
     String constraint_name;
 
+    /// For ADD PROJECTION
+    ASTPtr projection_decl = nullptr;
+    String after_projection_name;
+
+    /// For ADD/DROP PROJECTION
+    String projection_name;
+
+    ASTPtr statistics_decl = nullptr;
+    std::vector<String> statistics_columns;
+    std::vector<String> statistics_types;
+
     /// For MODIFY TTL
     ASTPtr ttl = nullptr;
 
@@ -92,28 +138,41 @@ struct AlterCommand
     bool clear = false;
 
     /// For ADD and MODIFY
-    CompressionCodecPtr codec = nullptr;
+    ASTPtr codec = nullptr;
 
-    /// For MODIFY SETTING
+    /// For MODIFY SETTING or MODIFY COLUMN MODIFY SETTING
     SettingsChanges settings_changes;
+
+    /// For RESET SETTING or MODIFY COLUMN RESET SETTING
+    std::set<String> settings_resets;
 
     /// For MODIFY_QUERY
     ASTPtr select = nullptr;
 
+    /// For MODIFY_SQL_SECURITY
+    ASTPtr sql_security = nullptr;
+
+    /// For MODIFY_REFRESH
+    ASTPtr refresh = nullptr;
+
     /// Target column name
     String rename_to;
 
-    static std::optional<AlterCommand> parse(const ASTAlterCommand * command, bool sanity_check_compression_codecs);
+    /// What to remove from column (or TTL)
+    RemoveProperty to_remove = RemoveProperty::NO_PROPERTY;
 
-    void apply(StorageInMemoryMetadata & metadata, const Context & context) const;
+    /// Is this MODIFY COLUMN MODIFY SETTING or MODIFY COLUMN column with settings declaration)
+    bool append_column_setting = false;
 
-    /// Checks that alter query changes data. For MergeTree:
-    ///    * column files (data and marks)
-    ///    * each part meta (columns.txt)
-    /// in each part on disk (it's not lightweight alter).
-    bool isModifyingData(const StorageInMemoryMetadata & metadata) const;
+    static std::optional<AlterCommand> parse(const ASTAlterCommand * command);
 
-    bool isRequireMutationStage(const StorageInMemoryMetadata & metadata) const;
+    void apply(StorageInMemoryMetadata & metadata, ContextPtr context) const;
+
+    /// Check that alter command require data modification (mutation) to be
+    /// executed. For example, cast from Date to UInt16 type can be executed
+    /// without any data modifications. But column drop or modify from UInt16 to
+    /// UInt32 require data modification.
+    bool isRequireMutationStage(const StorageInMemoryMetadata & metadata, const ContextPtr & context) const;
 
     /// Checks that only settings changed by alter
     bool isSettingsAlter() const;
@@ -124,14 +183,17 @@ struct AlterCommand
     /// Checks that any TTL changed by alter
     bool isTTLAlter(const StorageInMemoryMetadata & metadata) const;
 
+    /// Command removing some property from column or table
+    bool isRemovingProperty() const;
+
+    /// Checks that command will drop something or rename column.
+    bool isDropOrRename() const;
+
     /// If possible, convert alter command to mutation command. In other case
     /// return empty optional. Some storages may execute mutations after
     /// metadata changes.
-    std::optional<MutationCommand> tryConvertToMutationCommand(StorageInMemoryMetadata & metadata, const Context & context) const;
+    std::optional<MutationCommand> tryConvertToMutationCommand(StorageInMemoryMetadata & metadata, ContextPtr context) const;
 };
-
-/// Return string representation of AlterCommand::Type
-String alterTypeToString(const AlterCommand::Type type);
 
 class Context;
 
@@ -143,10 +205,10 @@ private:
 
 public:
     /// Validate that commands can be applied to metadata.
-    /// Checks that all columns exist and dependecies between them.
+    /// Checks that all columns exist and dependencies between them.
     /// This check is lightweight and base only on metadata.
     /// More accurate check have to be performed with storage->checkAlterIsPossible.
-    void validate(const StorageInMemoryMetadata & metadata, const Context & context) const;
+    void validate(const StoragePtr & table, ContextPtr context) const;
 
     /// Prepare alter commands. Set ignore flag to some of them and set some
     /// parts to commands from storage's metadata (for example, absent default)
@@ -154,22 +216,31 @@ public:
 
     /// Apply all alter command in sequential order to storage metadata.
     /// Commands have to be prepared before apply.
-    void apply(StorageInMemoryMetadata & metadata, const Context & context) const;
+    void apply(StorageInMemoryMetadata & metadata, ContextPtr context) const;
 
-    /// At least one command modify data on disk.
-    bool isModifyingData(const StorageInMemoryMetadata & metadata) const;
+    /// At least one command modify settings or comments.
+    bool hasNonReplicatedAlterCommand() const;
 
-    /// At least one command modify settings.
+    /// All commands modify settings or comments.
+    bool areNonReplicatedAlterCommands() const;
+
+    /// All commands modify settings only.
     bool isSettingsAlter() const;
 
-    /// At least one command modify comments.
+    /// All commands modify comments only.
     bool isCommentAlter() const;
 
     /// Return mutation commands which some storages may execute as part of
     /// alter. If alter can be performed as pure metadata update, than result is
     /// empty. If some TTL changes happened than, depending on materialize_ttl
     /// additional mutation command (MATERIALIZE_TTL) will be returned.
-    MutationCommands getMutationCommands(StorageInMemoryMetadata metadata, bool materialize_ttl, const Context & context) const;
+    MutationCommands getMutationCommands(StorageInMemoryMetadata metadata, bool materialize_ttl, ContextPtr context, bool with_alters=false) const;
+
+    /// Check if commands have a text index
+    static bool hasTextIndex(const StorageInMemoryMetadata & metadata);
+
+    /// Check if commands have any vector similarity index
+    static bool hasVectorSimilarityIndex(const StorageInMemoryMetadata & metadata);
 };
 
 }

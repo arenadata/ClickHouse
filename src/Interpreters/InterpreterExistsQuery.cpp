@@ -1,15 +1,15 @@
 #include <Storages/IStorage.h>
 #include <Parsers/TablePropertiesQueriesASTs.h>
-#include <DataStreams/OneBlockInputStream.h>
-#include <DataStreams/BlockIO.h>
-#include <DataStreams/copyData.h>
+#include <Processors/Sources/SourceFromSingleChunk.h>
+#include <QueryPipeline/BlockIO.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnsNumber.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/InterpreterFactory.h>
 #include <Interpreters/InterpreterExistsQuery.h>
-#include <Access/AccessFlags.h>
+#include <Access/Common/AccessFlags.h>
 #include <Common/typeid_cast.h>
-
 
 namespace DB
 {
@@ -22,7 +22,7 @@ namespace ErrorCodes
 BlockIO InterpreterExistsQuery::execute()
 {
     BlockIO res;
-    res.in = executeImpl();
+    res.pipeline = executeImpl();
     return res;
 }
 
@@ -36,36 +36,76 @@ Block InterpreterExistsQuery::getSampleBlock()
 }
 
 
-BlockInputStreamPtr InterpreterExistsQuery::executeImpl()
+QueryPipeline InterpreterExistsQuery::executeImpl()
 {
     ASTQueryWithTableAndOutput * exists_query;
     bool result = false;
+
     if ((exists_query = query_ptr->as<ASTExistsTableQuery>()))
     {
-        if (exists_query->temporary)
+        if (exists_query->isTemporary())
         {
-            result = context.tryResolveStorageID({"", exists_query->table}, Context::ResolveExternal);
+            result = static_cast<bool>(getContext()->tryResolveStorageID(
+                {"", exists_query->getTable()}, Context::ResolveExternal));
         }
         else
         {
-            String database = context.resolveDatabase(exists_query->database);
-            context.checkAccess(AccessType::SHOW_TABLES, database, exists_query->table);
-            result = DatabaseCatalog::instance().isTableExist({database, exists_query->table}, context);
+            String database = getContext()->resolveDatabase(exists_query->getDatabase());
+            getContext()->checkAccess(AccessType::SHOW_TABLES, database, exists_query->getTable());
+            result = DatabaseCatalog::instance().isTableExist({database, exists_query->getTable()}, getContext());
         }
+    }
+    else if ((exists_query = query_ptr->as<ASTExistsViewQuery>()))
+    {
+        if (exists_query->isTemporary())
+        {
+            auto storage_id = getContext()->tryResolveStorageID(
+                {"", exists_query->getTable()}, Context::ResolveExternal);
+            if (storage_id)
+            {
+                auto table = DatabaseCatalog::instance().tryGetTable(storage_id, getContext());
+                result = table && table->isView();
+            }
+            else
+            {
+                result = false;
+            }
+        }
+        else
+        {
+            String database = getContext()->resolveDatabase(exists_query->getDatabase());
+            getContext()->checkAccess(AccessType::SHOW_TABLES, database, exists_query->getTable());
+            auto table = DatabaseCatalog::instance().tryGetTable({database, exists_query->getTable()}, getContext());
+            result = table && table->isView();
+        }
+    }
+    else if ((exists_query = query_ptr->as<ASTExistsDatabaseQuery>()))
+    {
+        String database = getContext()->resolveDatabase(exists_query->getDatabase());
+        getContext()->checkAccess(AccessType::SHOW_DATABASES, database);
+        result = DatabaseCatalog::instance().isDatabaseExist(database);
     }
     else if ((exists_query = query_ptr->as<ASTExistsDictionaryQuery>()))
     {
-        if (exists_query->temporary)
-            throw Exception("Temporary dictionaries are not possible.", ErrorCodes::SYNTAX_ERROR);
-        String database = context.resolveDatabase(exists_query->database);
-        context.checkAccess(AccessType::SHOW_DICTIONARIES, database, exists_query->table);
-        result = DatabaseCatalog::instance().isDictionaryExist({database, exists_query->table});
+        if (exists_query->isTemporary())
+            throw Exception(ErrorCodes::SYNTAX_ERROR, "Temporary dictionaries are not possible.");
+        String database = getContext()->resolveDatabase(exists_query->getDatabase());
+        getContext()->checkAccess(AccessType::SHOW_DICTIONARIES, database, exists_query->getTable());
+        result = DatabaseCatalog::instance().isDictionaryExist({database, exists_query->getTable()});
     }
 
-    return std::make_shared<OneBlockInputStream>(Block{{
+    return QueryPipeline(std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(Block{{
         ColumnUInt8::create(1, result),
         std::make_shared<DataTypeUInt8>(),
-        "result" }});
+        "result" }})));
 }
 
+void registerInterpreterExistsQuery(InterpreterFactory & factory)
+{
+    auto create_fn = [] (const InterpreterFactory::Arguments & args)
+    {
+        return std::make_unique<InterpreterExistsQuery>(args.query, args.context);
+    };
+    factory.registerInterpreter("InterpreterExistsQuery", create_fn);
+}
 }

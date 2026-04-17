@@ -3,55 +3,56 @@
 #include <cmath>
 #include <limits>
 #include <type_traits>
+#include <base/DecomposedFloat.h>
 
 
-/// To be sure, that this function is zero-cost for non-floating point types.
 template <typename T>
-inline std::enable_if_t<std::is_floating_point_v<T>, bool> isNaN(T x)
+inline bool isNaN(T x)
 {
-    return std::isnan(x);
+    /// To be sure, that this function is zero-cost for non-floating point types.
+    if constexpr (is_floating_point<T>)
+        return DecomposedFloat<T>(x).isNaN();
+    else
+        return false;
 }
 
 template <typename T>
-inline std::enable_if_t<!std::is_floating_point_v<T>, bool> isNaN(T)
+inline bool isFinite(T x)
 {
-    return false;
+    if constexpr (is_floating_point<T>)
+        return DecomposedFloat<T>(x).isFinite();
+    else
+        return true;
 }
 
 template <typename T>
-inline std::enable_if_t<std::is_floating_point_v<T>, bool> isFinite(T x)
+bool canConvertTo(Float64 x)
 {
-    return std::isfinite(x);
-}
+    if constexpr (is_floating_point<T>)
+        return true;
+    if (!isFinite(x))
+        return false;
+    if (x > Float64(std::numeric_limits<T>::max()) || x < Float64(std::numeric_limits<T>::lowest()))
+        return false;
 
-template <typename T>
-inline std::enable_if_t<!std::is_floating_point_v<T>, bool> isFinite(T)
-{
     return true;
 }
 
 template <typename T>
-std::enable_if_t<std::is_floating_point_v<T>, T> NaNOrZero()
+T NaNOrZero()
 {
-    return std::numeric_limits<T>::quiet_NaN();
+    if constexpr (std::is_floating_point_v<T>)
+        return std::numeric_limits<T>::quiet_NaN();
+    if constexpr (std::is_same_v<T, BFloat16>)
+        return BFloat16(std::numeric_limits<Float32>::quiet_NaN());
+    return {};
 }
 
 template <typename T>
-std::enable_if_t<std::numeric_limits<T>::is_integer, T> NaNOrZero()
+bool signBit(T x)
 {
-    return 0;
+    if constexpr (is_floating_point<T>)
+        return DecomposedFloat<T>(x).isNegative();
+    else
+        return x < 0;
 }
-
-template <typename T>
-std::enable_if_t<std::is_class_v<T>, T> NaNOrZero()
-{
-    return T{};
-}
-
-#if 1 /// __int128
-template <typename T>
-std::enable_if_t<std::is_same_v<T, __int128> && !std::numeric_limits<T>::is_integer, __int128> NaNOrZero()
-{
-    return __int128(0);
-}
-#endif

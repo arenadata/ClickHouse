@@ -1,15 +1,17 @@
 #pragma once
 
-#include <Parsers/IAST.h>
+#include <Parsers/IAST_fwd.h>
 #include <Interpreters/InDepthNodeVisitor.h>
 
 namespace DB
 {
 
+class ASTFunction;
+
 /// Extract constant arguments out of aggregate functions from child functions
 /// 'sum(a * 2)' -> 'sum(a) * 2'
 /// Rewrites:   sum([multiply|divide]) -> [multiply|divide](sum)
-///             [min|max]([multiply|divide|plus|minus]) -> [multiply|divide|plus|minus]([min|max])
+///             [min|max|avg]([multiply|divide|plus|minus]) -> [multiply|divide|plus|minus]([min|max|avg])
 /// TODO: groupBitAnd, groupBitOr, groupBitXor
 /// TODO: better constant detection: f(const) is not detected as const.
 /// TODO: 'f((2 * n) * n)' -> '2 * f(n * n)'

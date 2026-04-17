@@ -1,4 +1,4 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeArray.h>
@@ -20,17 +20,17 @@ class ArrayFlatten : public IFunction
 public:
     static constexpr auto name = "arrayFlatten";
 
-    static FunctionPtr create(const Context &) { return std::make_shared<ArrayFlatten>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<ArrayFlatten>(); }
 
     size_t getNumberOfArguments() const override { return 1; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (!isArray(arguments[0]))
-            throw Exception("Illegal type " + arguments[0]->getName() +
-                            " of argument of function " + getName() +
-                            ", expected Array", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of argument of function {}, expected Array",
+                            arguments[0]->getName(), getName());
 
         DataTypePtr nested_type = arguments[0];
         while (isArray(nested_type))
@@ -39,7 +39,7 @@ public:
         return std::make_shared<DataTypeArray>(nested_type);
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
         /** We create an array column with array elements as the most deep elements of nested arrays,
           * and construct offsets by selecting elements of most deep offsets by values of ancestor offsets.
@@ -79,11 +79,11 @@ result offsets: 3, 4
 result: Row 1: [1, 2, 3], Row2: [4]
           */
 
-        const ColumnArray * src_col = checkAndGetColumn<ColumnArray>(block.getByPosition(arguments[0]).column.get());
+        const ColumnArray * src_col = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
 
         if (!src_col)
-            throw Exception("Illegal column " + block.getByPosition(arguments[0]).column->getName() + " in argument of function 'arrayFlatten'",
-                ErrorCodes::ILLEGAL_COLUMN);
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} in argument of function 'arrayFlatten'",
+                arguments[0].column->getName());
 
         const IColumn::Offsets & src_offsets = src_col->getOffsets();
 
@@ -107,9 +107,9 @@ result: Row 1: [1, 2, 3], Row2: [4]
             prev_data = &next_col->getData();
         }
 
-        block.getByPosition(result).column = ColumnArray::create(
+        return ColumnArray::create(
             prev_data->getPtr(),
-            result_offsets_column ? std::move(result_offsets_column) : src_col->getOffsetsPtr());
+            result_offsets_column ? std::move(result_offsets_column) : src_col->getOffsetsPtr());  /// NOLINT(performance-move-const-arg)
     }
 
 private:
@@ -120,10 +120,30 @@ private:
 };
 
 
-void registerFunctionArrayFlatten(FunctionFactory & factory)
+REGISTER_FUNCTION(ArrayFlatten)
 {
-    factory.registerFunction<ArrayFlatten>();
-    factory.registerAlias("flatten", "arrayFlatten", FunctionFactory::CaseInsensitive);
+    FunctionDocumentation::Description description = R"(
+Converts an array of arrays to a flat array.
+
+Function:
+
+- Applies to any depth of nested arrays.
+- Does not change arrays that are already flat.
+
+The flattened array contains all the elements from all source arrays.
+)";
+    FunctionDocumentation::Syntax syntax = "arrayFlatten(arr)";
+    FunctionDocumentation::Arguments arguments = {
+        {"arr", "A multidimensional array.", {"Array(Array(T))"}},
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns a flattened array from the multidimensional array", {"Array(T)"}};
+    FunctionDocumentation::Examples examples = {{"Usage example", "SELECT arrayFlatten([[[1]], [[2], [3]]]);", "[1, 2, 3]"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<ArrayFlatten>(documentation);
+    factory.registerAlias("flatten", "arrayFlatten", FunctionFactory::Case::Insensitive);
 }
 
 }

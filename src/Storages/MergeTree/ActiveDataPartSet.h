@@ -1,29 +1,42 @@
 #pragma once
 
 #include <Storages/MergeTree/MergeTreePartInfo.h>
-#include <Core/Types.h>
+#include <base/types.h>
 #include <map>
+#include <vector>
 
+namespace Poco
+{
+class Logger;
+}
 
 namespace DB
 {
 
+using Strings = std::vector<String>;
+
 /** Supports multiple names of active parts of data.
   * Repeats part of the MergeTreeData functionality.
-  * TODO: generalize with MergeTreeData
   */
 class ActiveDataPartSet
 {
 public:
-    ActiveDataPartSet(MergeTreeDataFormatVersion format_version_) : format_version(format_version_) {}
+    enum class AddPartOutcome : uint8_t
+    {
+        Added,
+        HasCovering,
+        HasIntersectingPart,
+    };
+
+    ActiveDataPartSet() : ActiveDataPartSet(MERGE_TREE_DATA_MIN_FORMAT_VERSION_WITH_CUSTOM_PARTITIONING) {}
+    explicit ActiveDataPartSet(MergeTreeDataFormatVersion format_version_) : format_version(format_version_) {}
     ActiveDataPartSet(MergeTreeDataFormatVersion format_version_, const Strings & names);
 
-    ActiveDataPartSet(const ActiveDataPartSet & other)
-        : format_version(other.format_version)
-        , part_info_to_name(other.part_info_to_name)
-    {}
+    ActiveDataPartSet(const ActiveDataPartSet & other) = default;
+    ActiveDataPartSet(ActiveDataPartSet && other) noexcept = default;
 
-    ActiveDataPartSet(ActiveDataPartSet && other) noexcept { swap(other); }
+    ActiveDataPartSet & operator=(const ActiveDataPartSet & other) = default;
+    ActiveDataPartSet & operator=(ActiveDataPartSet && other) = default;
 
     void swap(ActiveDataPartSet & other) noexcept
     {
@@ -31,19 +44,16 @@ public:
         std::swap(part_info_to_name, other.part_info_to_name);
     }
 
-    ActiveDataPartSet & operator=(const ActiveDataPartSet & other)
-    {
-        if (&other != this)
-        {
-            ActiveDataPartSet tmp(other);
-            swap(tmp);
-        }
-        return *this;
-    }
-
     /// Returns true if the part was actually added. If out_replaced_parts != nullptr, it will contain
     /// parts that were replaced from the set by the newly added part.
     bool add(const String & name, Strings * out_replaced_parts = nullptr);
+    bool add(const MergeTreePartInfo & part_info, const String & name, Strings * out_replaced_parts = nullptr);
+    bool add(const MergeTreePartInfo & part_info, Strings * out_replaced_parts = nullptr);
+
+    AddPartOutcome tryAddPart(const MergeTreePartInfo & part_info, String * out_reason = nullptr);
+
+    /// Like add(const String &) but returns outcome instead of throwing on intersection.
+    AddPartOutcome tryAdd(const String & name, String * out_reason = nullptr);
 
     bool remove(const MergeTreePartInfo & part_info)
     {
@@ -58,9 +68,13 @@ public:
     /// Remove part and all covered parts from active set
     bool removePartAndCoveredParts(const String & part_name)
     {
-        Strings parts_covered_by = getPartsCoveredBy(MergeTreePartInfo::fromPartName(part_name, format_version));
-        bool result = true;
-        result &= remove(part_name);
+        return removePartAndCoveredParts(MergeTreePartInfo::fromPartName(part_name, format_version));
+    }
+
+    bool removePartAndCoveredParts(const MergeTreePartInfo & part_info)
+    {
+        Strings parts_covered_by = getPartsCoveredBy(part_info);
+        bool result = remove(part_info);
         for (const auto & part : parts_covered_by)
             result &= remove(part);
 
@@ -84,10 +98,17 @@ public:
     String getContainingPart(const String & name) const;
 
     Strings getPartsCoveredBy(const MergeTreePartInfo & part_info) const;
+    std::vector<MergeTreePartInfo> getPartInfosCoveredBy(const MergeTreePartInfo & part_info) const;
 
     /// Returns parts in ascending order of the partition_id and block number.
     Strings getParts() const;
+    Strings getPartsWithLimit(size_t limit) const;
+    std::vector<MergeTreePartInfo> getPartInfos() const;
+    std::vector<MergeTreePartInfo> getPatchPartInfos() const;
+    bool hasPartitionId(const String & partition_id) const;
 
+    bool isEmpty() const;
+    bool hasSome() const;
     size_t size() const;
 
     void clear()
@@ -97,9 +118,18 @@ public:
 
     MergeTreeDataFormatVersion getFormatVersion() const { return format_version; }
 
+    void checkIntersectingParts(const MergeTreePartInfo & part_info) const;
+    void checkIntersectingParts(const String & name) const;
+
 private:
+
+    AddPartOutcome addImpl(const MergeTreePartInfo & part_info, const String & name, Strings * out_replaced_parts = nullptr, String * out_reason = nullptr);
     MergeTreeDataFormatVersion format_version;
-    std::map<MergeTreePartInfo, String> part_info_to_name;
+
+    using PartInfoToName = std::map<MergeTreePartInfo, String>;
+    PartInfoToName part_info_to_name;
+
+    std::vector<std::map<MergeTreePartInfo, String>::const_iterator> getPartsCoveredByImpl(const MergeTreePartInfo & part_info) const;
 
     std::map<MergeTreePartInfo, String>::const_iterator getContainingPartImpl(const MergeTreePartInfo & part_info) const;
 };

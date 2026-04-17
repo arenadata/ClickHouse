@@ -1,28 +1,35 @@
-#include <Functions/IFunctionImpl.h>
+#include <Core/ColumnsWithTypeAndName.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeAggregateFunction.h>
-#include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnAggregateFunction.h>
+#include <Common/FunctionDocumentation.h>
 #include <Common/typeid_cast.h>
 
-#include <Columns/ColumnVector.h>
-#include <Columns/ColumnsNumber.h>
-#include <iostream>
 
 #include <Common/PODArray.h>
-#include <Columns/ColumnArray.h>
 
 namespace DB
 {
+namespace ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+    extern const int ILLEGAL_COLUMN;
+}
 
-    namespace ErrorCodes
-    {
-        extern const int BAD_ARGUMENTS;
-        extern const int ILLEGAL_COLUMN;
-        extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    }
+namespace
+{
 
+bool isAggregateFunctionState(const IDataType & type)
+{
+    return typeid_cast<const DataTypeAggregateFunction *>(&type) != nullptr;
+}
+
+}
+
+namespace
+{
 
 /** finalizeAggregation(agg_state) - get the result from the aggregation state.
 * Takes state of aggregate function. Returns result of aggregation (finalized state).
@@ -31,11 +38,11 @@ class FunctionEvalMLMethod : public IFunction
 {
 public:
     static constexpr auto name = "evalMLMethod";
-    static FunctionPtr create(const Context & context)
+    static FunctionPtr create(ContextPtr context)
     {
         return std::make_shared<FunctionEvalMLMethod>(context);
     }
-    explicit FunctionEvalMLMethod(const Context & context_) : context(context_)
+    explicit FunctionEvalMLMethod(ContextPtr context_) : context(context_)
     {}
 
     String getName() const override
@@ -47,30 +54,38 @@ public:
     {
         return true;
     }
+
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override
+    {
+        return true;
+    }
+
     size_t getNumberOfArguments() const override
     {
         return 0;
     }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
-        if (arguments.empty())
-            throw Exception("Function " + getName() + " requires at least one argument", ErrorCodes::BAD_ARGUMENTS);
+        FunctionArgumentDescriptors mandatory_args{
+            {"model", &isAggregateFunctionState, nullptr, "AggregateFunctionState"}
+        };
+        FunctionArgumentDescriptor optional_args{
+            "xi", &isNumber, nullptr, "Float* or (U)Int*"
+        };
 
-        const auto * type = checkAndGetDataType<DataTypeAggregateFunction>(arguments[0].get());
-        if (!type)
-            throw Exception("Argument for function " + getName() + " must have type AggregateFunction - state of aggregate function.",
-                            ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+        validateFunctionArgumentsWithVariadics(*this, arguments, mandatory_args, optional_args);
 
-        return type->getReturnTypeToPredict();
+        const auto* agg_function = static_cast<const DataTypeAggregateFunction *>(arguments[0].type.get());
+        return agg_function->getReturnTypeToPredict();
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t /*input_rows_count*/) const override
     {
         if (arguments.empty())
-            throw Exception("Function " + getName() + " requires at least one argument", ErrorCodes::BAD_ARGUMENTS);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function {} requires at least one argument", getName());
 
-        const auto * model = block.getByPosition(arguments[0]).column.get();
+        const auto * model = arguments[0].column.get();
 
         if (const auto * column_with_states = typeid_cast<const ColumnConst *>(model))
             model = column_with_states->getDataColumnPtr().get();
@@ -78,18 +93,53 @@ public:
         const auto * agg_function = typeid_cast<const ColumnAggregateFunction *>(model);
 
         if (!agg_function)
-            throw Exception("Illegal column " + block.getByPosition(arguments[0]).column->getName()
-                            + " of first argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN);
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of first argument of function {}",
+                            arguments[0].column->getName(), getName());
 
-        block.getByPosition(result).column = agg_function->predictValues(block, arguments, context);
+        return agg_function->predictValues(arguments, context);
     }
 
-    const Context & context;
+    ContextPtr context;
 };
 
-void registerFunctionEvalMLMethod(FunctionFactory & factory)
+}
+
+REGISTER_FUNCTION(EvalMLMethod)
 {
-    factory.registerFunction<FunctionEvalMLMethod>();
+    FunctionDocumentation::Description description = R"(
+Applies a trained machine learning model to input features to generate predictions.
+)";
+    FunctionDocumentation::Syntax syntax = "evalMLMethod(model, x1[, x2, ...])";
+    FunctionDocumentation::Arguments arguments = {
+        {"model", "The trained machine learning model.", {"AggregateFunctionState"}},
+        {"x1, x2, ...", "Feature values for prediction.", {"Float*", "(U)Int*"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the predicted value based on the trained model.", {"Float64"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Example usage",
+        R"(
+SELECT
+evalMLMethod(model, trip_distance),
+total_amount
+FROM trips
+LEFT JOIN models ON year = toYear(pickup_datetime)
+LIMIT 5
+        )",
+        R"(
+┌─evalMLMethod(model, trip_distance)─┬─total_amount─┐
+│ 8.087692004204174                  │ 5.4          │
+│ 7.861181608305352                  │ 4.6          │
+│ 26.661544467907536                 │ 23.4         │
+│ 8.767223191900637                  │ 5.8          │
+│ 10.80581675499003                  │ 9            │
+└────────────────────────────────────┴──────────────┘
+        )"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::MachineLearning;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionEvalMLMethod>(documentation);
 }
 
 }

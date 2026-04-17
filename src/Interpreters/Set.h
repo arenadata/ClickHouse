@@ -1,14 +1,13 @@
 #pragma once
 
-#include <shared_mutex>
-#include <Core/Block.h>
-#include <DataStreams/SizeLimits.h>
+#include <QueryPipeline/SizeLimits.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/SetVariants.h>
-#include <Parsers/IAST.h>
+#include <Interpreters/SetKeys.h>
 #include <Storages/MergeTree/BoolMask.h>
 
-#include <common/logger_useful.h>
+#include <Common/SharedMutex.h>
+#include <Interpreters/castColumn.h>
 
 
 namespace DB
@@ -18,8 +17,13 @@ struct Range;
 
 class Context;
 class IFunctionBase;
-using FunctionBasePtr = std::shared_ptr<IFunctionBase>;
+using FunctionBasePtr = std::shared_ptr<const IFunctionBase>;
+using Sizes = std::vector<size_t>;
 
+struct ColumnWithTypeAndName;
+using ColumnsWithTypeAndName = VectorWithMemoryTracking<ColumnWithTypeAndName>;
+
+class Chunk;
 
 /** Data structure for implementation of IN expression.
   */
@@ -30,52 +34,65 @@ public:
     /// (that is useful only for checking that some value is in the set and may not store the original values),
     /// store all set elements in explicit form.
     /// This is needed for subsequent use for index.
-    Set(const SizeLimits & limits_, bool fill_set_elements_, bool transform_null_in_)
-        : log(&Poco::Logger::get("Set")),
-        limits(limits_), fill_set_elements(fill_set_elements_), transform_null_in(transform_null_in_)
-    {
-    }
-
-    bool empty() const { return data.empty(); }
+    Set(const SizeLimits & limits_, size_t max_elements_to_fill_, bool transform_null_in_);
 
     /** Set can be created either from AST or from a stream of data (subquery result).
       */
 
-    /** Create a Set from expression (specified literally in the query).
-      * 'types' - types of what are on the left hand side of IN.
-      * 'node' - list of values: 1, 2, 3 or list of tuples: (1, 2), (3, 4), (5, 6).
-      */
-    void createFromAST(const DataTypes & types, ASTPtr node, const Context & context);
-
     /** Create a Set from stream.
       * Call setHeader, then call insertFromBlock for each block.
       */
-    void setHeader(const Block & header);
+    void setHeader(const ColumnsWithTypeAndName & header);
 
     /// Returns false, if some limit was exceeded and no need to insert more data.
-    bool insertFromBlock(const Block & block);
+    bool insertFromColumns(const Columns & columns);
+    bool insertFromBlock(const ColumnsWithTypeAndName & columns);
+
+    void fillSetElements();
+    bool insertFromColumns(const Columns & columns, SetKeyColumns & holder);
+    void appendSetElements(SetKeyColumns & holder);
+
     /// Call after all blocks were inserted. To get the information that set is already created.
     void finishInsert() { is_created = true; }
 
-    bool isCreated() const { return is_created; }
+    /// finishInsert and isCreated are thread-safe
+    bool isCreated() const { return is_created.load(); }
+
+    void checkIsCreated() const;
+
+    void processDateTime64Column(const ColumnWithTypeAndName & column_to_cast, ColumnPtr & result, ColumnPtr & null_map_holder, ConstNullMapPtr & null_map) const;
 
     /** For columns of 'block', check belonging of corresponding rows to the set.
       * Return UInt8 column with the result.
       */
-    ColumnPtr execute(const Block & block, bool negative) const;
+    ColumnPtr execute(const ColumnsWithTypeAndName & columns, bool negative) const;
 
-    size_t getTotalRowCount() const { return data.getTotalRowCount(); }
-    size_t getTotalByteCount() const { return data.getTotalByteCount(); }
+    bool hasNull() const;
+
+    bool empty() const;
+    size_t getTotalRowCount() const;
+    size_t getTotalByteCount() const;
 
     const DataTypes & getDataTypes() const { return data_types; }
     const DataTypes & getElementsTypes() const { return set_elements_types; }
 
-    bool hasExplicitSetElements() const { return fill_set_elements; }
-    Columns getSetElements() const { return { set_elements.begin(), set_elements.end() }; }
+    bool hasExplicitSetElements() const { return fill_set_elements || (!set_elements.empty() && set_elements.front()->size() == data.getTotalRowCount()); }
+    bool hasSetElements() const { return !set_elements.empty(); }
+    Columns getSetElements() const;
 
     void checkColumnsNumber(size_t num_key_columns) const;
     bool areTypesEqual(size_t set_type_idx, const DataTypePtr & other_type) const;
     void checkTypesEqual(size_t set_type_idx, const DataTypePtr & other_type) const;
+
+    static DataTypes getElementTypes(DataTypes types, bool transform_null_in);
+
+    /// Limitations on the maximum size of the set
+    const SizeLimits limits;
+
+    /// If true, insert NULL values to set.
+    const bool transform_null_in;
+
+    const size_t max_elements_to_fill;
 
 private:
     size_t keys_size = 0;
@@ -106,20 +123,13 @@ private:
     /// Types for set_elements.
     DataTypes set_elements_types;
 
-    Poco::Logger * log;
-
-    /// Limitations on the maximum size of the set
-    SizeLimits limits;
+    LoggerPtr log;
 
     /// Do we need to additionally store all elements of the set in explicit form for subsequent use for index.
-    bool fill_set_elements;
-
-    bool transform_null_in;
-
-    bool has_null = false;
+    bool fill_set_elements = false;
 
     /// Check if set contains all the data.
-    bool is_created = false;
+    std::atomic<bool> is_created = false;
 
     /// If in the left part columns contains the same types as the elements of the set.
     void executeOrdinary(
@@ -130,14 +140,16 @@ private:
 
     /// Collected elements of `Set`.
     /// It is necessary for the index to work on the primary key in the IN statement.
-    std::vector<IColumn::WrappedPtr> set_elements;
+    MutableColumns set_elements;
 
     /** Protects work with the set in the functions `insertFromBlock` and `execute`.
       * These functions can be called simultaneously from different threads only when using StorageSet,
-      *  and StorageSet calls only these two functions.
-      * Therefore, the rest of the functions for working with set are not protected.
       */
-    mutable std::shared_mutex rwlock;
+    mutable SharedMutex rwlock;
+
+    /// A cache for cast functions (if any) to avoid rebuilding cast functions
+    /// for every call to `execute`
+    mutable std::unique_ptr<InternalCastFunctionCache> cast_cache;
 
     template <typename Method>
     void insertFromBlockImpl(
@@ -181,39 +193,6 @@ using ConstSetPtr = std::shared_ptr<const Set>;
 using Sets = std::vector<SetPtr>;
 
 
-class IFunction;
-using FunctionPtr = std::shared_ptr<IFunction>;
-
-/** Class that represents single value with possible infinities.
-  * Single field is stored in column for more optimal inplace comparisons with other regular columns.
-  * Extracting fields from columns and further their comparison is suboptimal and requires extra copying.
-  */
-class ValueWithInfinity
-{
-public:
-    enum Type
-    {
-        MINUS_INFINITY = -1,
-        NORMAL = 0,
-        PLUS_INFINITY = 1
-    };
-
-    ValueWithInfinity(MutableColumnPtr && column_)
-        : column(std::move(column_)), type(NORMAL) {}
-
-    void update(const Field & x);
-    void update(Type type_) { type = type_; }
-
-    const IColumn & getColumnIfFinite() const;
-
-    Type getType() const { return type; }
-
-private:
-    MutableColumnPtr column;
-    Type type;
-};
-
-
 /// Class for checkInRange function.
 class MergeTreeSetIndex
 {
@@ -228,22 +207,44 @@ public:
         std::vector<FunctionBasePtr> functions;
     };
 
-    MergeTreeSetIndex(const Columns & set_elements, std::vector<KeyTuplePositionMapping> && index_mapping_);
+    MergeTreeSetIndex(const Columns & set_elements, std::vector<KeyTuplePositionMapping> && indexes_mapping_);
 
     size_t size() const { return ordered_set.at(0)->size(); }
 
     bool hasMonotonicFunctionsChain() const;
 
-    BoolMask checkInRange(const std::vector<Range> & key_ranges, const DataTypes & data_types);
+    BoolMask checkInRange(const std::vector<Range> & key_ranges, const DataTypes & data_types, bool single_point = false) const;
+
+    const Columns & getOrderedSet() const { return ordered_set; }
+
+    const std::vector<KeyTuplePositionMapping> & getIndexesMapping() const { return indexes_mapping; }
 
 private:
+    /** Class that represents single value with possible infinities.
+      * Single field is stored in column for more optimal inplace comparisons with other regular columns.
+      * Extracting fields from columns and further their comparison is suboptimal and requires extra copying.
+      */
+    struct FieldValue
+    {
+        explicit FieldValue(MutableColumnPtr && column_) : column(std::move(column_)) {}
+        void update(const Field & x);
+
+        bool isNormal() const { return !value.isPositiveInfinity() && !value.isNegativeInfinity(); }
+        bool isPositiveInfinity() const { return value.isPositiveInfinity(); }
+        bool isNegativeInfinity() const { return value.isNegativeInfinity(); }
+
+        Field value; // Null, -Inf, +Inf
+
+        // If value is Null, uses the actual value in column
+        MutableColumnPtr column;
+    };
+
+    // If all arguments in tuple are key columns, we can optimize NOT IN when there is only one element.
+    bool has_all_keys;
     Columns ordered_set;
     std::vector<KeyTuplePositionMapping> indexes_mapping;
 
-    using ColumnsWithInfinity = std::vector<ValueWithInfinity>;
-
-    ColumnsWithInfinity left_point;
-    ColumnsWithInfinity right_point;
+    using FieldValues = std::vector<FieldValue>;
 };
 
 }

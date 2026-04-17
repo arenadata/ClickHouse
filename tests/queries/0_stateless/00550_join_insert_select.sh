@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
-$CLICKHOUSE_CLIENT -n --ignore-error --query="
+$CLICKHOUSE_CLIENT --ignore-error --query="
 DROP TABLE IF EXISTS test1_00550;
 DROP TABLE IF EXISTS test2_00550;
 DROP TABLE IF EXISTS test3_00550;

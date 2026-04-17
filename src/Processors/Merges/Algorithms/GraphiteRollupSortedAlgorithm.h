@@ -22,11 +22,23 @@ class GraphiteRollupSortedAlgorithm final : public IMergingAlgorithmWithSharedCh
 {
 public:
     GraphiteRollupSortedAlgorithm(
-        const Block & header, size_t num_inputs,
-        SortDescription description_, size_t max_block_size,
-        Graphite::Params params_, time_t time_of_merge_);
+        SharedHeader header,
+        size_t num_inputs,
+        SortDescription description_,
+        size_t max_block_size_rows_,
+        size_t max_block_size_bytes_,
+        std::optional<size_t> max_dynamic_subcolumns_,
+        Graphite::Params params_,
+        time_t time_of_merge_);
 
+    /// Reset merged_data before params is destroyed, because GraphiteRollupMergedData
+    /// holds raw pointers into params.patterns and its destructor accesses them.
+    ~GraphiteRollupSortedAlgorithm() override;
+
+    const char * getName() const override { return "GraphiteRollupSortedAlgorithm"; }
     Status merge() override;
+
+    MergedStats getMergedStats() const override { return merged_data->getMergedStats(); }
 
     struct ColumnsDefinition
     {
@@ -34,6 +46,8 @@ public:
         size_t time_column_num;
         size_t value_column_num;
         size_t version_column_num;
+
+        DataTypePtr time_column_type;
 
         /// All columns other than 'time', 'value', 'version'. They are unmodified during rollup.
         ColumnNumbers unmodified_column_numbers;
@@ -46,7 +60,7 @@ public:
     {
     public:
         using MergedData::MergedData;
-        ~GraphiteRollupMergedData();
+        ~GraphiteRollupMergedData() override;
 
         void startNextGroup(const ColumnRawPtrs & raw_columns, size_t row,
                             Graphite::RollupRule next_rule, ColumnsDefinition & def);
@@ -65,7 +79,7 @@ public:
     };
 
 private:
-    GraphiteRollupMergedData merged_data;
+    GraphiteRollupMergedData & graphite_rollup_merged_data;
 
     const Graphite::Params params;
     ColumnsDefinition columns_definition;
@@ -90,7 +104,7 @@ private:
      */
 
     /// Path name of current bucket
-    StringRef current_group_path;
+    std::string_view current_group_path;
 
     static constexpr size_t max_row_refs = 2; /// current_subgroup_newest_row, current_row.
     /// Last row with maximum version for current primary key (time bucket).
@@ -100,16 +114,6 @@ private:
     time_t current_time = 0;
     time_t current_time_rounded = 0;
 
-    const Graphite::Pattern undef_pattern =
-    { /// temporary empty pattern for selectPatternForPath
-            .regexp = nullptr,
-            .regexp_str = "",
-            .function = nullptr,
-            .retentions = DB::Graphite::Retentions(),
-            .type = undef_pattern.TypeUndef,
-    };
-
-    Graphite::RollupRule selectPatternForPath(StringRef path) const;
     UInt32 selectPrecision(const Graphite::Retentions & retentions, time_t time) const;
 
     /// Insert the values into the resulting columns, which will not be changed in the future.

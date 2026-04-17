@@ -1,11 +1,11 @@
 #include <Functions/FunctionFactory.h>
-#include <Functions/IFunctionImpl.h>
-#include <Common/StringUtils/StringUtils.h>
+#include <Functions/IFunction.h>
+#include <Common/StringUtils.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
-#include "domain.h"
+#include <Functions/URL/domain.h>
 
 
 namespace DB
@@ -18,88 +18,87 @@ namespace ErrorCodes
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
-struct FunctionPort : public IFunction
+template<bool conform_rfc>
+struct FunctionPortImpl : public IFunction
 {
-    static constexpr auto name = "port";
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionPort>(); }
-
-    String getName() const override { return name; }
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
     bool useDefaultImplementationForConstants() const override { return true; }
     ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
         if (arguments.size() != 1 && arguments.size() != 2)
-            throw Exception("Number of arguments for function " + getName() + " doesn't match: passed "
-                            + std::to_string(arguments.size()) + ", should be 1 or 2",
-                            ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
+            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                            "Number of arguments for function {} doesn't match: passed {}, should be 1 or 2",
+                            getName(), arguments.size());
 
         if (!WhichDataType(arguments[0].type).isString())
-            throw Exception("Illegal type " + arguments[0].type->getName() + " of first argument of function " + getName() + ". Must be String.",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of first argument of function {}. "
+                "Must be String.", arguments[0].type->getName(), getName());
 
         if (arguments.size() == 2 && !WhichDataType(arguments[1].type).isUInt16())
-            throw Exception("Illegal type " + arguments[1].type->getName() + " of second argument of function " + getName() + ". Must be UInt16.",
-                ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of second argument of function {}. "
+                "Must be UInt16.", arguments[1].type->getName(), getName());
 
         return std::make_shared<DataTypeUInt16>();
     }
 
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
         UInt16 default_port = 0;
         if (arguments.size() == 2)
         {
-            const auto * port_column = checkAndGetColumn<ColumnConst>(block.getByPosition(arguments[1]).column.get());
+            const auto * port_column = checkAndGetColumn<ColumnConst>(arguments[1].column.get());
             if (!port_column)
-                throw Exception("Second argument for function " + getName() + " must be constant UInt16", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Second argument for function {} must be constant UInt16", getName());
             default_port = port_column->getValue<UInt16>();
         }
 
-        const ColumnPtr url_column = block.getByPosition(arguments[0]).column;
+        const ColumnPtr url_column = arguments[0].column;
         if (const ColumnString * url_strs = checkAndGetColumn<ColumnString>(url_column.get()))
         {
             auto col_res = ColumnVector<UInt16>::create();
             typename ColumnVector<UInt16>::Container & vec_res = col_res->getData();
             vec_res.resize(url_column->size());
 
-            vector(default_port, url_strs->getChars(), url_strs->getOffsets(), vec_res);
-            block.getByPosition(result).column = std::move(col_res);
+            vector(default_port, url_strs->getChars(), url_strs->getOffsets(), vec_res, input_rows_count);
+            return col_res;
         }
-        else
-            throw Exception(
-                "Illegal column " + block.getByPosition(arguments[0]).column->getName() + " of argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN);
+        throw Exception(
+            ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}", arguments[0].column->getName(), getName());
 }
 
 private:
-    static void vector(UInt16 default_port, const ColumnString::Chars & data, const ColumnString::Offsets & offsets, PaddedPODArray<UInt16> & res)
+    static void vector(UInt16 default_port, const ColumnString::Chars & data, const ColumnString::Offsets & offsets, PaddedPODArray<UInt16> & res, size_t input_rows_count)
     {
-        size_t size = offsets.size();
-
         ColumnString::Offset prev_offset = 0;
-        for (size_t i = 0; i < size; ++i)
+        for (size_t i = 0; i < input_rows_count; ++i)
         {
-            res[i] = extractPort(default_port, data, prev_offset, offsets[i] - prev_offset - 1);
+            res[i] = extractPort(default_port, data, prev_offset, offsets[i] - prev_offset);
             prev_offset = offsets[i];
         }
 }
 
     static UInt16 extractPort(UInt16 default_port, const ColumnString::Chars & buf, size_t offset, size_t size)
     {
-        const char * p = reinterpret_cast<const char *>(&buf[0]) + offset;
+        const char * p = reinterpret_cast<const char *>(buf.data()) + offset;
         const char * end = p + size;
 
-        StringRef host = getURLHost(p, size);
-        if (!host.size)
+        std::string_view host;
+        if constexpr (conform_rfc)
+            host = getURLHostRFC(p, size);
+        else
+            host = getURLHost(p, size);
+
+        if (host.empty())
             return default_port;
-        if (host.size == size)
+        if (host.size() == size)
             return default_port;
 
-        p = host.data + host.size;
+        p = host.data() + host.size();
         if (*p++ != ':')
             return default_port;
 
@@ -112,18 +111,88 @@ private:
                 return default_port;
 
             port = (port * 10) + (*p - '0');
-            if (port < 0 || port > UInt16(-1))
+            if (port < 0 || port > static_cast<UInt16>(-1))
                 return default_port;
             ++p;
         }
-        return port;
+        return static_cast<UInt16>(port);
     }
 };
 
-void registerFunctionPort(FunctionFactory & factory)
+struct FunctionPort : public FunctionPortImpl<false>
 {
-    factory.registerFunction<FunctionPort>();
+    static constexpr auto name = "port";
+    String getName() const override { return name; }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionPort>(); }
+};
+
+struct FunctionPortRFC : public FunctionPortImpl<true>
+{
+    static constexpr auto name = "portRFC";
+    String getName() const override { return name; }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionPortRFC>(); }
+};
+
+REGISTER_FUNCTION(Port)
+{
+    /// port documentation
+    FunctionDocumentation::Description description_port = R"(
+Returns the port of a URL, or the `default_port` if the URL contains no port or cannot be parsed.
+    )";
+    FunctionDocumentation::Syntax syntax_port = "port(url[, default_port])";
+    FunctionDocumentation::Arguments arguments_port = {
+        {"url", "URL.", {"String"}},
+        {"default_port", "Optional. The default port number to be returned. `0` by default.", {"UInt16"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value_port = {"Returns the port of the URL, or the default port if there is no port in the URL or in case of a validation error.", {"UInt16"}};
+    FunctionDocumentation::Examples examples_port = {
+    {
+        "Usage example",
+        R"(
+SELECT port('https://clickhouse.com:8443/docs'), port('https://clickhouse.com/docs', 443);
+        )",
+        R"(
+┌─port('https://clickhouse.com:8443/docs')─┬─port('https://clickhouse.com/docs', 443)─┐
+│                                     8443 │                                      443 │
+└──────────────────────────────────────────┴──────────────────────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in_port = {20, 5};
+    FunctionDocumentation::Category category_port = FunctionDocumentation::Category::URL;
+    FunctionDocumentation documentation_port = {description_port, syntax_port, arguments_port, {}, returned_value_port, examples_port, introduced_in_port, category_port};
+
+    factory.registerFunction<FunctionPort>(documentation_port);
+
+    /// portRFC documentation
+    FunctionDocumentation::Description description_portRFC = R"(
+Returns the port or `default_port` if the URL contains no port or cannot be parsed.
+Similar to [`port`](#port), but [RFC 3986](https://datatracker.ietf.org/doc/html/rfc3986) conformant.
+    )";
+    FunctionDocumentation::Syntax syntax_portRFC = "portRFC(url[, default_port])";
+    FunctionDocumentation::Arguments arguments_portRFC = {
+        {"url", "URL.", {"String"}},
+        {"default_port", "Optional. The default port number to be returned. `0` by default.", {"UInt16"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value_portRFC = {"Returns the port or the default port if there is no port in the URL or in case of a validation error.", {"UInt16"}};
+    FunctionDocumentation::Examples examples_portRFC = {
+    {
+        "Usage example",
+        R"(
+SELECT port('http://user:password@example.com:8080/'), portRFC('http://user:password@example.com:8080/');
+        )",
+        R"(
+┌─port('http:/⋯com:8080/')─┬─portRFC('htt⋯com:8080/')─┐
+│                        0 │                     8080 │
+└──────────────────────────┴──────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in_portRFC = {22, 10};
+    FunctionDocumentation::Category category_portRFC = FunctionDocumentation::Category::URL;
+    FunctionDocumentation documentation_portRFC = {description_portRFC, syntax_portRFC, arguments_portRFC, {}, returned_value_portRFC, examples_portRFC, introduced_in_portRFC, category_portRFC};
+
+    factory.registerFunction<FunctionPortRFC>(documentation_portRFC);
 }
 
 }
-

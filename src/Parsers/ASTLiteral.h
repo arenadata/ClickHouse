@@ -1,25 +1,32 @@
 #pragma once
 
 #include <Core/Field.h>
-#include <Common/FieldVisitors.h>
 #include <Parsers/ASTWithAlias.h>
-#include <Parsers/TokenIterator.h>
-#include <optional>
-
 
 namespace DB
 {
 
-/** Literal (atomic) - number, string, NULL
-  */
+/// Literal (atomic) - number, string, NULL
 class ASTLiteral : public ASTWithAlias
 {
-public:
-    Field value;
+protected:
+    struct ASTLiteralFlags
+    {
+        using ParentFlags = ASTWithAliasFlags;
+        static constexpr UInt32 RESERVED_BITS = ASTWithAliasFlags::RESERVED_BITS + 1;
 
-    /// For ConstantExpressionTemplate
-    std::optional<TokenIterator> begin;
-    std::optional<TokenIterator> end;
+        UInt32 _parent_reserved : ParentFlags::RESERVED_BITS;
+        UInt32 use_legacy_column_name_of_tuple : 1;
+        UInt32 unused : 30;
+    };
+
+public:
+    explicit ASTLiteral(Field value_)
+        : value(std::move(value_))
+    {
+    }
+
+    Field value;
 
     /*
      * The name of the column corresponding to this literal. Only used to
@@ -30,25 +37,33 @@ public:
      */
     String unique_column_name;
 
-
-public:
-    ASTLiteral(Field && value_) : value(value_) {}
-    ASTLiteral(const Field & value_) : value(value_) {}
-
-    /** Get the text that identifies this element. */
-    String getID(char delim) const override { return "Literal" + (delim + applyVisitor(FieldVisitorDump(), value)); }
-
-    ASTPtr clone() const override { return std::make_shared<ASTLiteral>(*this); }
-
-    void updateTreeHashImpl(SipHash & hash_state) const override;
-
-protected:
-    void formatImplWithoutAlias(const FormatSettings & settings, FormatState &, FormatStateStacked) const override
+    void setUseLegacyColumnNameOfTuple(bool _value)
     {
-        settings.ostr << applyVisitor(FieldVisitorToString(), value);
+        flags<ASTLiteralFlags>().use_legacy_column_name_of_tuple = _value;
     }
 
+    bool getUseLegacyColumnNameOfTuple() const
+    {
+        return flags<ASTLiteralFlags>().use_legacy_column_name_of_tuple;
+    }
+
+    /** Get the text that identifies this element. */
+    String getID(char delim) const override;
+
+    ASTPtr clone() const override;
+
+    void updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const override;
+
+protected:
+    void formatImplWithoutAlias(WriteBuffer & ostr, const FormatSettings & settings, FormatState &, FormatStateStacked) const override;
+
     void appendColumnNameImpl(WriteBuffer & ostr) const override;
+
+private:
+    /// Legacy version of 'appendColumnNameImpl'. It differs only with tuple literals.
+    /// It's only needed to continue working of queries with tuple literals
+    /// in distributed tables while rolling update.
+    void appendColumnNameImplLegacy(WriteBuffer & ostr) const;
 };
 
 }

@@ -1,851 +1,898 @@
 #include <mutex>
-#include <Common/FieldVisitors.h>
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeString.h>
-#include <DataTypes/DataTypeArray.h>
-#include <Columns/ColumnString.h>
+#include <base/bit_cast.h>
+
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnConst.h>
-#include <Columns/ColumnsNumber.h>
-#include <Common/Arena.h>
+#include <Columns/ColumnDecimal.h>
+#include <Columns/ColumnString.h>
+#include <Columns/ColumnNullable.h>
+#include <Common/SipHash.h>
+#include <Core/DecimalFunctions.h>
+#include <DataTypes/DataTypeArray.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/getLeastSupertype.h>
+#include <Functions/FunctionFactory.h>
+#include <Functions/FunctionHelpers.h>
+#include <Functions/IFunction.h>
+#include <Functions/IFunctionAdaptors.h>
+#include <Interpreters/castColumn.h>
+#include <Interpreters/convertFieldToType.h>
 #include <Common/HashTable/HashMap.h>
 #include <Common/typeid_cast.h>
-#include <common/StringRef.h>
-#include <Functions/IFunctionImpl.h>
-#include <Functions/FunctionHelpers.h>
-#include <Functions/FunctionFactory.h>
-#include <DataTypes/getLeastSupertype.h>
+#include <Common/FieldAccurateComparison.h>
 
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
     extern const int BAD_ARGUMENTS;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int ILLEGAL_COLUMN;
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
-
-/** transform(x, from_array, to_array[, default]) - convert x according to an explicitly passed match.
-  */
-
-/** transform(x, [from...], [to...], default)
-  * - converts the values according to the explicitly specified mapping.
-  *
-  * x - what to transform.
-  * from - a constant array of values for the transformation.
-  * to - a constant array of values into which values from `from` must be transformed.
-  * default - what value to use if x is not equal to any of the values in `from`.
-  * `from` and `to` - arrays of the same size.
-  *
-  * Types:
-  * transform(T, Array(T), Array(U), U) -> U
-  *
-  * transform(x, [from...], [to...])
-  * - if `default` is not specified, then for values of `x` for which there is no corresponding element in `from`, the unchanged value of `x` is returned.
-  *
-  * Types:
-  * transform(T, Array(T), Array(T)) -> T
-  *
-  * Note: the implementation is rather cumbersome.
-  */
-class FunctionTransform : public IFunction
+namespace
 {
-public:
-    static constexpr auto name = "transform";
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionTransform>(); }
-
-    String getName() const override
+    /** transform(x, [from...], [to...], default)
+      * - converts the values according to the explicitly specified mapping.
+      *
+      * x - what to transform.
+      * from - a constant array of values for the transformation.
+      * to - a constant array of values into which values from `from` must be transformed.
+      * default - what value to use if x is not equal to any of the values in `from`.
+      * `from` and `to` - arrays of the same size.
+      *
+      * Types:
+      * transform(T, Array(T), Array(U), U) -> U
+      *
+      * transform(x, [from...], [to...])
+      * - if `default` is not specified, then for values of `x` for which there is no corresponding element in `from`, the unchanged value of `x` is returned.
+      *
+      * Types:
+      * transform(T, Array(T), Array(T)) -> T
+      *
+      * Note: the implementation is rather cumbersome.
+      */
+    class FunctionTransform : public IFunction
     {
-        return name;
-    }
+    public:
+        static constexpr auto name = "transform";
+        static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionTransform>(); }
 
-    bool isVariadic() const override { return true; }
-    size_t getNumberOfArguments() const override { return 0; }
-    bool useDefaultImplementationForConstants() const override { return true; }
-    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1, 2}; }
+        String getName() const override { return name; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
-    {
-        const auto args_size = arguments.size();
-        if (args_size != 3 && args_size != 4)
-            throw Exception{"Number of arguments for function " + getName() + " doesn't match: passed " + toString(args_size) + ", should be 3 or 4",
-                ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH};
+        bool isVariadic() const override { return true; }
+        bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
+        size_t getNumberOfArguments() const override { return 0; }
+        bool useDefaultImplementationForConstants() const override { return false; }
+        bool useDefaultImplementationForNulls() const override { return false; }
+        bool useDefaultImplementationForNothing() const override { return false; }
+        ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1, 2}; }
 
-        const DataTypePtr & type_x = arguments[0];
-
-        if (!type_x->isValueRepresentedByNumber() && !isString(type_x))
-            throw Exception{"Unsupported type " + type_x->getName()
-                + " of first argument of function " + getName()
-                + ", must be numeric type or Date/DateTime or String", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
-
-        const DataTypeArray * type_arr_from = checkAndGetDataType<DataTypeArray>(arguments[1].get());
-
-        if (!type_arr_from)
-            throw Exception{"Second argument of function " + getName()
-                + ", must be array of source values to transform from.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
-
-        const auto type_arr_from_nested = type_arr_from->getNestedType();
-
-        if ((type_x->isValueRepresentedByNumber() != type_arr_from_nested->isValueRepresentedByNumber())
-            || (isString(type_x) != isString(type_arr_from_nested)))
+        DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
         {
-            throw Exception{"First argument and elements of array of second argument of function " + getName()
-                + " must have compatible types: both numeric or both strings.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
-        }
+            const auto args_size = arguments.size();
+            if (args_size != 3 && args_size != 4)
+                throw Exception(
+                    ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
+                    "Number of arguments for function {} doesn't match: "
+                    "passed {}, should be 3 or 4",
+                    getName(),
+                    args_size);
 
-        const DataTypeArray * type_arr_to = checkAndGetDataType<DataTypeArray>(arguments[2].get());
+            const DataTypePtr & type_x = arguments[0];
 
-        if (!type_arr_to)
-            throw Exception{"Third argument of function " + getName()
-                + ", must be array of destination values to transform to.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
+            const DataTypeArray * type_arr_from = checkAndGetDataType<DataTypeArray>(arguments[1].get());
 
-        const DataTypePtr & type_arr_to_nested = type_arr_to->getNestedType();
+            if (!type_arr_from)
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Second argument of function {}, must be array of source values to transform from",
+                    getName());
 
-        if (args_size == 3)
-        {
-            if ((type_x->isValueRepresentedByNumber() != type_arr_to_nested->isValueRepresentedByNumber())
-                || (isString(type_x) != isString(type_arr_to_nested)))
-                throw Exception{"Function " + getName()
-                    + " has signature: transform(T, Array(T), Array(U), U) -> U; or transform(T, Array(T), Array(T)) -> T; where T and U are types.",
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
+            const auto type_arr_from_nested = type_arr_from->getNestedType();
 
-            return type_x;
-        }
-        else
-        {
-            const DataTypePtr & type_default = arguments[3];
+            const DataTypeArray * type_arr_to = checkAndGetDataType<DataTypeArray>(arguments[2].get());
 
-            if (!type_default->isValueRepresentedByNumber() && !isString(type_default))
-                throw Exception{"Unsupported type " + type_default->getName()
-                    + " of fourth argument (default value) of function " + getName()
-                    + ", must be numeric type or Date/DateTime or String", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
+            if (!type_arr_to)
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Third argument of function {}, must be array of destination values to transform to",
+                    getName());
 
-            bool default_is_string = WhichDataType(type_default).isString();
-            bool nested_is_string = WhichDataType(type_arr_to_nested).isString();
+            const DataTypePtr & type_arr_to_nested = type_arr_to->getNestedType();
 
-            if ((type_default->isValueRepresentedByNumber() != type_arr_to_nested->isValueRepresentedByNumber())
-                || (default_is_string != nested_is_string))
-                throw Exception{"Function " + getName()
-                    + " have signature: transform(T, Array(T), Array(U), U) -> U; or transform(T, Array(T), Array(T)) -> T; where T and U are types.",
-                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
-
-            if (type_arr_to_nested->isValueRepresentedByNumber() && type_default->isValueRepresentedByNumber())
+            if (args_size == 3)
             {
-                /// We take the smallest common type for the elements of the array of values `to` and for `default`.
-                return getLeastSupertype({type_arr_to_nested, type_default});
+                if ((type_x->isValueRepresentedByNumber() != type_arr_to_nested->isValueRepresentedByNumber())
+                    || (isString(type_x) != isString(type_arr_to_nested)))
+                    throw Exception(
+                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                        "Function {} has signature: "
+                        "transform(T, Array(T), Array(U), U) -> U; "
+                        "or transform(T, Array(T), Array(T)) -> T; where T and U are types",
+                        getName());
+
+                auto ret = tryGetLeastSupertype(DataTypes{type_arr_to_nested, type_x});
+                if (!ret)
+                    throw Exception(
+                        ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                        "Function {} has signature: "
+                        "transform(T, Array(T), Array(U), U) -> U; "
+                        "or transform(T, Array(T), Array(T)) -> T; where T and U are types",
+                        getName());
+                checkAllowedType(ret);
+                return ret;
             }
 
-            /// TODO More checks.
-            return type_arr_to_nested;
-        }
-    }
-
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
-    {
-        const ColumnConst * array_from = checkAndGetColumnConst<ColumnArray>(block.getByPosition(arguments[1]).column.get());
-        const ColumnConst * array_to = checkAndGetColumnConst<ColumnArray>(block.getByPosition(arguments[2]).column.get());
-
-        if (!array_from || !array_to)
-            throw Exception{"Second and third arguments of function " + getName() + " must be constant arrays.", ErrorCodes::ILLEGAL_COLUMN};
-
-        initialize(array_from->getValue<Array>(), array_to->getValue<Array>(), block, arguments);
-
-        const auto * in = block.getByPosition(arguments.front()).column.get();
-
-        if (isColumnConst(*in))
-        {
-            executeConst(block, arguments, result, input_rows_count);
-            return;
+            auto ret = tryGetLeastSupertype(DataTypes{type_arr_to_nested, arguments[3]});
+            if (!ret)
+                throw Exception(
+                    ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT,
+                    "Function {} have signature: "
+                    "transform(T, Array(T), Array(U), U) -> U; "
+                    "or transform(T, Array(T), Array(T)) -> T; where T and U are types",
+                    getName());
+            checkAllowedType(ret);
+            return ret;
         }
 
-        const IColumn * default_column = nullptr;
-        if (arguments.size() == 4)
-            default_column = block.getByPosition(arguments[3]).column.get();
-
-        auto column_result = block.getByPosition(result).type->createColumn();
-        auto * out = column_result.get();
-
-        if (!executeNum<UInt8>(in, out, default_column)
-            && !executeNum<UInt16>(in, out, default_column)
-            && !executeNum<UInt32>(in, out, default_column)
-            && !executeNum<UInt64>(in, out, default_column)
-            && !executeNum<Int8>(in, out, default_column)
-            && !executeNum<Int16>(in, out, default_column)
-            && !executeNum<Int32>(in, out, default_column)
-            && !executeNum<Int64>(in, out, default_column)
-            && !executeNum<Float32>(in, out, default_column)
-            && !executeNum<Float64>(in, out, default_column)
-            && !executeString(in, out, default_column))
+        ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
         {
-            throw Exception{"Illegal column " + in->getName() + " of first argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN};
-        }
+            std::call_once(once, [&] { initialize(arguments, result_type); });
 
-        block.getByPosition(result).column = std::move(column_result);
-    }
+            const auto * in = arguments[0].column.get();
 
-private:
-    static void executeConst(Block & block, const ColumnNumbers & arguments, const size_t result, size_t input_rows_count)
-    {
-        /// Materialize the input column and compute the function as usual.
+            if (isColumnConst(*in))
+                return executeConst(arguments, result_type, input_rows_count);
 
-        Block tmp_block;
-        ColumnNumbers tmp_arguments;
-
-        tmp_block.insert(block.getByPosition(arguments[0]));
-        tmp_block.getByPosition(0).column = tmp_block.getByPosition(0).column->cloneResized(input_rows_count)->convertToFullColumnIfConst();
-        tmp_arguments.push_back(0);
-
-        for (size_t i = 1; i < arguments.size(); ++i)
-        {
-            tmp_block.insert(block.getByPosition(arguments[i]));
-            tmp_arguments.push_back(i);
-        }
-
-        auto impl = FunctionOverloadResolverAdaptor(std::make_unique<DefaultOverloadResolver>(std::make_shared<FunctionTransform>()))
-                    .build(tmp_block.getColumnsWithTypeAndName());
-
-        tmp_block.insert(block.getByPosition(result));
-        size_t tmp_result = arguments.size();
-
-        impl->execute(tmp_block, tmp_arguments, tmp_result, input_rows_count);
-
-        block.getByPosition(result).column = tmp_block.getByPosition(tmp_result).column;
-    }
-
-    template <typename T>
-    bool executeNum(const IColumn * in_untyped, IColumn * out_untyped, const IColumn * default_untyped)
-    {
-        if (const auto in = checkAndGetColumn<ColumnVector<T>>(in_untyped))
-        {
-            if (!default_untyped)
+            ColumnPtr default_non_const;
+            if (!cache.default_column && arguments.size() == 4)
             {
-                auto out = typeid_cast<ColumnVector<T> *>(out_untyped);
-                if (!out)
+                if (arguments[1].column.get()->size() > arguments[3].column.get()->size() || arguments[2].column.get()->size() > arguments[3].column.get()->size())
                 {
-                    throw Exception{"Illegal column " + out_untyped->getName() + " of elements of array of third argument of function " + getName()
-                        + ", must be " + in->getName(), ErrorCodes::ILLEGAL_COLUMN};
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Fourth argument of function {} must be a constant or at least as big as the second and third arguments",
+                        getName());
                 }
-
-                executeImplNumToNum<T>(in->getData(), out->getData());
+                default_non_const = castColumn(arguments[3], result_type);
+                /// The column might be const on some blocks (e.g. when all values are NULL),
+                /// but the code below uses insertFrom which requires matching column types.
+                /// Convert to full column to avoid ColumnNullable.insertFrom(ColumnConst) mismatch.
+                if (isColumnConst(*default_non_const))
+                    default_non_const = default_non_const->convertToFullColumnIfConst();
             }
-            else if (isColumnConst(*default_untyped))
+
+            ColumnPtr in_cast = arguments[0].column;
+            if (arguments.size() == 3)
+                in_cast = castColumn(arguments[0], result_type);
+
+            auto column_result = result_type->createColumn();
+            if (cache.is_empty)
             {
-                if (!executeNumToNumWithConstDefault<T, UInt8>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, UInt16>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, UInt32>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, UInt64>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, Int8>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, Int16>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, Int32>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, Int64>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, Float32>(in, out_untyped)
-                    && !executeNumToNumWithConstDefault<T, Float64>(in, out_untyped)
-                    && !executeNumToStringWithConstDefault<T>(in, out_untyped))
+                return default_non_const
+                    ? default_non_const
+                    : castColumn(arguments[0], result_type);
+            }
+            if (cache.table_num_to_idx)
+            {
+                if (!executeNum<ColumnVector<UInt8>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<UInt16>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<UInt32>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<UInt64>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<Int8>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<Int16>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<Int32>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<Int64>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<Float32>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnVector<Float64>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnDecimal<Decimal32>>(in, *column_result, default_non_const, *in_cast, input_rows_count)
+                    && !executeNum<ColumnDecimal<Decimal64>>(in, *column_result, default_non_const, *in_cast, input_rows_count))
                 {
-                    throw Exception{"Illegal column " + in->getName() + " of elements of array of second argument of function " + getName(),
-                        ErrorCodes::ILLEGAL_COLUMN};
+                    throw Exception(
+                        ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of first argument of function {}", in->getName(), getName());
                 }
+            }
+            else if (cache.table_string_to_idx)
+            {
+                if (!executeString(in, *column_result, default_non_const, *in_cast, input_rows_count))
+                    executeContiguous(in, *column_result, default_non_const, *in_cast, input_rows_count);
+            }
+            else if (cache.table_anything_to_idx)
+            {
+                executeAnything(in, *column_result, default_non_const, *in_cast, input_rows_count);
             }
             else
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "State of the function `transform` is not initialized");
+
+            return column_result;
+        }
+
+    private:
+        static ColumnPtr executeConst(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count)
+        {
+            /// Materialize the input column and compute the function as usual.
+
+            ColumnsWithTypeAndName args = arguments;
+            args[0].column = args[0].column->cloneResized(input_rows_count)->convertToFullColumnIfConst();
+
+            auto impl = std::make_shared<FunctionToOverloadResolverAdaptor>(std::make_shared<FunctionTransform>())->build(args);
+
+            return impl->execute(args, result_type, input_rows_count, /* dry_run = */ false);
+        }
+
+        void executeAnything(const IColumn * in, IColumn & column_result, const ColumnPtr default_non_const, const IColumn & in_cast, size_t input_rows_count) const
+        {
+            const auto & table = *cache.table_anything_to_idx;
+            column_result.reserve(input_rows_count);
+            for (size_t i = 0; i < input_rows_count; ++i)
             {
-                if (!executeNumToNumWithNonConstDefault<T, UInt8>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, UInt16>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, UInt32>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, UInt64>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, Int8>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, Int16>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, Int32>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, Int64>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, Float32>(in, out_untyped, default_untyped)
-                    && !executeNumToNumWithNonConstDefault<T, Float64>(in, out_untyped, default_untyped)
-                    && !executeNumToStringWithNonConstDefault<T>(in, out_untyped, default_untyped))
+                SipHash hash;
+                in->updateHashWithValue(i, hash);
+
+                const auto * it = table.find(hash.get128());
+                if (it)
+                    column_result.insertFrom(*cache.to_column, it->getMapped());
+                else if (cache.default_column)
+                    column_result.insertFrom(*cache.default_column, 0);
+                else if (default_non_const)
+                    column_result.insertFrom(*default_non_const, i);
+                else
+                    column_result.insertFrom(in_cast, i);
+            }
+        }
+
+        void executeContiguous(const IColumn * in, IColumn & column_result, const ColumnPtr default_non_const, const IColumn & in_cast, size_t input_rows_count) const
+        {
+            const auto & table = *cache.table_string_to_idx;
+            column_result.reserve(input_rows_count);
+            for (size_t i = 0; i < input_rows_count; ++i)
+            {
+                const auto * it = table.find(in->getDataAt(i));
+                if (it)
+                    column_result.insertFrom(*cache.to_column, it->getMapped());
+                else if (cache.default_column)
+                    column_result.insertFrom(*cache.default_column, 0);
+                else if (default_non_const)
+                    column_result.insertFrom(*default_non_const, i);
+                else
+                    column_result.insertFrom(in_cast, i);
+            }
+        }
+
+        template <typename T>
+        bool executeNum(const IColumn * in_untyped, IColumn & column_result, const ColumnPtr default_non_const, const IColumn & in_cast, size_t input_rows_count) const
+        {
+            const auto * const in = checkAndGetColumn<T>(in_untyped);
+            if (!in)
+                return false;
+            const auto & pod = in->getData();
+            UInt32 in_scale = 0;
+            if constexpr (std::is_same_v<ColumnDecimal<Decimal32>, T> || std::is_same_v<ColumnDecimal<Decimal64>, T>)
+                in_scale = in->getScale();
+
+            if (!executeNumToString(pod, column_result, default_non_const, input_rows_count)
+                && !executeNumToNum<ColumnVector<UInt8>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<UInt16>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<UInt32>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<UInt64>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<Int8>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<Int16>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<Int32>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<Int64>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<Float32>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnVector<Float64>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnDecimal<Decimal32>>(pod, column_result, default_non_const, in_scale, input_rows_count)
+                && !executeNumToNum<ColumnDecimal<Decimal64>>(pod, column_result, default_non_const, in_scale, input_rows_count))
+            {
+                const auto & table = *cache.table_num_to_idx;
+                column_result.reserve(input_rows_count);
+                for (size_t i = 0; i < input_rows_count; ++i)
                 {
-                    throw Exception{"Illegal column " + in->getName() + " of elements of array of second argument of function " + getName(),
-                        ErrorCodes::ILLEGAL_COLUMN};
+                    const auto * it = table.find(bit_cast<UInt64>(pod[i]));
+                    if (it)
+                        column_result.insertFrom(*cache.to_column, it->getMapped());
+                    else if (cache.default_column)
+                        column_result.insertFrom(*cache.default_column, 0);
+                    else if (default_non_const)
+                        column_result.insertFrom(*default_non_const, i);
+                    else
+                        column_result.insertFrom(in_cast, i);
                 }
             }
-
             return true;
         }
 
-        return false;
-    }
-
-    bool executeString(const IColumn * in_untyped, IColumn * out_untyped, const IColumn * default_untyped)
-    {
-        if (const auto * in = checkAndGetColumn<ColumnString>(in_untyped))
+        template <typename T>
+        bool executeNumToString(const PaddedPODArray<T> & pod, IColumn & column_result, const ColumnPtr default_non_const, size_t input_rows_count) const
         {
-            if (!default_untyped)
+            auto * out = typeid_cast<ColumnString *>(&column_result);
+            if (!out)
+                return false;
+            auto & out_offs = out->getOffsets();
+            out_offs.resize(input_rows_count);
+            auto & out_chars = out->getChars();
+
+            const auto * to_col = assert_cast<const ColumnString *>(cache.to_column.get());
+            const auto & to_chars = to_col->getChars();
+            const auto & to_offs = to_col->getOffsets();
+            const auto & table = *cache.table_num_to_idx;
+
+            if (cache.default_column)
             {
-                if (!executeStringToString(in, out_untyped))
-                    throw Exception{"Illegal column " + in->getName() + " of elements of array of second argument of function " + getName(),
-                        ErrorCodes::ILLEGAL_COLUMN};
-            }
-            else if (isColumnConst(*default_untyped))
-            {
-                if (!executeStringToNumWithConstDefault<UInt8>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<UInt16>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<UInt32>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<UInt64>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<Int8>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<Int16>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<Int32>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<Int64>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<Float32>(in, out_untyped)
-                    && !executeStringToNumWithConstDefault<Float64>(in, out_untyped)
-                    && !executeStringToStringWithConstDefault(in, out_untyped))
-                {
-                    throw Exception{"Illegal column " + in->getName() + " of elements of array of second argument of function " + getName(),
-                        ErrorCodes::ILLEGAL_COLUMN};
-                }
+                const auto * def = assert_cast<const ColumnString *>(cache.default_column.get());
+                const auto & def_chars = def->getChars();
+                const auto & def_offs = def->getOffsets();
+                const auto * def_data = def_chars.data();
+                auto def_size = def_offs[0];
+                executeNumToStringHelper(table, pod, out_chars, out_offs, to_chars, to_offs, def_data, def_size, input_rows_count);
             }
             else
             {
-                if (!executeStringToNumWithNonConstDefault<UInt8>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<UInt16>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<UInt32>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<UInt64>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<Int8>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<Int16>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<Int32>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<Int64>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<Float32>(in, out_untyped, default_untyped)
-                    && !executeStringToNumWithNonConstDefault<Float64>(in, out_untyped, default_untyped)
-                    && !executeStringToStringWithNonConstDefault(in, out_untyped, default_untyped))
-                {
-                    throw Exception{"Illegal column " + in->getName() + " of elements of array of second argument of function " + getName(),
-                        ErrorCodes::ILLEGAL_COLUMN};
-                }
+                const auto * def = assert_cast<const ColumnString *>(default_non_const.get());
+                const auto & def_chars = def->getChars();
+                const auto & def_offs = def->getOffsets();
+                executeNumToStringHelper(table, pod, out_chars, out_offs, to_chars, to_offs, def_chars, def_offs, input_rows_count);
             }
-
             return true;
         }
 
-        return false;
-    }
-
-    template <typename T, typename U>
-    bool executeNumToNumWithConstDefault(const ColumnVector<T> * in, IColumn * out_untyped)
-    {
-        auto out = typeid_cast<ColumnVector<U> *>(out_untyped);
-        if (!out)
-            return false;
-
-        executeImplNumToNumWithConstDefault<T, U>(in->getData(), out->getData(), const_default_value.get<U>());
-        return true;
-    }
-
-    template <typename T, typename U>
-    bool executeNumToNumWithNonConstDefault(const ColumnVector<T> * in, IColumn * out_untyped, const IColumn * default_untyped)
-    {
-        auto out = typeid_cast<ColumnVector<U> *>(out_untyped);
-        if (!out)
-            return false;
-
-        if (!executeNumToNumWithNonConstDefault2<T, U, UInt8>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, UInt16>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, UInt32>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, UInt64>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, Int8>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, Int16>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, Int32>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, Int64>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, Float32>(in, out, default_untyped)
-            && !executeNumToNumWithNonConstDefault2<T, U, Float64>(in, out, default_untyped))
+        template <typename Table, typename In, typename DefData, typename DefOffs>
+        void executeNumToStringHelper(
+            const Table & table,
+            const PaddedPODArray<In> & pod,
+            ColumnString::Chars & out_data,
+            ColumnString::Offsets & out_offsets,
+            const ColumnString::Chars & to_data,
+            const ColumnString::Offsets & to_offsets,
+            const DefData & def_data,
+            const DefOffs & def_offsets,
+            size_t input_rows_count) const
         {
-            throw Exception(
-                "Illegal column " + default_untyped->getName() + " of fourth argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN);
-        }
-
-        return true;
-    }
-
-    template <typename T, typename U, typename V>
-    bool executeNumToNumWithNonConstDefault2(const ColumnVector<T> * in, ColumnVector<U> * out, const IColumn * default_untyped)
-    {
-        auto col_default = checkAndGetColumn<ColumnVector<V>>(default_untyped);
-        if (!col_default)
-            return false;
-
-        executeImplNumToNumWithNonConstDefault<T, U, V>(in->getData(), out->getData(), col_default->getData());
-        return true;
-    }
-
-    template <typename T>
-    bool executeNumToStringWithConstDefault(const ColumnVector<T> * in, IColumn * out_untyped)
-    {
-        auto * out = typeid_cast<ColumnString *>(out_untyped);
-        if (!out)
-            return false;
-
-        const String & default_str = const_default_value.get<const String &>();
-        StringRef default_string_ref{default_str.data(), default_str.size() + 1};
-        executeImplNumToStringWithConstDefault<T>(in->getData(), out->getChars(), out->getOffsets(), default_string_ref);
-        return true;
-    }
-
-    template <typename T>
-    bool executeNumToStringWithNonConstDefault(const ColumnVector<T> * in, IColumn * out_untyped, const IColumn * default_untyped)
-    {
-        auto * out = typeid_cast<ColumnString *>(out_untyped);
-        if (!out)
-            return false;
-
-        const auto * default_col = checkAndGetColumn<ColumnString>(default_untyped);
-        if (!default_col)
-        {
-            throw Exception{"Illegal column " + default_untyped->getName() + " of fourth argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN};
-        }
-
-        executeImplNumToStringWithNonConstDefault<T>(
-            in->getData(),
-            out->getChars(), out->getOffsets(),
-            default_col->getChars(), default_col->getOffsets());
-
-        return true;
-    }
-
-    template <typename U>
-    bool executeStringToNumWithConstDefault(const ColumnString * in, IColumn * out_untyped)
-    {
-        auto out = typeid_cast<ColumnVector<U> *>(out_untyped);
-        if (!out)
-            return false;
-
-        executeImplStringToNumWithConstDefault<U>(in->getChars(), in->getOffsets(), out->getData(), const_default_value.get<U>());
-        return true;
-    }
-
-    template <typename U>
-    bool executeStringToNumWithNonConstDefault(const ColumnString * in, IColumn * out_untyped, const IColumn * default_untyped)
-    {
-        auto out = typeid_cast<ColumnVector<U> *>(out_untyped);
-        if (!out)
-            return false;
-
-        if (!executeStringToNumWithNonConstDefault2<U, UInt8>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, UInt16>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, UInt32>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, UInt64>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, Int8>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, Int16>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, Int32>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, Int64>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, Float32>(in, out, default_untyped)
-            && !executeStringToNumWithNonConstDefault2<U, Float64>(in, out, default_untyped))
-        {
-            throw Exception{"Illegal column " + default_untyped->getName() + " of fourth argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN};
-        }
-
-        return true;
-    }
-
-    template <typename U, typename V>
-    bool executeStringToNumWithNonConstDefault2(const ColumnString * in, ColumnVector<U> * out, const IColumn * default_untyped)
-    {
-        auto col_default = checkAndGetColumn<ColumnVector<V>>(default_untyped);
-        if (!col_default)
-            return false;
-
-        executeImplStringToNumWithNonConstDefault<U, V>(in->getChars(), in->getOffsets(), out->getData(), col_default->getData());
-        return true;
-    }
-
-    bool executeStringToString(const ColumnString * in, IColumn * out_untyped)
-    {
-        auto * out = typeid_cast<ColumnString *>(out_untyped);
-        if (!out)
-            return false;
-
-        executeImplStringToString(in->getChars(), in->getOffsets(), out->getChars(), out->getOffsets());
-        return true;
-    }
-
-    bool executeStringToStringWithConstDefault(const ColumnString * in, IColumn * out_untyped)
-    {
-        auto * out = typeid_cast<ColumnString *>(out_untyped);
-        if (!out)
-            return false;
-
-        const String & default_str = const_default_value.get<const String &>();
-        StringRef default_string_ref{default_str.data(), default_str.size() + 1};
-        executeImplStringToStringWithConstDefault(in->getChars(), in->getOffsets(), out->getChars(), out->getOffsets(), default_string_ref);
-        return true;
-    }
-
-    bool executeStringToStringWithNonConstDefault(const ColumnString * in, IColumn * out_untyped, const IColumn * default_untyped)
-    {
-        auto * out = typeid_cast<ColumnString *>(out_untyped);
-        if (!out)
-            return false;
-
-        const auto * default_col = checkAndGetColumn<ColumnString>(default_untyped);
-        if (!default_col)
-        {
-            throw Exception{"Illegal column " + default_untyped->getName() + " of fourth argument of function " + getName(),
-                ErrorCodes::ILLEGAL_COLUMN};
-        }
-
-        executeImplStringToStringWithNonConstDefault(
-            in->getChars(), in->getOffsets(),
-            out->getChars(), out->getOffsets(),
-            default_col->getChars(), default_col->getOffsets());
-
-        return true;
-    }
-
-
-    template <typename T, typename U>
-    void executeImplNumToNumWithConstDefault(const PaddedPODArray<T> & src, PaddedPODArray<U> & dst, U dst_default)
-    {
-        const auto & table = *table_num_to_num;
-        size_t size = src.size();
-        dst.resize(size);
-        for (size_t i = 0; i < size; ++i)
-        {
-            auto it = table.find(src[i]);
-            if (it)
-                memcpy(&dst[i], &it->getMapped(), sizeof(dst[i]));    /// little endian.
-            else
-                dst[i] = dst_default;
-        }
-    }
-
-    template <typename T, typename U, typename V>
-    void executeImplNumToNumWithNonConstDefault(const PaddedPODArray<T> & src, PaddedPODArray<U> & dst, const PaddedPODArray<V> & dst_default)
-    {
-        const auto & table = *table_num_to_num;
-        size_t size = src.size();
-        dst.resize(size);
-        for (size_t i = 0; i < size; ++i)
-        {
-            auto it = table.find(src[i]);
-            if (it)
-                memcpy(&dst[i], &it->getMapped(), sizeof(dst[i]));    /// little endian.
-            else
-                dst[i] = dst_default[i]; // NOLINT
-        }
-    }
-
-    template <typename T>
-    void executeImplNumToNum(const PaddedPODArray<T> & src, PaddedPODArray<T> & dst)
-    {
-        const auto & table = *table_num_to_num;
-        size_t size = src.size();
-        dst.resize(size);
-        for (size_t i = 0; i < size; ++i)
-        {
-            auto it = table.find(src[i]);
-            if (it)
-                memcpy(&dst[i], &it->getMapped(), sizeof(dst[i]));
-            else
-                dst[i] = src[i];
-        }
-    }
-
-    template <typename T>
-    void executeImplNumToStringWithConstDefault(const PaddedPODArray<T> & src,
-        ColumnString::Chars & dst_data, ColumnString::Offsets & dst_offsets, StringRef dst_default)
-    {
-        const auto & table = *table_num_to_string;
-        size_t size = src.size();
-        dst_offsets.resize(size);
-        ColumnString::Offset current_dst_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            auto it = table.find(src[i]);
-            StringRef ref = it ? it->getMapped() : dst_default;
-            dst_data.resize(current_dst_offset + ref.size);
-            memcpy(&dst_data[current_dst_offset], ref.data, ref.size);
-            current_dst_offset += ref.size;
-            dst_offsets[i] = current_dst_offset;
-        }
-    }
-
-    template <typename T>
-    void executeImplNumToStringWithNonConstDefault(const PaddedPODArray<T> & src,
-        ColumnString::Chars & dst_data, ColumnString::Offsets & dst_offsets,
-        const ColumnString::Chars & dst_default_data, const ColumnString::Offsets & dst_default_offsets)
-    {
-        const auto & table = *table_num_to_string;
-        size_t size = src.size();
-        dst_offsets.resize(size);
-        ColumnString::Offset current_dst_offset = 0;
-        ColumnString::Offset current_dst_default_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            auto it = table.find(src[i]);
-            StringRef ref;
-
-            if (it)
-                ref = it->getMapped();
-            else
+            size_t out_cur_off = 0;
+            for (size_t i = 0; i < input_rows_count; ++i)
             {
-                ref.data = reinterpret_cast<const char *>(&dst_default_data[current_dst_default_offset]);
-                ref.size = dst_default_offsets[i] - current_dst_default_offset;
+                const char8_t * to = nullptr;
+                size_t to_size = 0;
+                const auto * it = table.find(bit_cast<UInt64>(pod[i]));
+                if (it)
+                {
+                    const auto idx = it->getMapped();
+                    const auto start = to_offsets[idx - 1];
+                    to = &to_data[start];
+                    to_size = to_offsets[idx] - start;
+                }
+                else if constexpr (std::is_same_v<DefData, ColumnString::Chars>)
+                {
+                    const auto start = def_offsets[i - 1];
+                    to = &def_data[start];
+                    to_size = def_offsets[i] - start;
+                }
+                else
+                {
+                    to = def_data;
+                    to_size = def_offsets;
+                }
+                out_data.resize(out_cur_off + to_size);
+                memcpy(&out_data[out_cur_off], to, to_size);
+                out_cur_off += to_size;
+                out_offsets[i] = out_cur_off;
             }
-
-            dst_data.resize(current_dst_offset + ref.size);
-            memcpy(&dst_data[current_dst_offset], ref.data, ref.size);
-            current_dst_offset += ref.size;
-            current_dst_default_offset = dst_default_offsets[i];
-            dst_offsets[i] = current_dst_offset;
         }
-    }
 
-    template <typename U>
-    void executeImplStringToNumWithConstDefault(
-        const ColumnString::Chars & src_data, const ColumnString::Offsets & src_offsets,
-        PaddedPODArray<U> & dst, U dst_default)
-    {
-        const auto & table = *table_string_to_num;
-        size_t size = src_offsets.size();
-        dst.resize(size);
-        ColumnString::Offset current_src_offset = 0;
-        for (size_t i = 0; i < size; ++i)
+        template <typename T, typename U>
+        bool executeNumToNum(
+            const PaddedPODArray<U> & pod, IColumn & column_result, ColumnPtr default_non_const, UInt32 in_scale, size_t input_rows_count) const
         {
-            StringRef ref{&src_data[current_src_offset], src_offsets[i] - current_src_offset};
-            current_src_offset = src_offsets[i];
-            const auto * it = table.find(ref);
-            if (it)
-                memcpy(&dst[i], &it->getMapped(), sizeof(dst[i]));
-            else
-                dst[i] = dst_default;
-        }
-    }
+            auto * out = typeid_cast<T *>(&column_result);
+            if (!out)
+                return false;
+            auto & out_pod = out->getData();
+            out_pod.resize(input_rows_count);
+            UInt32 out_scale = 0;
+            if constexpr (std::is_same_v<ColumnDecimal<Decimal32>, T> || std::is_same_v<ColumnDecimal<Decimal64>, T>)
+                out_scale = out->getScale();
 
-    template <typename U, typename V>
-    void executeImplStringToNumWithNonConstDefault(
-        const ColumnString::Chars & src_data, const ColumnString::Offsets & src_offsets,
-        PaddedPODArray<U> & dst, const PaddedPODArray<V> & dst_default)
-    {
-        const auto & table = *table_string_to_num;
-        size_t size = src_offsets.size();
-        dst.resize(size);
-        ColumnString::Offset current_src_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            StringRef ref{&src_data[current_src_offset], src_offsets[i] - current_src_offset};
-            current_src_offset = src_offsets[i];
-            const auto * it = table.find(ref);
-            if (it)
-                memcpy(&dst[i], &it->getMapped(), sizeof(dst[i]));
-            else
-                dst[i] = dst_default[i]; // NOLINT
-        }
-    }
-
-    template <bool with_default>
-    void executeImplStringToStringWithOrWithoutConstDefault(
-        const ColumnString::Chars & src_data, const ColumnString::Offsets & src_offsets,
-        ColumnString::Chars & dst_data, ColumnString::Offsets & dst_offsets, StringRef dst_default)
-    {
-        const auto & table = *table_string_to_string;
-        size_t size = src_offsets.size();
-        dst_offsets.resize(size);
-        ColumnString::Offset current_src_offset = 0;
-        ColumnString::Offset current_dst_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            StringRef src_ref{&src_data[current_src_offset], src_offsets[i] - current_src_offset};
-            current_src_offset = src_offsets[i];
-
-            const auto * it = table.find(src_ref);
-
-            StringRef dst_ref = it ? it->getMapped() : (with_default ? dst_default : src_ref);
-            dst_data.resize(current_dst_offset + dst_ref.size);
-            memcpy(&dst_data[current_dst_offset], dst_ref.data, dst_ref.size);
-            current_dst_offset += dst_ref.size;
-            dst_offsets[i] = current_dst_offset;
-        }
-    }
-
-    void executeImplStringToString(
-        const ColumnString::Chars & src_data, const ColumnString::Offsets & src_offsets,
-        ColumnString::Chars & dst_data, ColumnString::Offsets & dst_offsets)
-    {
-        executeImplStringToStringWithOrWithoutConstDefault<false>(src_data, src_offsets, dst_data, dst_offsets, {});
-    }
-
-    void executeImplStringToStringWithConstDefault(
-        const ColumnString::Chars & src_data, const ColumnString::Offsets & src_offsets,
-        ColumnString::Chars & dst_data, ColumnString::Offsets & dst_offsets, StringRef dst_default)
-    {
-        executeImplStringToStringWithOrWithoutConstDefault<true>(src_data, src_offsets, dst_data, dst_offsets, dst_default);
-    }
-
-    void executeImplStringToStringWithNonConstDefault(
-        const ColumnString::Chars & src_data, const ColumnString::Offsets & src_offsets,
-        ColumnString::Chars & dst_data, ColumnString::Offsets & dst_offsets,
-        const ColumnString::Chars & dst_default_data, const ColumnString::Offsets & dst_default_offsets)
-    {
-        const auto & table = *table_string_to_string;
-        size_t size = src_offsets.size();
-        dst_offsets.resize(size);
-        ColumnString::Offset current_src_offset = 0;
-        ColumnString::Offset current_dst_offset = 0;
-        ColumnString::Offset current_dst_default_offset = 0;
-        for (size_t i = 0; i < size; ++i)
-        {
-            StringRef src_ref{&src_data[current_src_offset], src_offsets[i] - current_src_offset};
-            current_src_offset = src_offsets[i];
-
-            const auto * it = table.find(src_ref);
-            StringRef dst_ref;
-
-            if (it)
-                dst_ref = it->getMapped();
-            else
+            const auto & to_pod = assert_cast<const T *>(cache.to_column.get())->getData();
+            const auto & table = *cache.table_num_to_idx;
+            if (cache.default_column)
             {
-                dst_ref.data = reinterpret_cast<const char *>(&dst_default_data[current_dst_default_offset]);
-                dst_ref.size = dst_default_offsets[i] - current_dst_default_offset;
+                const auto const_def = assert_cast<const T *>(cache.default_column.get())->getData()[0];
+                executeNumToNumHelper(table, pod, out_pod, to_pod, const_def, input_rows_count, out_scale, out_scale);
             }
-
-            dst_data.resize(current_dst_offset + dst_ref.size);
-            memcpy(&dst_data[current_dst_offset], dst_ref.data, dst_ref.size);
-            current_dst_offset += dst_ref.size;
-            current_dst_default_offset = dst_default_offsets[i];
-            dst_offsets[i] = current_dst_offset;
-        }
-    }
-
-
-    /// Different versions of the hash tables to implement the mapping.
-
-    using NumToNum = HashMap<UInt64, UInt64, HashCRC32<UInt64>>;
-    using NumToString = HashMap <UInt64, StringRef, HashCRC32<UInt64>>;     /// Everywhere StringRef's with trailing zero.
-    using StringToNum = HashMap<StringRef, UInt64, StringRefHash>;
-    using StringToString = HashMap<StringRef, StringRef, StringRefHash>;
-
-    std::unique_ptr<NumToNum> table_num_to_num;
-    std::unique_ptr<NumToString> table_num_to_string;
-    std::unique_ptr<StringToNum> table_string_to_num;
-    std::unique_ptr<StringToString> table_string_to_string;
-
-    Arena string_pool;
-
-    Field const_default_value;    /// Null, if not specified.
-
-    std::atomic<bool> initialized {false};
-    std::mutex mutex;
-
-    /// Can be called from different threads. It works only on the first call.
-    void initialize(const Array & from, const Array & to, Block & block, const ColumnNumbers & arguments)
-    {
-        if (initialized)
-            return;
-
-        const size_t size = from.size();
-        if (0 == size)
-            throw Exception{"Empty arrays are illegal in function " + getName(), ErrorCodes::BAD_ARGUMENTS};
-
-        std::lock_guard lock(mutex);
-
-        if (initialized)
-            return;
-
-        if (size != to.size())
-            throw Exception{"Second and third arguments of function " + getName() + " must be arrays of same size", ErrorCodes::BAD_ARGUMENTS};
-
-        Array converted_to;
-        const Array * used_to = &to;
-
-        /// Whether the default value is set.
-
-        if (arguments.size() == 4)
-        {
-            const IColumn * default_col = block.getByPosition(arguments[3]).column.get();
-            const ColumnConst * const_default_col = typeid_cast<const ColumnConst *>(default_col);
-
-            if (const_default_col)
-                const_default_value = (*const_default_col)[0];
-
-            /// Do we need to convert the elements `to` and `default_value` to the smallest common type that is Float64?
-            bool default_col_is_float =
-                   checkColumn<ColumnFloat32>(default_col)
-                || checkColumn<ColumnFloat64>(default_col)
-                || checkColumnConst<ColumnFloat32>(default_col)
-                || checkColumnConst<ColumnFloat64>(default_col);
-
-            bool to_is_float = to[0].getType() == Field::Types::Float64;
-
-            if (default_col_is_float && !to_is_float)
+            else if (default_non_const)
             {
-                converted_to.resize(size);
+                const auto & nconst_def = assert_cast<const T *>(default_non_const.get())->getData();
+                executeNumToNumHelper(table, pod, out_pod, to_pod, nconst_def, input_rows_count, out_scale, out_scale);
+            }
+            else
+                executeNumToNumHelper(table, pod, out_pod, to_pod, pod, input_rows_count, out_scale, in_scale);
+            return true;
+        }
+
+        template <typename Table, typename In, typename Out, typename Def>
+        void executeNumToNumHelper(
+            const Table & table,
+            const PaddedPODArray<In> & pod,
+            PaddedPODArray<Out> & out_pod,
+            const PaddedPODArray<Out> & to_pod,
+            const Def & def,
+            size_t input_rows_count,
+            UInt32 out_scale,
+            UInt32 def_scale) const
+        {
+            for (size_t i = 0; i < input_rows_count; ++i)
+            {
+                const auto * it = table.find(bit_cast<UInt64>(pod[i]));
+                if (it)
+                {
+                    const auto idx = it->getMapped();
+                    out_pod[i] = to_pod[idx];
+                }
+                else if constexpr (std::is_same_v<Def, Out>)
+                    out_pod[i] = def;
+                else if constexpr (is_decimal<Out> && !is_decimal<typename Def::value_type>)
+                    out_pod[i] = DecimalUtils::decimalFromComponents<Out>(static_cast<typename Out::NativeType>(def[i]), 0, out_scale);
+                else if constexpr (is_decimal<Out>)
+                {
+                    if (def_scale == out_scale)
+                        out_pod[i] = static_cast<typename Out::NativeType>(def[i]);
+                    else
+                    {
+                        const auto whole = static_cast<typename Out::NativeType>(DecimalUtils::getWholePart(def[i], def_scale));
+                        const auto fract = static_cast<typename Out::NativeType>(DecimalUtils::getFractionalPart(def[i], def_scale));
+                        out_pod[i] = DecimalUtils::decimalFromComponents<Out>(whole, fract, out_scale);
+                    }
+                }
+                else
+                    out_pod[i] = static_cast<Out>(def[i]); // NOLINT(bugprone-signed-char-misuse,cert-str34-c)
+            }
+        }
+
+        bool executeString(const IColumn * in_untyped, IColumn & column_result, const ColumnPtr default_non_const, const IColumn & in_cast, size_t input_rows_count) const
+        {
+            const auto * const in = checkAndGetColumn<ColumnString>(in_untyped);
+            if (!in)
+                return false;
+            const auto & data = in->getChars();
+            const auto & offsets = in->getOffsets();
+
+            if (!executeStringToString(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<UInt8>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<UInt16>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<UInt32>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<UInt64>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<Int8>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<Int16>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<Int32>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<Int64>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<Float32>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnVector<Float64>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnDecimal<Decimal32>>(data, offsets, column_result, default_non_const, input_rows_count)
+                && !executeStringToNum<ColumnDecimal<Decimal64>>(data, offsets, column_result, default_non_const, input_rows_count))
+            {
+                const size_t size = offsets.size();
+                const auto & table = *cache.table_string_to_idx;
+                ColumnString::Offset current_offset = 0;
                 for (size_t i = 0; i < size; ++i)
-                    converted_to[i] = applyVisitor(FieldVisitorConvertToNumber<Float64>(), to[i]);
-                used_to = &converted_to;
+                {
+                    const std::string_view ref{reinterpret_cast<const char *>(&data[current_offset]), offsets[i] - current_offset};
+                    current_offset = offsets[i];
+                    const auto * it = table.find(ref);
+                    if (it)
+                        column_result.insertFrom(*cache.to_column, it->getMapped());
+                    else if (cache.default_column)
+                        column_result.insertFrom(*cache.default_column, 0);
+                    else if (default_non_const)
+                        column_result.insertFrom(*default_non_const, i);
+                    else
+                        column_result.insertFrom(in_cast, i);
+                }
             }
-            else if (!default_col_is_float && to_is_float)
+            return true;
+        }
+
+        bool executeStringToString(
+            const ColumnString::Chars & data,
+            const ColumnString::Offsets & offsets,
+            IColumn & column_result,
+            const ColumnPtr default_non_const,
+            size_t input_rows_count) const
+        {
+            auto * out = typeid_cast<ColumnString *>(&column_result);
+            if (!out)
+                return false;
+            auto & out_offs = out->getOffsets();
+            out_offs.resize(input_rows_count);
+            auto & out_chars = out->getChars();
+
+            const auto * to_col = assert_cast<const ColumnString *>(cache.to_column.get());
+            const auto & to_chars = to_col->getChars();
+            const auto & to_offs = to_col->getOffsets();
+
+            const auto & table = *cache.table_string_to_idx;
+            if (cache.default_column)
             {
-                if (const_default_col)
-                    const_default_value = applyVisitor(FieldVisitorConvertToNumber<Float64>(), const_default_value);
+                const auto * def = assert_cast<const ColumnString *>(cache.default_column.get());
+                const auto & def_chars = def->getChars();
+                const auto & def_offs = def->getOffsets();
+                const auto * def_data = def_chars.data();
+                auto def_size = def_offs[0];
+                executeStringToStringHelper(table, data, offsets, out_chars, out_offs, to_chars, to_offs, def_data, def_size, input_rows_count);
+            }
+            else if (default_non_const)
+            {
+                const auto * def = assert_cast<const ColumnString *>(default_non_const.get());
+                const auto & def_chars = def->getChars();
+                const auto & def_offs = def->getOffsets();
+                executeStringToStringHelper(table, data, offsets, out_chars, out_offs, to_chars, to_offs, def_chars, def_offs, input_rows_count);
+            }
+            else
+            {
+                executeStringToStringHelper(table, data, offsets, out_chars, out_offs, to_chars, to_offs, data, offsets, input_rows_count);
+            }
+            return true;
+        }
+
+        template <typename Table, typename DefData, typename DefOffs>
+        void executeStringToStringHelper(
+            const Table & table,
+            const ColumnString::Chars & data,
+            const ColumnString::Offsets & offsets,
+            ColumnString::Chars & out_data,
+            ColumnString::Offsets & out_offsets,
+            const ColumnString::Chars & to_data,
+            const ColumnString::Offsets & to_offsets,
+            const DefData & def_data,
+            const DefOffs & def_offsets,
+            size_t input_rows_count) const
+        {
+            ColumnString::Offset current_offset = 0;
+            size_t out_cur_off = 0;
+            for (size_t i = 0; i < input_rows_count; ++i)
+            {
+                const char8_t * to = nullptr;
+                size_t to_size = 0;
+                const std::string_view ref{reinterpret_cast<const char *>(&data[current_offset]), offsets[i] - current_offset};
+                current_offset = offsets[i];
+                const auto * it = table.find(ref);
+                if (it)
+                {
+                    const auto idx = it->getMapped();
+                    const auto start = to_offsets[idx - 1];
+                    to = &to_data[start];
+                    to_size = to_offsets[idx] - start;
+                }
+                else if constexpr (std::is_same_v<DefData, ColumnString::Chars>)
+                {
+                    const auto start = def_offsets[i - 1];
+                    to = &def_data[start];
+                    to_size = def_offsets[i] - start;
+                }
+                else
+                {
+                    to = def_data;
+                    to_size = def_offsets;
+                }
+                out_data.resize(out_cur_off + to_size);
+                memcpy(&out_data[out_cur_off], to, to_size);
+                out_cur_off += to_size;
+                out_offsets[i] = out_cur_off;
             }
         }
 
-        /// Note: Doesn't check the duplicates in the `from` array.
+        template <typename T>
+        bool executeStringToNum(
+            const ColumnString::Chars & data,
+            const ColumnString::Offsets & offsets,
+            IColumn & column_result,
+            const ColumnPtr default_non_const,
+            size_t input_rows_count) const
+        {
+            auto * out = typeid_cast<T *>(&column_result);
+            if (!out)
+                return false;
+            auto & out_pod = out->getData();
+            out_pod.resize(input_rows_count);
 
-        if (from[0].getType() != Field::Types::String && to[0].getType() != Field::Types::String)
-        {
-            table_num_to_num = std::make_unique<NumToNum>();
-            auto & table = *table_num_to_num;
-            for (size_t i = 0; i < size; ++i)
+            const auto & to_pod = assert_cast<const T *>(cache.to_column.get())->getData();
+            const auto & table = *cache.table_string_to_idx;
+            if (cache.default_column)
             {
-                // Field may be of Float type, but for the purpose of bitwise
-                // equality we can treat them as UInt64, hence the reinterpret().
-                table[from[i].reinterpret<UInt64>()] = (*used_to)[i].reinterpret<UInt64>();
+                const auto const_def = assert_cast<const T *>(cache.default_column.get())->getData()[0];
+                executeStringToNumHelper(table, data, offsets, out_pod, to_pod, const_def, input_rows_count);
             }
-        }
-        else if (from[0].getType() != Field::Types::String && to[0].getType() == Field::Types::String)
-        {
-            table_num_to_string = std::make_unique<NumToString>();
-            auto & table = *table_num_to_string;
-            for (size_t i = 0; i < size; ++i)
+            else
             {
-                const String & str_to = to[i].get<const String &>();
-                StringRef ref{string_pool.insert(str_to.data(), str_to.size() + 1), str_to.size() + 1};
-                table[from[i].reinterpret<UInt64>()] = ref;
+                const auto & nconst_def = assert_cast<const T *>(default_non_const.get())->getData();
+                executeStringToNumHelper(table, data, offsets, out_pod, to_pod, nconst_def, input_rows_count);
             }
-        }
-        else if (from[0].getType() == Field::Types::String && to[0].getType() != Field::Types::String)
-        {
-            table_string_to_num = std::make_unique<StringToNum>();
-            auto & table = *table_string_to_num;
-            for (size_t i = 0; i < size; ++i)
-            {
-                const String & str_from = from[i].get<const String &>();
-                StringRef ref{string_pool.insert(str_from.data(), str_from.size() + 1), str_from.size() + 1};
-                table[ref] = (*used_to)[i].reinterpret<UInt64>();
-            }
-        }
-        else if (from[0].getType() == Field::Types::String && to[0].getType() == Field::Types::String)
-        {
-            table_string_to_string = std::make_unique<StringToString>();
-            auto & table = *table_string_to_string;
-            for (size_t i = 0; i < size; ++i)
-            {
-                const String & str_from = from[i].get<const String &>();
-                const String & str_to = to[i].get<const String &>();
-                StringRef ref_from{string_pool.insert(str_from.data(), str_from.size() + 1), str_from.size() + 1};
-                StringRef ref_to{string_pool.insert(str_to.data(), str_to.size() + 1), str_to.size() + 1};
-                table[ref_from] = ref_to;
-            }
+            return true;
         }
 
-        initialized = true;
-    }
-};
+        template <typename Table, typename Out, typename Def>
+        void executeStringToNumHelper(
+            const Table & table,
+            const ColumnString::Chars & data,
+            const ColumnString::Offsets & offsets,
+            PaddedPODArray<Out> & out_pod,
+            const PaddedPODArray<Out> & to_pod,
+            const Def & def,
+            size_t input_rows_count) const
+        {
+            ColumnString::Offset current_offset = 0;
+            for (size_t i = 0; i < input_rows_count; ++i)
+            {
+                const std::string_view ref{reinterpret_cast<const char *>(&data[current_offset]), offsets[i] - current_offset};
+                current_offset = offsets[i];
+                const auto * it = table.find(ref);
+                if (it)
+                {
+                    const auto idx = it->getMapped();
+                    out_pod[i] = to_pod[idx];
+                }
+                else if constexpr (std::is_same_v<Def, Out>)
+                    out_pod[i] = def;
+                else if constexpr (is_decimal<Out>)
+                    out_pod[i] = static_cast<typename Out::NativeType>(def[i]);
+                else
+                    out_pod[i] = static_cast<Out>(def[i]); // NOLINT(bugprone-signed-char-misuse,cert-str34-c)
+            }
+        }
 
-void registerFunctionTransform(FunctionFactory & factory)
+        /// Different versions of the hash tables to implement the mapping.
+
+        struct Cache
+        {
+            using NumToIdx = HashMap<UInt64, size_t, HashCRC32<UInt64>>;
+            using StringToIdx = HashMap<std::string_view, size_t, StringViewHash>;
+            using AnythingToIdx = HashMap<UInt128, size_t>;
+
+            std::unique_ptr<NumToIdx> table_num_to_idx;
+            std::unique_ptr<StringToIdx> table_string_to_idx;
+            std::unique_ptr<AnythingToIdx> table_anything_to_idx;
+
+            ColumnPtr from_column;
+            ColumnPtr to_column;
+            ColumnPtr default_column;
+
+            bool is_empty = false;
+        };
+
+        mutable std::once_flag once;
+        mutable Cache cache;
+
+
+        static void checkAllowedType(const DataTypePtr & type)
+        {
+            if (type->isNullable())
+                checkAllowedTypeHelper(static_cast<const DataTypeNullable *>(type.get())->getNestedType());
+            else
+                checkAllowedTypeHelper(type);
+        }
+
+        static void checkAllowedTypeHelper(const DataTypePtr & type)
+        {
+            if (isStringOrFixedString(type))
+                return;
+
+            if (type->haveMaximumSizeOfValue())
+            {
+                auto data_type_size = type->getMaximumSizeOfValueInMemory();
+                if (data_type_size <= sizeof(UInt64))
+                    return;
+            }
+
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Unexpected type {} in function 'transform'", type->getName());
+        }
+
+        /// Can be called from different threads. It works only on the first call.
+        void initialize(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type) const
+        {
+            const DataTypePtr & from_type = arguments[0].type;
+
+            if (from_type->onlyNull())
+            {
+                cache.is_empty = true;
+                return;
+            }
+
+            const ColumnArray * array_from = checkAndGetColumnConstData<ColumnArray>(arguments[1].column.get());
+            const ColumnArray * array_to = checkAndGetColumnConstData<ColumnArray>(arguments[2].column.get());
+
+            if (!array_from || !array_to)
+                throw Exception(
+                    ErrorCodes::ILLEGAL_COLUMN, "Second and third arguments of function {} must be constant arrays", getName());
+
+            const ColumnPtr & from_column_uncast = array_from->getDataPtr();
+
+            cache.from_column = castColumn(
+                {
+                    from_column_uncast,
+                    typeid_cast<const DataTypeArray &>(*arguments[1].type).getNestedType(),
+                    arguments[1].name
+                },
+                from_type);
+
+            cache.to_column = castColumn(
+                {
+                    array_to->getDataPtr(),
+                    typeid_cast<const DataTypeArray &>(*arguments[2].type).getNestedType(),
+                    arguments[2].name
+                },
+                result_type);
+
+            const size_t size = cache.from_column->size();
+            if (0 == size)
+            {
+                cache.is_empty = true;
+                return;
+            }
+
+            if (cache.to_column->size() != size)
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS, "Second and third arguments of function {} must be arrays of same size", getName());
+
+            /// Whether the default value is set.
+            if (arguments.size() == 4)
+            {
+                const IColumn * default_col = arguments[3].column.get();
+                if (default_col && isColumnConst(*default_col))
+                {
+                    auto default_column = result_type->createColumn();
+                    if (!default_col->onlyNull())
+                    {
+                        Field f = convertFieldToType((*default_col)[0], *result_type);
+                        default_column->insert(f);
+                    }
+                    else
+                        default_column->insertDefault();
+                    cache.default_column = std::move(default_column);
+                }
+            }
+
+            WhichDataType which(from_type);
+
+            /// Field may be of Float type, but for the purpose of bitwise equality we can treat them as UInt64
+            if (isNativeNumber(which) || which.isDecimal32() || which.isDecimal64() || which.isEnum())
+            {
+                cache.table_num_to_idx = std::make_unique<Cache::NumToIdx>();
+                auto & table = *cache.table_num_to_idx;
+                for (size_t i = 0; i < size; ++i)
+                {
+                    if (which.isEnum() /// The correctness of strings are already checked by casting them to the Enum type.
+                        || accurateEquals((*cache.from_column)[i], (*from_column_uncast)[i]))
+                    {
+                        UInt64 key = 0;
+                        auto * dst = reinterpret_cast<char *>(&key);
+                        const auto ref = cache.from_column->getDataAt(i);
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunreachable-code"
+                        if constexpr (std::endian::native == std::endian::big)
+                            dst += sizeof(key) - ref.size();
+#pragma clang diagnostic pop
+
+                        memcpy(dst, ref.data(), ref.size());
+                        table.insertIfNotPresent(key, i);
+                    }
+                }
+            }
+            else if (from_type->isValueUnambiguouslyRepresentedInContiguousMemoryRegion())
+            {
+                cache.table_string_to_idx = std::make_unique<Cache::StringToIdx>();
+                auto & table = *cache.table_string_to_idx;
+                for (size_t i = 0; i < size; ++i)
+                {
+                    if (accurateEquals((*cache.from_column)[i], (*from_column_uncast)[i]))
+                    {
+                        std::string_view ref = cache.from_column->getDataAt(i);
+                        table.insertIfNotPresent(ref, i);
+                    }
+                }
+            }
+            else
+            {
+                cache.table_anything_to_idx = std::make_unique<Cache::AnythingToIdx>();
+                auto & table = *cache.table_anything_to_idx;
+                for (size_t i = 0; i < size; ++i)
+                {
+                    if (accurateEquals((*cache.from_column)[i], (*from_column_uncast)[i]))
+                    {
+                        SipHash hash;
+                        cache.from_column->updateHashWithValue(i, hash);
+                        table.insertIfNotPresent(hash.get128(), i);
+                    }
+                }
+            }
+        }
+    };
+
+}
+
+REGISTER_FUNCTION(Transform)
 {
-    factory.registerFunction<FunctionTransform>();
+    FunctionDocumentation::Description description = R"(
+Transforms a value according to the explicitly defined mapping of some elements to other elements.
+
+There are two variations of this function:
+- `transform(x, array_from, array_to, default)` - transforms `x` using mapping arrays with a default value for unmatched elements
+- `transform(x, array_from, array_to)` - same transformation but returns the original `x` if no match is found
+
+The function searches for `x` in `array_from` and returns the corresponding element from `array_to` at the same index.
+If `x` is not found in `array_from`, it returns either the `default` value (4-parameter version) or the original `x` (3-parameter version).
+If multiple matching elements exist in `array_from`, it returns the element corresponding to the first match.
+
+Requirements:
+- `array_from` and `array_to` must have the same number of elements
+- For 4-parameter version: `transform(T, Array(T), Array(U), U) -> U` where `T` and `U` can be different compatible types
+- For 3-parameter version: `transform(T, Array(T), Array(T)) -> T` where all types must be the same
+)";
+
+    FunctionDocumentation::Syntax syntax = "transform(x, array_from, array_to[, default])";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "Value to transform.", {"(U)Int*", "Decimal", "Float*", "String", "Date", "DateTime"}},
+        {"array_from", "Constant array of values to search for matches.", {"Array((U)Int*)", "Array(Decimal)", "Array(Float*)", "Array(String)", "Array(Date)", "Array(DateTime)"}},
+        {"array_to", "Constant array of values to return for corresponding matches in `array_from`.", {"Array((U)Int*)", "Array(Decimal)", "Array(Float*)", "Array(String)", "Array(Date)", "Array(DateTime)"}},
+        {"default", "Optional. Value to return if `x` is not found in `array_from`. If omitted, returns x unchanged.", {"(U)Int*", "Decimal", "Float*", "String", "Date", "DateTime"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {
+        "Returns the corresponding value from `array_to` if x matches an element in `array_from`, otherwise returns default (if provided) or x (if default not provided).",
+        {"Any"}
+    };
+    FunctionDocumentation::Examples examples = {
+    {
+        "transform(T, Array(T), Array(U), U) -> U",
+        R"(
+SELECT
+transform(SearchEngineID, [2, 3], ['Yandex', 'Google'], 'Other') AS title,
+count() AS c
+FROM test.hits
+WHERE SearchEngineID != 0
+GROUP BY title
+ORDER BY c DESC
+        )",
+        R"(
+┌─title─────┬──────c─┐
+│ Yandex    │ 498635 │
+│ Google    │ 229872 │
+│ Other     │ 104472 │
+└───────────┴────────┘
+        )"
+    },
+    {
+        "transform(T, Array(T), Array(T)) -> T",
+        R"(
+SELECT
+transform(domain(Referer), ['yandex.ru', 'google.ru', 'vkontakte.ru'], ['www.yandex', 'example.com', 'vk.com']) AS s, count() AS c
+FROM test.hits
+GROUP BY domain(Referer)
+ORDER BY count() DESC
+LIMIT 10
+        )",
+        R"(
+┌─s──────────────┬───────c─┐
+│                │ 2906259 │
+│ www.yandex     │  867767 │
+│ ███████.ru     │  313599 │
+│ mail.yandex.ru │  107147 │
+│ ██████.ru      │  100355 │
+│ █████████.ru   │   65040 │
+│ news.yandex.ru │   64515 │
+│ ██████.net     │   59141 │
+│ example.com    │   57316 │
+└────────────────┴─────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionTransform>(documentation);
 }
 
 }

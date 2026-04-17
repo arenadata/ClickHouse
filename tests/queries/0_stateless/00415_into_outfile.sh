@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
 function perform()
 {
@@ -19,6 +20,10 @@ function perform()
 }
 
 perform "select" "SELECT 1, 2, 3 INTO OUTFILE '${CLICKHOUSE_TMP}/test_into_outfile_select.out'"
+
+perform "select_with_append" "SELECT 1, 2, 3 INTO OUTFILE '${CLICKHOUSE_TMP}/test_into_outfile_select_with_append.out' APPEND"
+
+perform "select_with_truncate" "SELECT 1, 2, 3 INTO OUTFILE '${CLICKHOUSE_TMP}/test_into_outfile_select_with_truncate.out' TRUNCATE"
 
 perform "union_all" "SELECT 1, 2 UNION ALL SELECT 3, 4 INTO OUTFILE '${CLICKHOUSE_TMP}/test_into_outfile_union_all.out' FORMAT TSV" | sort --numeric-sort
 

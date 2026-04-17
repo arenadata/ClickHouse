@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ext/shared_ptr_helper.h>
 #include <Storages/System/StorageSystemPartsBase.h>
 
 
@@ -13,16 +12,16 @@ class Context;
 /** Implements system table 'parts_columns' which allows to get information about
  * columns in data parts for tables of MergeTree family.
  */
-class StorageSystemPartsColumns final
-        : public ext::shared_ptr_helper<StorageSystemPartsColumns>, public StorageSystemPartsBase
+class StorageSystemPartsColumns final : public StorageSystemPartsBase
 {
-    friend struct ext::shared_ptr_helper<StorageSystemPartsColumns>;
 public:
+    explicit StorageSystemPartsColumns(const StorageID & table_id_);
+
     std::string getName() const override { return "SystemPartsColumns"; }
 
 protected:
-    StorageSystemPartsColumns(const std::string & name_);
-    void processNextStorage(MutableColumns & columns, const StoragesInfo & info, bool has_state_column) override;
+    void processNextStorage(
+        ContextPtr context, MutableColumns & columns, std::vector<UInt8> & columns_mask, const StoragesInfo & info, bool has_state_column) override;
 };
 
 }

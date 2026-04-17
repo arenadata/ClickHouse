@@ -4,11 +4,12 @@
 namespace DB
 {
 
-enum class TTLMode
+enum class TTLMode : uint8_t
 {
     DELETE,
     MOVE,
-    GROUP_BY
+    GROUP_BY,
+    RECOMPRESS,
 };
 
 }

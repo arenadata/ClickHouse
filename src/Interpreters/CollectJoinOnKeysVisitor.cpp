@@ -1,4 +1,4 @@
-#include <Parsers/queryToString.h>
+#include <Parsers/ASTIdentifier.h>
 
 #include <Interpreters/CollectJoinOnKeysVisitor.h>
 #include <Interpreters/IdentifierSemantic.h>
@@ -11,85 +11,155 @@ namespace ErrorCodes
 {
     extern const int INVALID_JOIN_ON_EXPRESSION;
     extern const int AMBIGUOUS_COLUMN_NAME;
+    extern const int SYNTAX_ERROR;
     extern const int LOGICAL_ERROR;
 }
 
-void CollectJoinOnKeysMatcher::Data::addJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast,
-                                                 const std::pair<size_t, size_t> & table_no)
+namespace
+{
+
+bool isDeterminedIdentifier(JoinIdentifierPos pos)
+{
+    return pos == JoinIdentifierPos::Left || pos == JoinIdentifierPos::Right;
+}
+
+bool isLeftIdentifier(JoinIdentifierPos pos)
+{
+    /// Unknown identifiers  considered as left, we will try to process it on later stages
+    /// Usually such identifiers came from `ARRAY JOIN ... AS ...`
+    return pos == JoinIdentifierPos::Left || pos == JoinIdentifierPos::Unknown;
+}
+
+bool isRightIdentifier(JoinIdentifierPos pos)
+{
+    return pos == JoinIdentifierPos::Right;
+}
+
+}
+
+void CollectJoinOnKeysMatcher::Data::addJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast, JoinIdentifierPosPair table_pos, bool null_safe_comparison)
 {
     ASTPtr left = left_ast->clone();
     ASTPtr right = right_ast->clone();
 
-    if (table_no.first == 1 || table_no.second == 2)
-        analyzed_join.addOnKeys(left, right);
-    else if (table_no.first == 2 || table_no.second == 1)
-        analyzed_join.addOnKeys(right, left);
+    if (isLeftIdentifier(table_pos.first) && isRightIdentifier(table_pos.second))
+        analyzed_join.addOnKeys(left, right, null_safe_comparison);
+    else if (isRightIdentifier(table_pos.first) && isLeftIdentifier(table_pos.second))
+        analyzed_join.addOnKeys(right, left, null_safe_comparison);
     else
-        throw Exception("Cannot detect left and right JOIN keys. JOIN ON section is ambiguous.",
-                        ErrorCodes::AMBIGUOUS_COLUMN_NAME);
-    has_some = true;
+        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Cannot detect left and right JOIN keys. JOIN ON section is ambiguous.");
 }
 
 void CollectJoinOnKeysMatcher::Data::addAsofJoinKeys(const ASTPtr & left_ast, const ASTPtr & right_ast,
-                                                     const std::pair<size_t, size_t> & table_no, const ASOF::Inequality & inequality)
+                                                     JoinIdentifierPosPair table_pos, const ASOFJoinInequality & inequality)
 {
-    if (table_no.first == 1 || table_no.second == 2)
+    if (isLeftIdentifier(table_pos.first) && isRightIdentifier(table_pos.second))
     {
         asof_left_key = left_ast->clone();
         asof_right_key = right_ast->clone();
         analyzed_join.setAsofInequality(inequality);
     }
-    else if (table_no.first == 2 || table_no.second == 1)
+    else if (isRightIdentifier(table_pos.first) && isLeftIdentifier(table_pos.second))
     {
         asof_left_key = right_ast->clone();
         asof_right_key = left_ast->clone();
-        analyzed_join.setAsofInequality(ASOF::reverseInequality(inequality));
+        analyzed_join.setAsofInequality(reverseASOFJoinInequality(inequality));
+    }
+    else
+    {
+        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION,
+                        "Expressions {} and {} are from the same table but from different arguments of equal function in ASOF JOIN",
+                        left_ast->formatForErrorMessage(), right_ast->formatForErrorMessage());
     }
 }
 
 void CollectJoinOnKeysMatcher::Data::asofToJoinKeys()
 {
     if (!asof_left_key || !asof_right_key)
-        throw Exception("No inequality in ASOF JOIN ON section.", ErrorCodes::INVALID_JOIN_ON_EXPRESSION);
-    addJoinKeys(asof_left_key, asof_right_key, {1, 2});
+        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "No inequality in ASOF JOIN ON section.");
+    addJoinKeys(asof_left_key, asof_right_key, {JoinIdentifierPos::Left, JoinIdentifierPos::Right}, false);
 }
 
+void CollectJoinOnKeysMatcher::visit(const ASTIdentifier & ident, const ASTPtr & ast, CollectJoinOnKeysMatcher::Data & data)
+{
+    if (auto expr_from_table = getTableForIdentifiers(ast, false, data); isDeterminedIdentifier(expr_from_table))
+        data.analyzed_join.addJoinCondition(ast, isLeftIdentifier(expr_from_table));
+    else
+        throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Unexpected identifier '{}' in JOIN ON section", ident.name());
+}
 
 void CollectJoinOnKeysMatcher::visit(const ASTFunction & func, const ASTPtr & ast, Data & data)
 {
     if (func.name == "and")
         return; /// go into children
 
-    if (func.name == "equals")
+    ASOFJoinInequality inequality = getASOFJoinInequality(func.name);
+
+    if (func.name == "equals" || func.name == "isNotDistinctFrom" || inequality != ASOFJoinInequality::None)
+    {
+        if (func.arguments->children.size() != 2)
+            throw Exception(ErrorCodes::SYNTAX_ERROR, "Function {} takes two arguments, got '{}' instead",
+                            func.name, func.formatForErrorMessage());
+    }
+
+    if (func.name == "equals" || func.name == "isNotDistinctFrom")
     {
         ASTPtr left = func.arguments->children.at(0);
         ASTPtr right = func.arguments->children.at(1);
-        auto table_numbers = getTableNumbers(ast, left, right, data);
-        data.addJoinKeys(left, right, table_numbers);
+        auto table_numbers = getTableNumbers(left, right, data);
+
+        if (table_numbers.first == table_numbers.second)
+        {
+            if (!isDeterminedIdentifier(table_numbers.first))
+                throw Exception(ErrorCodes::AMBIGUOUS_COLUMN_NAME,
+                    "Ambiguous columns in expression '{}' in JOIN ON section", ast->formatForErrorMessage());
+            data.analyzed_join.addJoinCondition(ast, isLeftIdentifier(table_numbers.first));
+            return;
+        }
+
+        if ((isLeftIdentifier(table_numbers.first) && isRightIdentifier(table_numbers.second)) ||
+            (isRightIdentifier(table_numbers.first) && isLeftIdentifier(table_numbers.second)))
+        {
+            bool null_safe_comparison = func.name == "isNotDistinctFrom";
+            data.addJoinKeys(left, right, table_numbers, null_safe_comparison);
+            return;
+        }
+    }
+
+
+    if (auto expr_from_table = getTableForIdentifiers(ast, false, data); isDeterminedIdentifier(expr_from_table))
+    {
+        data.analyzed_join.addJoinCondition(ast, isLeftIdentifier(expr_from_table));
         return;
     }
 
-    ASOF::Inequality inequality = ASOF::getInequality(func.name);
-
-    if (data.is_asof && (inequality != ASOF::Inequality::None))
+    if (data.is_asof && inequality != ASOFJoinInequality::None)
     {
         if (data.asof_left_key || data.asof_right_key)
-            throwSyntaxException("ASOF JOIN expects exactly one inequality in ON section, unexpected " + queryToString(ast) + ".");
+            throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "ASOF JOIN expects exactly one inequality in ON section. "
+                            "Unexpected '{}'", ast->formatForErrorMessage());
 
         ASTPtr left = func.arguments->children.at(0);
         ASTPtr right = func.arguments->children.at(1);
-        auto table_numbers = getTableNumbers(ast, left, right, data);
+        auto table_numbers = getTableNumbers(left, right, data);
 
         data.addAsofJoinKeys(left, right, table_numbers, inequality);
         return;
     }
 
-    throwSyntaxException("Expected equals expression, got " + queryToString(ast) + ".");
+    throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Unsupported JOIN ON conditions. Unexpected '{}'",
+                    ast->formatForErrorMessage());
 }
 
 void CollectJoinOnKeysMatcher::getIdentifiers(const ASTPtr & ast, std::vector<const ASTIdentifier *> & out)
 {
-    if (const auto * ident = ast->as<ASTIdentifier>())
+    if (const auto * func = ast->as<ASTFunction>())
+    {
+        if (func->name == "arrayJoin")
+            throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Not allowed function in JOIN ON. Unexpected '{}'",
+                            ast->formatForErrorMessage());
+    }
+    else if (const auto * ident = ast->as<ASTIdentifier>())
     {
         if (IdentifierSemantic::getColumnName(*ident))
             out.push_back(ident);
@@ -100,37 +170,21 @@ void CollectJoinOnKeysMatcher::getIdentifiers(const ASTPtr & ast, std::vector<co
         getIdentifiers(child, out);
 }
 
-std::pair<size_t, size_t> CollectJoinOnKeysMatcher::getTableNumbers(const ASTPtr & expr, const ASTPtr & left_ast, const ASTPtr & right_ast,
-                                                                    Data & data)
+JoinIdentifierPosPair CollectJoinOnKeysMatcher::getTableNumbers(const ASTPtr & left_ast, const ASTPtr & right_ast, Data & data)
 {
-    std::vector<const ASTIdentifier *> left_identifiers;
-    std::vector<const ASTIdentifier *> right_identifiers;
-
-    getIdentifiers(left_ast, left_identifiers);
-    getIdentifiers(right_ast, right_identifiers);
-
-    size_t left_idents_table = getTableForIdentifiers(left_identifiers, data);
-    size_t right_idents_table = getTableForIdentifiers(right_identifiers, data);
-
-    if (left_idents_table && left_idents_table == right_idents_table)
-    {
-        auto left_name = queryToString(*left_identifiers[0]);
-        auto right_name = queryToString(*right_identifiers[0]);
-
-        throwSyntaxException("In expression " + queryToString(expr) + " columns " + left_name + " and " + right_name
-                                + " are from the same table but from different arguments of equal function.");
-    }
+    auto left_idents_table = getTableForIdentifiers(left_ast, true, data);
+    auto right_idents_table = getTableForIdentifiers(right_ast, true, data);
 
     return std::make_pair(left_idents_table, right_idents_table);
 }
 
 const ASTIdentifier * CollectJoinOnKeysMatcher::unrollAliases(const ASTIdentifier * identifier, const Aliases & aliases)
 {
-    if (identifier->compound())
+    if (identifier->supposedToBeCompound())
         return identifier;
 
     UInt32 max_attempts = 100;
-    for (auto it = aliases.find(identifier->name); it != aliases.end();)
+    for (auto it = aliases.find(identifier->name()); it != aliases.end();)
     {
         const ASTIdentifier * parent = identifier;
         identifier = it->second->as<ASTIdentifier>();
@@ -138,22 +192,27 @@ const ASTIdentifier * CollectJoinOnKeysMatcher::unrollAliases(const ASTIdentifie
             break; /// not a column alias
         if (identifier == parent)
             break; /// alias to itself with the same name: 'a as a'
-        if (identifier->compound())
+        if (identifier->supposedToBeCompound())
             break; /// not an alias. Break to prevent cycle through short names: 'a as b, t1.b as a'
 
-        it = aliases.find(identifier->name);
+        it = aliases.find(identifier->name());
         if (!max_attempts--)
-            throw Exception("Cannot unroll aliases for '" + identifier->name + "'", ErrorCodes::LOGICAL_ERROR);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot unroll aliases for '{}'", identifier->name());
     }
 
     return identifier;
 }
 
-/// @returns 1 if identifiers belongs to left table, 2 for right table and 0 if unknown. Throws on table mix.
+/// @returns Left or right table identifiers belongs to.
 /// Place detected identifier into identifiers[0] if any.
-size_t CollectJoinOnKeysMatcher::getTableForIdentifiers(std::vector<const ASTIdentifier *> & identifiers, const Data & data)
+JoinIdentifierPos CollectJoinOnKeysMatcher::getTableForIdentifiers(const ASTPtr & ast, bool throw_on_table_mix, const Data & data)
 {
-    size_t table_number = 0;
+    std::vector<const ASTIdentifier *> identifiers;
+    getIdentifiers(ast, identifiers);
+    if (identifiers.empty())
+        return JoinIdentifierPos::NotColumn;
+
+    JoinIdentifierPos table_number = JoinIdentifierPos::Unknown;
 
     for (auto & ident : identifiers)
     {
@@ -163,12 +222,22 @@ size_t CollectJoinOnKeysMatcher::getTableForIdentifiers(std::vector<const ASTIde
 
         /// Column name could be cropped to a short form in TranslateQualifiedNamesVisitor.
         /// In this case it saves membership in IdentifierSemantic.
-        auto opt = IdentifierSemantic::getMembership(*identifier);
-        size_t membership = opt ? (*opt + 1) : 0;
-
-        if (!membership)
+        JoinIdentifierPos membership = JoinIdentifierPos::Unknown;
+        if (auto opt = IdentifierSemantic::getMembership(*identifier); opt.has_value())
         {
-            const String & name = identifier->name;
+            if (*opt == 0)
+                membership = JoinIdentifierPos::Left;
+            else if (*opt == 1)
+                membership = JoinIdentifierPos::Right;
+            else
+                throw DB::Exception(ErrorCodes::AMBIGUOUS_COLUMN_NAME,
+                                    "Position of identifier {} can't be deteminated.",
+                                    identifier->name());
+        }
+
+        if (membership == JoinIdentifierPos::Unknown)
+        {
+            const String & name = identifier->name();
             bool in_left_table = data.left_table.hasColumn(name);
             bool in_right_table = data.right_table.hasColumn(name);
 
@@ -183,38 +252,32 @@ size_t CollectJoinOnKeysMatcher::getTableForIdentifiers(std::vector<const ASTIde
                     in_left_table = !in_right_table;
                 }
                 else
-                    throw Exception("Column '" + name + "' is ambiguous", ErrorCodes::AMBIGUOUS_COLUMN_NAME);
+                    throw Exception(ErrorCodes::AMBIGUOUS_COLUMN_NAME, "Column '{}' is ambiguous", name);
             }
 
             if (in_left_table)
-                membership = 1;
+                membership = JoinIdentifierPos::Left;
             if (in_right_table)
-                membership = 2;
+                membership = JoinIdentifierPos::Right;
         }
 
-        if (membership && table_number == 0)
+        if (membership != JoinIdentifierPos::Unknown && table_number == JoinIdentifierPos::Unknown)
         {
             table_number = membership;
             std::swap(ident, identifiers[0]); /// move first detected identifier to the first position
         }
 
-        if (membership && membership != table_number)
+        if (membership != JoinIdentifierPos::Unknown && membership != table_number)
         {
-            throw Exception("Invalid columns in JOIN ON section. Columns "
-                        + identifiers[0]->getAliasOrColumnName() + " and " + ident->getAliasOrColumnName()
-                        + " are from different tables.", ErrorCodes::INVALID_JOIN_ON_EXPRESSION);
+            if (throw_on_table_mix)
+                throw Exception(ErrorCodes::INVALID_JOIN_ON_EXPRESSION, "Invalid columns in JOIN ON section. "
+                            "Columns {} and {} are from different tables.",
+                            identifiers[0]->getAliasOrColumnName(), ident->getAliasOrColumnName());
+            return JoinIdentifierPos::Unknown;
         }
     }
 
     return table_number;
-}
-
-[[noreturn]] void CollectJoinOnKeysMatcher::throwSyntaxException(const String & msg)
-{
-    throw Exception("Invalid expression for JOIN ON. " + msg +
-        " Supported syntax: JOIN ON Expr([table.]column, ...) = Expr([table.]column, ...) "
-        "[AND Expr([table.]column, ...) = Expr([table.]column, ...) ...]",
-        ErrorCodes::INVALID_JOIN_ON_EXPRESSION);
 }
 
 }

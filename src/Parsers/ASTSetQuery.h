@@ -1,41 +1,43 @@
 #pragma once
 
-#include <Common/FieldVisitors.h>
-#include <Common/SettingsChanges.h>
+#include <Core/Names.h>
 #include <Parsers/IAST.h>
-
+#include <Common/SettingsChanges.h>
 
 namespace DB
 {
 
+constexpr char QUERY_PARAMETER_NAME_PREFIX[] = "param_";
 
 /** SET query
   */
 class ASTSetQuery : public IAST
 {
 public:
-    bool is_standalone = true; /// If false, this AST is a part of another query, such as SELECT.
+    /// If false, this AST is a part of another query, such as SELECT.
+    bool is_standalone = true;
 
     SettingsChanges changes;
+    /// settings that will be reset to default value
+    std::vector<String> default_settings;
+    NameToNameVector query_parameters;
 
     /** Get the text that identifies this element. */
     String getID(char) const override { return "Set"; }
 
-    ASTPtr clone() const override { return std::make_shared<ASTSetQuery>(*this); }
+    ASTPtr clone() const override { return make_intrusive<ASTSetQuery>(*this); }
 
-    void formatImpl(const FormatSettings & settings, FormatState &, FormatStateStacked) const override
-    {
-        if (is_standalone)
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << "SET " << (settings.hilite ? hilite_none : "");
+    void updateTreeHashImpl(SipHash & hash_state, bool ignore_aliases) const override;
 
-        for (auto it = changes.begin(); it != changes.end(); ++it)
-        {
-            if (it != changes.begin())
-                settings.ostr << ", ";
+    bool hasSecretParts() const override;
 
-            settings.ostr << it->name << " = " << applyVisitor(FieldVisitorToString(), it->value);
-        }
-    }
+    QueryKind getQueryKind() const override { return QueryKind::Set; }
+
+    void appendColumnName(WriteBuffer & ostr) const override;
+    void appendColumnNameWithoutAlias(WriteBuffer & ostr) const override { appendColumnName(ostr); }
+
+protected:
+    void formatImpl(WriteBuffer & ostr, const FormatSettings & format, FormatState &, FormatStateStacked) const override;
 };
 
 }

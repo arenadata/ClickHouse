@@ -8,7 +8,7 @@ namespace DB
 struct IReadableWriteBuffer
 {
     /// At the first time returns getReadBufferImpl(). Next calls return nullptr.
-    inline std::shared_ptr<ReadBuffer> tryGetReadBuffer()
+    std::unique_ptr<ReadBuffer> tryGetReadBuffer()
     {
         if (!can_reread)
             return nullptr;
@@ -17,14 +17,14 @@ struct IReadableWriteBuffer
         return getReadBufferImpl();
     }
 
-    virtual ~IReadableWriteBuffer() {}
+    virtual ~IReadableWriteBuffer() = default;
 
 protected:
 
     /// Creates read buffer from current write buffer.
     /// Returned buffer points to the first byte of original buffer.
     /// Original stream becomes invalid.
-    virtual std::shared_ptr<ReadBuffer> getReadBufferImpl() = 0;
+    virtual std::unique_ptr<ReadBuffer> getReadBufferImpl() = 0;
 
     bool can_reread = true;
 };

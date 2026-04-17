@@ -1,16 +1,12 @@
-#include "ThreadProfileEvents.h"
+#include <Common/ThreadProfileEvents.h>
 
-#if defined(__linux__)
+#if defined(OS_LINUX)
 
-#include "TaskStatsInfoGetter.h"
-#include "ProcfsMetricsProvider.h"
-#include "hasLinuxCapability.h"
+#include <Common/ProcfsMetricsProvider.h>
+#include <Common/hasLinuxCapability.h>
 
-#include <filesystem>
 #include <fstream>
 #include <optional>
-#include <sstream>
-#include <unordered_set>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -21,15 +17,69 @@
 #include <sys/types.h>
 #include <dirent.h>
 
+#include <boost/algorithm/string/split.hpp>
+
+#include <base/errnoToString.h>
+#include <Common/logger_useful.h>
+#include <Core/AccurateComparison.h>
+
+namespace ProfileEvents
+{
+    extern const Event OSIOWaitMicroseconds;
+    extern const Event OSCPUWaitMicroseconds;
+    extern const Event OSCPUVirtualTimeMicroseconds;
+    extern const Event OSReadChars;
+    extern const Event OSWriteChars;
+    extern const Event OSReadBytes;
+    extern const Event OSWriteBytes;
+
+    extern const Event PerfCPUCycles;
+    extern const Event PerfInstructions;
+    extern const Event PerfCacheReferences;
+    extern const Event PerfCacheMisses;
+    extern const Event PerfBranchInstructions;
+    extern const Event PerfBranchMisses;
+    extern const Event PerfBusCycles;
+    extern const Event PerfStalledCyclesFrontend;
+    extern const Event PerfStalledCyclesBackend;
+    extern const Event PerfRefCPUCycles;
+
+    extern const Event PerfCPUClock;
+    extern const Event PerfTaskClock;
+    extern const Event PerfContextSwitches;
+    extern const Event PerfCPUMigrations;
+    extern const Event PerfAlignmentFaults;
+    extern const Event PerfEmulationFaults;
+    extern const Event PerfMinEnabledTime;
+    extern const Event PerfMinEnabledRunningTime;
+    extern const Event PerfDataTLBReferences;
+    extern const Event PerfDataTLBMisses;
+    extern const Event PerfInstructionTLBReferences;
+    extern const Event PerfInstructionTLBMisses;
+    extern const Event PerfLocalMemoryReferences;
+    extern const Event PerfLocalMemoryMisses;
+}
+
 namespace DB
 {
+
+const char * TasksStatsCounters::metricsProviderString(MetricsProvider provider)
+{
+    switch (provider)
+    {
+        case MetricsProvider::None:
+            return "none";
+        case MetricsProvider::Procfs:
+            return "procfs";
+    }
+}
 
 bool TasksStatsCounters::checkIfAvailable()
 {
     return findBestAvailableProvider() != MetricsProvider::None;
 }
 
-std::unique_ptr<TasksStatsCounters> TasksStatsCounters::create(const UInt64 tid)
+std::unique_ptr<TasksStatsCounters> TasksStatsCounters::create(UInt64 tid)
 {
     std::unique_ptr<TasksStatsCounters> instance;
     if (checkIfAvailable())
@@ -43,11 +93,7 @@ TasksStatsCounters::MetricsProvider TasksStatsCounters::findBestAvailableProvide
     static std::optional<MetricsProvider> provider =
         []() -> MetricsProvider
         {
-            if (TaskStatsInfoGetter::checkPermissions())
-            {
-                return MetricsProvider::Netlink;
-            }
-            else if (ProcfsMetricsProvider::isAvailable())
+            if (ProcfsMetricsProvider::isAvailable())
             {
                 return MetricsProvider::Procfs;
             }
@@ -62,18 +108,14 @@ TasksStatsCounters::TasksStatsCounters(const UInt64 tid, const MetricsProvider p
 {
     switch (provider)
     {
-    case MetricsProvider::Netlink:
-        stats_getter = [metrics_provider = std::make_shared<TaskStatsInfoGetter>(), tid]()
-                {
-                    ::taskstats result;
-                    metrics_provider->getStat(result, tid);
-                    return result;
-                };
-        break;
     case MetricsProvider::Procfs:
-        stats_getter = [metrics_provider = std::make_shared<ProcfsMetricsProvider>(tid)]()
+        /// Note that in the case of Procfs we are always reading the same files over an over
+        /// In order to avoid opening and closing them for every task we use a ThreadLocal variable so we'll keep
+        /// the files under this thread until the thread exits
+        stats_getter = [tid]()
                 {
-                    ::taskstats result;
+                    thread_local auto metrics_provider = std::make_shared<ProcfsMetricsProvider>(tid);
+                    ::taskstats result{};
                     metrics_provider->getTaskStats(result);
                     return result;
                 };
@@ -122,7 +164,7 @@ void TasksStatsCounters::incrementProfileEvents(const ::taskstats & prev, const 
 
 #endif
 
-#if defined(__linux__) && !defined(ARCADIA_BUILD)
+#if defined(OS_LINUX)
 
 namespace DB
 {
@@ -162,7 +204,7 @@ thread_local PerfEventsCounters current_thread_counters;
 
 // descriptions' source: http://man7.org/linux/man-pages/man2/perf_event_open.2.html
 static const PerfEventInfo raw_events_info[] = {
-    HARDWARE_EVENT(PERF_COUNT_HW_CPU_CYCLES, PerfCpuCycles),
+    HARDWARE_EVENT(PERF_COUNT_HW_CPU_CYCLES, PerfCPUCycles),
     HARDWARE_EVENT(PERF_COUNT_HW_INSTRUCTIONS, PerfInstructions),
     HARDWARE_EVENT(PERF_COUNT_HW_CACHE_REFERENCES, PerfCacheReferences),
     HARDWARE_EVENT(PERF_COUNT_HW_CACHE_MISSES, PerfCacheMisses),
@@ -171,13 +213,13 @@ static const PerfEventInfo raw_events_info[] = {
     HARDWARE_EVENT(PERF_COUNT_HW_BUS_CYCLES, PerfBusCycles),
     HARDWARE_EVENT(PERF_COUNT_HW_STALLED_CYCLES_FRONTEND, PerfStalledCyclesFrontend),
     HARDWARE_EVENT(PERF_COUNT_HW_STALLED_CYCLES_BACKEND, PerfStalledCyclesBackend),
-    HARDWARE_EVENT(PERF_COUNT_HW_REF_CPU_CYCLES, PerfRefCpuCycles),
+    HARDWARE_EVENT(PERF_COUNT_HW_REF_CPU_CYCLES, PerfRefCPUCycles),
 
     // `cpu-clock` is a bit broken according to this: https://stackoverflow.com/a/56967896
-    SOFTWARE_EVENT(PERF_COUNT_SW_CPU_CLOCK, PerfCpuClock),
+    SOFTWARE_EVENT(PERF_COUNT_SW_CPU_CLOCK, PerfCPUClock),
     SOFTWARE_EVENT(PERF_COUNT_SW_TASK_CLOCK, PerfTaskClock),
     SOFTWARE_EVENT(PERF_COUNT_SW_CONTEXT_SWITCHES, PerfContextSwitches),
-    SOFTWARE_EVENT(PERF_COUNT_SW_CPU_MIGRATIONS, PerfCpuMigrations),
+    SOFTWARE_EVENT(PERF_COUNT_SW_CPU_MIGRATIONS, PerfCPUMigrations),
     SOFTWARE_EVENT(PERF_COUNT_SW_ALIGNMENT_FAULTS, PerfAlignmentFaults),
     SOFTWARE_EVENT(PERF_COUNT_SW_EMULATION_FAULTS, PerfEmulationFaults),
 
@@ -205,9 +247,9 @@ static_assert(sizeof(raw_events_info) / sizeof(raw_events_info[0]) == NUMBER_OF_
 #undef CACHE_EVENT
 
 // A map of event name -> event index, to parse event list in settings.
-static std::unordered_map<std::string, size_t> populateEventMap()
+static std::unordered_map<std::string_view, size_t> populateEventMap()
 {
-    std::unordered_map<std::string, size_t> name_to_index;
+    std::unordered_map<std::string_view, size_t> name_to_index;
     name_to_index.reserve(NUMBER_OF_RAW_EVENTS);
 
     for (size_t i = 0; i < NUMBER_OF_RAW_EVENTS; ++i)
@@ -244,9 +286,9 @@ static void enablePerfEvent(int event_fd)
 {
     if (ioctl(event_fd, PERF_EVENT_IOC_ENABLE, 0))
     {
-        LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+        LOG_WARNING(getLogger("PerfEvents"),
             "Can't enable perf event with file descriptor {}: '{}' ({})",
-            event_fd, strerror(errno), errno);
+            event_fd, errnoToString(), errno);
     }
 }
 
@@ -254,9 +296,9 @@ static void disablePerfEvent(int event_fd)
 {
     if (ioctl(event_fd, PERF_EVENT_IOC_DISABLE, 0))
     {
-        LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+        LOG_WARNING(getLogger("PerfEvents"),
             "Can't disable perf event with file descriptor {}: '{}' ({})",
-            event_fd, strerror(errno), errno);
+            event_fd, errnoToString(), errno);
     }
 }
 
@@ -264,9 +306,9 @@ static void releasePerfEvent(int event_fd)
 {
     if (close(event_fd))
     {
-        LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+        LOG_WARNING(getLogger("PerfEvents"),
             "Can't close perf event file descriptor {}: {} ({})",
-            event_fd, strerror(errno), errno);
+            event_fd, errnoToString(), errno);
     }
 }
 
@@ -277,14 +319,14 @@ static bool validatePerfEventDescriptor(int & fd)
 
     if (errno == EBADF)
     {
-        LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+        LOG_WARNING(getLogger("PerfEvents"),
             "Event descriptor {} was closed from the outside; reopening", fd);
     }
     else
     {
-        LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+        LOG_WARNING(getLogger("PerfEvents"),
             "Error while checking availability of event descriptor {}: {} ({})",
-            fd, strerror(errno), errno);
+            fd, errnoToString(), errno);
 
         disablePerfEvent(fd);
         releasePerfEvent(fd);
@@ -360,7 +402,7 @@ bool PerfEventsCounters::processThreadLocalChanges(const std::string & needed_ev
     bool has_cap_sys_admin = hasLinuxCapability(CAP_SYS_ADMIN);
     if (perf_event_paranoid >= 3 && !has_cap_sys_admin)
     {
-        LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+        LOG_WARNING(getLogger("PerfEvents"),
             "Not enough permissions to record perf events: "
             "perf_event_paranoid = {} and CAP_SYS_ADMIN = 0",
             perf_event_paranoid);
@@ -388,18 +430,17 @@ bool PerfEventsCounters::processThreadLocalChanges(const std::string & needed_ev
             // ENOENT means that the event is not supported. Don't log it, because
             // this is called for each thread and would be too verbose. Log other
             // error codes because they might signify an error.
-            LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+            LOG_WARNING(getLogger("PerfEvents"),
                 "Failed to open perf event {} (event_type={}, event_config={}): "
                 "'{}' ({})", event_info.settings_name, event_info.event_type,
-                event_info.event_config, strerror(errno), errno);
+                event_info.event_config, errnoToString(), errno);
         }
     }
 
     return true;
 }
 
-// Parse comma-separated list of event names. Empty means all available
-// events.
+// Parse comma-separated list of event names. Empty means all available events.
 std::vector<size_t> PerfEventsCounters::eventIndicesFromString(const std::string & events_list)
 {
     std::vector<size_t> result;
@@ -414,12 +455,12 @@ std::vector<size_t> PerfEventsCounters::eventIndicesFromString(const std::string
         return result;
     }
 
-    std::istringstream iss(events_list);
-    std::string event_name;
-    while (std::getline(iss, event_name, ','))
+    std::vector<std::string> event_names;
+    boost::split(event_names, events_list, [](char c) { return c == ','; });
+
+    for (auto & event_name : event_names)
     {
-        // Allow spaces at the beginning of the token, so that you can write
-        // 'a, b'.
+        // Allow spaces at the beginning of the token, so that you can write 'a, b'.
         event_name.erase(0, event_name.find_first_not_of(' '));
 
         auto entry = event_name_to_index.find(event_name);
@@ -429,7 +470,7 @@ std::vector<size_t> PerfEventsCounters::eventIndicesFromString(const std::string
         }
         else
         {
-            LOG_ERROR(&Poco::Logger::get("PerfEvents"),
+            LOG_ERROR(getLogger("PerfEvents"),
                 "Unknown perf event name '{}' specified in settings", event_name);
         }
     }
@@ -472,13 +513,13 @@ void PerfEventsCounters::finalizeProfileEvents(ProfileEvents::Counters & profile
             continue;
 
         constexpr ssize_t bytes_to_read = sizeof(current_values[0]);
-        const int bytes_read = read(fd, &current_values[i], bytes_to_read);
+        const ssize_t bytes_read = read(fd, &current_values[i], bytes_to_read);
 
         if (bytes_read != bytes_to_read)
         {
-            LOG_WARNING(&Poco::Logger::get("PerfEvents"),
+            LOG_WARNING(getLogger("PerfEvents"),
                 "Can't read event value from file descriptor {}: '{}' ({})",
-                fd, strerror(errno), errno);
+                fd, errnoToString(), errno);
             current_values[i] = {};
         }
     }
@@ -504,8 +545,12 @@ void PerfEventsCounters::finalizeProfileEvents(ProfileEvents::Counters & profile
         // deltas from old values.
         const auto enabled = current_value.time_enabled - previous_value.time_enabled;
         const auto running = current_value.time_running - previous_value.time_running;
-        const UInt64 delta = (current_value.value - previous_value.value)
-            * enabled / std::max(1.f, float(running));
+        const auto scaled_value = static_cast<Float64>(current_value.value - previous_value.value) * static_cast<Float64>(enabled) / std::max(1., static_cast<Float64>(running));
+
+        UInt64 delta = 0;
+
+        // If no overflow happens, then the value is converted to UInt64
+        accurate::convertNumeric<Float64, UInt64, false>(scaled_value, delta);
 
         if (min_enabled_time > enabled)
         {
@@ -566,7 +611,7 @@ void PerfDescriptorsHolder::releaseResources()
 namespace DB
 {
 
-// Not on Linux or in Arcadia: the functionality is disabled.
+// the functionality is disabled when we are not running on Linux.
 PerfEventsCounters current_thread_counters;
 
 }

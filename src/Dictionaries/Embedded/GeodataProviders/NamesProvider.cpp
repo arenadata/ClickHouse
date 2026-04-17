@@ -1,8 +1,13 @@
-#include "NamesProvider.h"
+#include <Dictionaries/Embedded/GeodataProviders/NamesProvider.h>
 
 #include <IO/ReadBufferFromFile.h>
-#include "NamesFormatReader.h"
+#include <Dictionaries/Embedded/GeodataProviders/NamesFormatReader.h>
+#include <filesystem>
 
+namespace fs = std::filesystem;
+
+namespace DB
+{
 
 bool LanguageRegionsNamesDataSource::isModified() const
 {
@@ -11,13 +16,13 @@ bool LanguageRegionsNamesDataSource::isModified() const
 
 size_t LanguageRegionsNamesDataSource::estimateTotalSize() const
 {
-    return Poco::File(path).getSize();
+    return fs::file_size(path);
 }
 
 ILanguageRegionsNamesReaderPtr LanguageRegionsNamesDataSource::createReader()
 {
     updates_tracker.fixCurrentVersion();
-    auto file_reader = std::make_shared<DB::ReadBufferFromFile>(path);
+    auto file_reader = std::make_shared<ReadBufferFromFile>(path);
     return std::make_unique<LanguageRegionsNamesFormatReader>(std::move(file_reader));
 }
 
@@ -39,13 +44,14 @@ RegionsNamesDataProvider::RegionsNamesDataProvider(const std::string & directory
 ILanguageRegionsNamesDataSourcePtr RegionsNamesDataProvider::getLanguageRegionsNamesSource(const std::string & language) const
 {
     const auto data_file = getDataFilePath(language);
-    if (Poco::File(data_file).exists())
+    if (fs::exists(data_file))
         return std::make_unique<LanguageRegionsNamesDataSource>(data_file, language);
-    else
-        return {};
+    return {};
 }
 
 std::string RegionsNamesDataProvider::getDataFilePath(const std::string & language) const
 {
     return directory + "/regions_names_" + language + ".txt";
+}
+
 }

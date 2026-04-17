@@ -2,248 +2,202 @@
 
 #include <atomic>
 #include <variant>
-#include <vector>
-#include <Columns/ColumnDecimal.h>
-#include <Columns/ColumnString.h>
-#include <Common/Arena.h>
-#include <Core/Block.h>
-#include <ext/range.h>
-#include <ext/size.h>
-#include "DictionaryStructure.h"
-#include "IDictionary.h"
-#include "IDictionarySource.h"
+#include <Common/VectorWithMemoryTracking.h>
+#include <optional>
 
+#include <Common/HashTable/HashSet.h>
+#include <Common/Arena.h>
+#include <QueryPipeline/Pipe.h>
+#include <DataTypes/IDataType.h>
+#include <Core/Block_fwd.h>
+
+#include <Dictionaries/DictionaryStructure.h>
+#include <Dictionaries/IDictionary.h>
+#include <Dictionaries/IDictionarySource.h>
+#include <Dictionaries/DictionaryHelpers.h>
 
 namespace DB
 {
-using BlockPtr = std::shared_ptr<Block>;
 
 class FlatDictionary final : public IDictionary
 {
 public:
+    struct Configuration
+    {
+        size_t initial_array_size;
+        size_t max_array_size;
+        bool require_nonempty;
+        DictionaryLifetime dict_lifetime;
+        bool use_async_executor = false;
+    };
+
     FlatDictionary(
-        const std::string & database_,
-        const std::string & name_,
+        const StorageID & dict_id_,
         const DictionaryStructure & dict_struct_,
         DictionarySourcePtr source_ptr_,
-        const DictionaryLifetime dict_lifetime_,
-        bool require_nonempty_,
-        BlockPtr saved_block_ = nullptr);
-
-    const std::string & getDatabase() const override { return database; }
-    const std::string & getName() const override { return name; }
-    const std::string & getFullName() const override { return full_name; }
+        Configuration configuration_,
+        BlockPtr update_field_loaded_block_ = nullptr);
 
     std::string getTypeName() const override { return "Flat"; }
 
     size_t getBytesAllocated() const override { return bytes_allocated; }
 
-    size_t getQueryCount() const override { return query_count.load(std::memory_order_relaxed); }
+    size_t getQueryCount() const override { return query_count.load(); }
+
+    double getFoundRate() const override
+    {
+        size_t queries = query_count.load();
+        if (!queries)
+            return 0;
+        return std::min(1.0, static_cast<double>(found_count.load()) / static_cast<double>(queries));
+    }
 
     double getHitRate() const override { return 1.0; }
 
     size_t getElementCount() const override { return element_count; }
 
-    double getLoadFactor() const override { return static_cast<double>(element_count) / bucket_count; }
+    double getLoadFactor() const override { return static_cast<double>(element_count) / static_cast<double>(bucket_count); }
 
-    std::shared_ptr<const IExternalLoadable> clone() const override
+    std::shared_ptr<IExternalLoadable> clone() const override
     {
-        return std::make_shared<FlatDictionary>(database, name, dict_struct, source_ptr->clone(), dict_lifetime, require_nonempty, saved_block);
+        return std::make_shared<FlatDictionary>(getDictionaryID(), dict_struct, source_ptr->clone(), configuration, update_field_loaded_block);
     }
 
-    const IDictionarySource * getSource() const override { return source_ptr.get(); }
+    DictionarySourcePtr getSource() const override { return source_ptr; }
 
-    const DictionaryLifetime & getLifetime() const override { return dict_lifetime; }
+    const DictionaryLifetime & getLifetime() const override { return configuration.dict_lifetime; }
 
     const DictionaryStructure & getStructure() const override { return dict_struct; }
 
     bool isInjective(const std::string & attribute_name) const override
     {
-        return dict_struct.attributes[&getAttribute(attribute_name) - attributes.data()].injective;
+        return dict_struct.getAttribute(attribute_name).injective;
     }
 
-    bool hasHierarchy() const override { return hierarchical_attribute; }
+    DictionaryKeyType getKeyType() const override { return DictionaryKeyType::Simple; }
 
-    void toParent(const PaddedPODArray<Key> & ids, PaddedPODArray<Key> & out) const override;
+    ColumnPtr getColumn(
+        const std::string & attribute_name,
+        const DataTypePtr & attribute_type,
+        const Columns & key_columns,
+        const DataTypes & key_types,
+        DefaultOrFilter default_or_filter) const override;
 
-    void isInVectorVector(
-        const PaddedPODArray<Key> & child_ids, const PaddedPODArray<Key> & ancestor_ids, PaddedPODArray<UInt8> & out) const override;
-    void isInVectorConstant(const PaddedPODArray<Key> & child_ids, const Key ancestor_id, PaddedPODArray<UInt8> & out) const override;
-    void isInConstantVector(const Key child_id, const PaddedPODArray<Key> & ancestor_ids, PaddedPODArray<UInt8> & out) const override;
+    ColumnUInt8::Ptr hasKeys(const Columns & key_columns, const DataTypes & key_types) const override;
 
-    template <typename T>
-    using ResultArrayType = std::conditional_t<IsDecimalNumber<T>, DecimalPaddedPODArray<T>, PaddedPODArray<T>>;
+    bool hasHierarchy() const override { return dict_struct.hierarchical_attribute_index.has_value(); }
 
-#define DECLARE(TYPE) \
-    void get##TYPE(const std::string & attribute_name, const PaddedPODArray<Key> & ids, ResultArrayType<TYPE> & out) const;
-    DECLARE(UInt8)
-    DECLARE(UInt16)
-    DECLARE(UInt32)
-    DECLARE(UInt64)
-    DECLARE(UInt128)
-    DECLARE(Int8)
-    DECLARE(Int16)
-    DECLARE(Int32)
-    DECLARE(Int64)
-    DECLARE(Float32)
-    DECLARE(Float64)
-    DECLARE(Decimal32)
-    DECLARE(Decimal64)
-    DECLARE(Decimal128)
-#undef DECLARE
+    ColumnPtr getHierarchy(ColumnPtr key_column, const DataTypePtr & key_type) const override;
 
-    void getString(const std::string & attribute_name, const PaddedPODArray<Key> & ids, ColumnString * out) const;
+    ColumnUInt8::Ptr isInHierarchy(
+        ColumnPtr key_column,
+        ColumnPtr in_key_column,
+        const DataTypePtr & key_type) const override;
 
-#define DECLARE(TYPE) \
-    void get##TYPE( \
-        const std::string & attribute_name, \
-        const PaddedPODArray<Key> & ids, \
-        const PaddedPODArray<TYPE> & def, \
-        ResultArrayType<TYPE> & out) const;
-    DECLARE(UInt8)
-    DECLARE(UInt16)
-    DECLARE(UInt32)
-    DECLARE(UInt64)
-    DECLARE(UInt128)
-    DECLARE(Int8)
-    DECLARE(Int16)
-    DECLARE(Int32)
-    DECLARE(Int64)
-    DECLARE(Float32)
-    DECLARE(Float64)
-    DECLARE(Decimal32)
-    DECLARE(Decimal64)
-    DECLARE(Decimal128)
-#undef DECLARE
+    DictionaryHierarchicalParentToChildIndexPtr getHierarchicalIndex() const override;
 
-    void
-    getString(const std::string & attribute_name, const PaddedPODArray<Key> & ids, const ColumnString * const def, ColumnString * const out)
-        const;
+    size_t getHierarchicalIndexBytesAllocated() const override { return hierarchical_index_bytes_allocated; }
 
-#define DECLARE(TYPE) \
-    void get##TYPE(const std::string & attribute_name, const PaddedPODArray<Key> & ids, const TYPE def, ResultArrayType<TYPE> & out) const;
-    DECLARE(UInt8)
-    DECLARE(UInt16)
-    DECLARE(UInt32)
-    DECLARE(UInt64)
-    DECLARE(UInt128)
-    DECLARE(Int8)
-    DECLARE(Int16)
-    DECLARE(Int32)
-    DECLARE(Int64)
-    DECLARE(Float32)
-    DECLARE(Float64)
-    DECLARE(Decimal32)
-    DECLARE(Decimal64)
-    DECLARE(Decimal128)
-#undef DECLARE
+    ColumnPtr getDescendants(
+        ColumnPtr key_column,
+        const DataTypePtr & key_type,
+        size_t level,
+        DictionaryHierarchicalParentToChildIndexPtr parent_to_child_index) const override;
 
-    void getString(const std::string & attribute_name, const PaddedPODArray<Key> & ids, const String & def, ColumnString * const out) const;
-
-    void has(const PaddedPODArray<Key> & ids, PaddedPODArray<UInt8> & out) const override;
-
-    BlockInputStreamPtr getBlockInputStream(const Names & column_names, size_t max_block_size) const override;
+    Pipe read(const Names & column_names, size_t max_block_size, size_t num_streams) const override;
 
 private:
     template <typename Value>
-    using ContainerType = PaddedPODArray<Value>;
+    using ContainerType = std::conditional_t<
+        std::is_same_v<Value, Array> || std::is_same_v<Value, Map> || std::is_same_v<Value, Object>,
+        VectorWithMemoryTracking<Value>,
+        PaddedPODArray<Value>>;
+
+    using NullableSet = HashSet<UInt64, DefaultHash<UInt64>, HashTableGrower<>>;
 
     struct Attribute final
     {
-        AttributeUnderlyingType type;
-        std::variant<
-            UInt8,
-            UInt16,
-            UInt32,
-            UInt64,
-            UInt128,
-            Int8,
-            Int16,
-            Int32,
-            Int64,
-            Decimal32,
-            Decimal64,
-            Decimal128,
-            Float32,
-            Float64,
-            StringRef>
-            null_values;
+        std::optional<NullableSet> is_nullable_set;
+
         std::variant<
             ContainerType<UInt8>,
             ContainerType<UInt16>,
             ContainerType<UInt32>,
             ContainerType<UInt64>,
             ContainerType<UInt128>,
+            ContainerType<UInt256>,
             ContainerType<Int8>,
             ContainerType<Int16>,
             ContainerType<Int32>,
             ContainerType<Int64>,
+            ContainerType<Int128>,
+            ContainerType<Int256>,
             ContainerType<Decimal32>,
             ContainerType<Decimal64>,
             ContainerType<Decimal128>,
+            ContainerType<Decimal256>,
+            ContainerType<DateTime64>,
             ContainerType<Float32>,
             ContainerType<Float64>,
-            ContainerType<StringRef>>
-            arrays;
-        std::unique_ptr<Arena> string_arena;
+            ContainerType<UUID>,
+            ContainerType<IPv4>,
+            ContainerType<IPv6>,
+            ContainerType<std::string_view>,
+            ContainerType<Array>,
+            ContainerType<Map>,
+            ContainerType<Object>>
+            container;
+
+        AttributeUnderlyingType type;
     };
 
     void createAttributes();
+
     void blockToAttributes(const Block & block);
+
     void updateData();
+
     void loadData();
 
-    template <typename T>
-    void addAttributeSize(const Attribute & attribute);
+    void buildHierarchyParentToChildIndexIfNeeded();
 
     void calculateBytesAllocated();
 
-    template <typename T>
-    void createAttributeImpl(Attribute & attribute, const Field & null_value);
+    Attribute createAttribute(const DictionaryAttribute & attribute);
 
-    Attribute createAttributeWithType(const AttributeUnderlyingType type, const Field & null_value);
-
-    template <typename AttributeType, typename OutputType, typename ValueSetter, typename DefaultGetter>
+    template <typename AttributeType, bool is_nullable, typename ValueSetter, typename DefaultValueExtractor>
     void getItemsImpl(
-        const Attribute & attribute, const PaddedPODArray<Key> & ids, ValueSetter && set_value, DefaultGetter && get_default) const;
+        const Attribute & attribute,
+        const PaddedPODArray<UInt64> & keys,
+        ValueSetter && set_value,
+        DefaultValueExtractor & default_value_extractor) const;
+
+    template <typename AttributeType, bool is_nullable, typename ValueSetter>
+    void getItemsShortCircuitImpl(
+        const Attribute & attribute, const PaddedPODArray<UInt64> & keys, ValueSetter && set_value, IColumn::Filter & default_mask) const;
 
     template <typename T>
-    void resize(Attribute & attribute, const Key id);
+    void resize(Attribute & attribute, UInt64 key);
 
-    template <typename T>
-    void setAttributeValueImpl(Attribute & attribute, const Key id, const T & value);
+    void setAttributeValue(Attribute & attribute, UInt64 key, const Field & value);
 
-    void setAttributeValue(Attribute & attribute, const Key id, const Field & value);
-
-    const Attribute & getAttribute(const std::string & attribute_name) const;
-
-    template <typename T>
-    void has(const Attribute & attribute, const PaddedPODArray<Key> & ids, PaddedPODArray<UInt8> & out) const;
-
-    template <typename ChildType, typename AncestorType>
-    void isInImpl(const ChildType & child_ids, const AncestorType & ancestor_ids, PaddedPODArray<UInt8> & out) const;
-
-    PaddedPODArray<Key> getIds() const;
-
-    const std::string database;
-    const std::string name;
-    const std::string full_name;
     const DictionaryStructure dict_struct;
     const DictionarySourcePtr source_ptr;
-    const DictionaryLifetime dict_lifetime;
-    const bool require_nonempty;
+    const Configuration configuration;
 
-    std::map<std::string, size_t> attribute_index_by_name;
-    std::vector<Attribute> attributes;
-    const Attribute * hierarchical_attribute = nullptr;
-    std::vector<bool> loaded_ids;
+    VectorWithMemoryTracking<Attribute> attributes;
+    VectorWithMemoryTracking<bool> loaded_keys;
 
     size_t bytes_allocated = 0;
+    size_t hierarchical_index_bytes_allocated = 0;
     size_t element_count = 0;
     size_t bucket_count = 0;
     mutable std::atomic<size_t> query_count{0};
+    mutable std::atomic<size_t> found_count{0};
 
-    BlockPtr saved_block;
+    BlockPtr update_field_loaded_block;
+    Arena string_arena;
+    DictionaryHierarchicalParentToChildIndexPtr hierarhical_index;
 };
 
 }

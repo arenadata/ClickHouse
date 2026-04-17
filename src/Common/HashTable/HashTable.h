@@ -1,25 +1,25 @@
 #pragma once
 
-#include <string.h>
-
-#include <math.h>
-
-#include <utility>
-
-#include <boost/noncopyable.hpp>
-
 #include <Core/Defines.h>
-#include <Core/Types.h>
+#include <base/types.h>
 #include <Common/Exception.h>
 
-#include <IO/WriteBuffer.h>
-#include <IO/WriteHelpers.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ReadHelpers.h>
 #include <IO/VarInt.h>
+#include <IO/WriteBuffer.h>
+#include <IO/WriteHelpers.h>
 
+#include <Common/CacheLine.h>
 #include <Common/HashTable/HashTableAllocator.h>
 #include <Common/HashTable/HashTableKeyHolder.h>
+#include <Common/HashTable/Prefetching.h>
+
+#include <boost/noncopyable.hpp>
+
+#include <utility>
+#include <math.h>
+#include <string.h>
 
 #ifdef DBMS_HASH_MAP_DEBUG_RESIZES
     #include <iostream>
@@ -29,7 +29,7 @@
 
 /** NOTE HashTable could only be used for memmoveable (position independent) types.
   * Example: std::string is not position independent in libstdc++ with C++11 ABI or in libc++.
-  * Also, key in hash table must be of type, that zero bytes is compared equals to zero key.
+  * Also, key in hash table must be of a type, such as that zero bytes is compared equals to zero key.
   */
 
 
@@ -39,6 +39,8 @@ namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int NO_AVAILABLE_DATA;
+    extern const int CANNOT_ALLOCATE_MEMORY;
+    extern const int TOO_LARGE_ARRAY_SIZE;
 }
 }
 
@@ -63,17 +65,38 @@ struct HashTableNoState
 };
 
 
+/** Numbers are compared bitwise.
+  * Complex types are compared by operator== as usual (this is important if there are gaps).
+  *
+  * This is needed if you use floats as keys. They are compared by bit equality.
+  * Otherwise the invariants in hash table probing do not met when NaNs are present.
+  */
+template <typename T>
+inline bool bitEquals(T a, T b)
+{
+    if constexpr (is_floating_point<T>)
+        /// Note that memcmp with constant size is a compiler builtin.
+        return 0 == memcmp(&a, &b, sizeof(T)); /// NOLINT
+    else
+        return a == b;
+}
+
+
 /// These functions can be overloaded for custom types.
 namespace ZeroTraits
 {
 
 template <typename T>
-bool check(const T x) { return x == 0; }
+bool check(const T x)
+{
+    return bitEquals(x, T{});
+}
 
 template <typename T>
-void set(T & x) { x = 0; }
+void set(T & x) { x = T{}; }
 
 }
+
 
 /**
   * getKey/Mapped -- methods to get key/"mapped" values from the LookupResult returned by find() and
@@ -94,7 +117,7 @@ void set(T & x) { x = 0; }
   * 3) Hash tables that store the key and do not have a "mapped" value, e.g. the normal HashTable.
   *    GetKey returns the key, and GetMapped returns a zero void pointer. This simplifies generic
   *    code that works with mapped values: it can overload on the return type of GetMapped(), and
-  *    doesn't need other parameters. One example is insertSetMapped() function.
+  *    doesn't need other parameters. One example is Cell::setMapped() function.
   *
   * 4) Hash tables that store both the key and the "mapped" value, e.g. HashMap. Both GetKey and
   *    GetMapped are supported.
@@ -136,7 +159,7 @@ struct HashTableCell
 
     Key key;
 
-    HashTableCell() {}
+    HashTableCell() {} /// NOLINT
 
     /// Create a cell with the given key / key and value.
     HashTableCell(const Key & key_, const State &) : key(key_) {}
@@ -147,12 +170,12 @@ struct HashTableCell
     const value_type & getValue() const { return key; }
 
     /// Get the key (internally).
-    static const Key & getKey(const value_type & value) { return value; }
+    static const Key & getKey(const value_type & value) { return value; }  /// NOLINT(bugprone-return-const-ref-from-parameter)
 
     /// Are the keys at the cells equal?
-    bool keyEquals(const Key & key_) const { return key == key_; }
-    bool keyEquals(const Key & key_, size_t /*hash_*/) const { return key == key_; }
-    bool keyEquals(const Key & key_, size_t /*hash_*/, const State & /*state*/) const { return key == key_; }
+    bool keyEquals(const Key & key_) const { return bitEquals(key, key_); }
+    bool keyEquals(const Key & key_, size_t /*hash_*/) const { return bitEquals(key, key_); }
+    bool keyEquals(const Key & key_, size_t /*hash_*/, const State & /*state*/) const { return bitEquals(key, key_); }
 
     /// If the cell can remember the value of the hash function, then remember it.
     void setHash(size_t /*hash_value*/) {}
@@ -174,33 +197,21 @@ struct HashTableCell
     /// Do the hash table need to store the zero key separately (that is, can a zero key be inserted into the hash table).
     static constexpr bool need_zero_value_storage = true;
 
-    /// Whether the cell is deleted.
-    bool isDeleted() const { return false; }
-
     /// Set the mapped value, if any (for HashMap), to the corresponding `value`.
     void setMapped(const value_type & /*value*/) {}
 
     /// Serialization, in binary and text form.
-    void write(DB::WriteBuffer & wb) const         { DB::writeBinary(key, wb); }
+    void write(DB::WriteBuffer & wb) const         { DB::writeBinaryLittleEndian(key, wb); }
     void writeText(DB::WriteBuffer & wb) const     { DB::writeDoubleQuoted(key, wb); }
 
     /// Deserialization, in binary and text form.
-    void read(DB::ReadBuffer & rb)        { DB::readBinary(key, rb); }
+    void read(DB::ReadBuffer & rb)        { DB::readBinaryLittleEndian(key, rb); }
     void readText(DB::ReadBuffer & rb)    { DB::readDoubleQuoted(key, rb); }
+
 };
 
-/**
-  * A helper function for HashTable::insert() to set the "mapped" value.
-  * Overloaded on the mapped type, does nothing if it's VoidMapped.
-  */
-template <typename ValueType>
-void insertSetMapped(VoidMapped /* dest */, const ValueType & /* src */) {}
-
-template <typename MappedType, typename ValueType>
-void insertSetMapped(MappedType & dest, const ValueType & src) { dest = src.second; }
-
-
 /** Determines the size of the hash table, and when and how much it should be resized.
+  * Has very small state (one UInt8) and useful for Set-s allocated in automatic memory (see uniqExact as an example).
   */
 template <size_t initial_size_degree = 8>
 struct HashTableGrower
@@ -209,6 +220,11 @@ struct HashTableGrower
 
     UInt8 size_degree = initial_size_degree;
     static constexpr auto initial_count = 1ULL << initial_size_degree;
+
+    /// If collision resolution chains are contiguous, we can implement erase operation by moving the elements.
+    static constexpr auto performs_linear_probing_with_single_step = true;
+
+    static constexpr size_t max_size_degree = 23;
 
     /// The size of the hash table in the cells.
     size_t bufSize() const               { return 1ULL << size_degree; }
@@ -228,25 +244,91 @@ struct HashTableGrower
     /// Increase the size of the hash table.
     void increaseSize()
     {
-        size_degree += size_degree >= 23 ? 1 : 2;
+        size_degree += size_degree >= max_size_degree ? 1 : 2;
     }
 
     /// Set the buffer size by the number of elements in the hash table. Used when deserializing a hash table.
     void set(size_t num_elems)
     {
-        size_degree = num_elems <= 1
-             ? initial_size_degree
-             : ((initial_size_degree > static_cast<size_t>(log2(num_elems - 1)) + 2)
-                 ? initial_size_degree
-                 : (static_cast<size_t>(log2(num_elems - 1)) + 2));
+        if (num_elems <= 1)
+            size_degree = initial_size_degree;
+        else if (initial_size_degree > static_cast<size_t>(log2(num_elems - 1)) + 2)
+            size_degree = initial_size_degree;
+        else
+            size_degree = static_cast<UInt8>(static_cast<size_t>(log2(num_elems - 1)) + 2);
     }
 
     void setBufSize(size_t buf_size_)
     {
-        size_degree = static_cast<size_t>(log2(buf_size_ - 1) + 1);
+        size_degree = static_cast<UInt8>(static_cast<size_t>(log2(buf_size_ - 1) + 1));
     }
 };
 
+/** Determines the size of the hash table, and when and how much it should be resized.
+  * This structure is aligned to cache line boundary and also occupies it all.
+  * Precalculates some values to speed up lookups and insertion into the HashTable (and thus has bigger memory footprint than HashTableGrower).
+  * This grower assume 0.5 load factor
+  */
+template <size_t initial_size_degree = 8>
+class alignas(DB::CH_CACHE_LINE_SIZE) HashTableGrowerWithPrecalculation
+{
+    /// The state of this structure is enough to get the buffer size of the hash table.
+
+    UInt8 size_degree = initial_size_degree;
+    size_t precalculated_mask = (1ULL << initial_size_degree) - 1;
+    size_t precalculated_max_fill = 1ULL << (initial_size_degree - 1);
+    static constexpr size_t max_size_degree = 23;
+
+public:
+    UInt8 sizeDegree() const { return size_degree; }
+
+    void increaseSizeDegree(UInt8 delta)
+    {
+        size_degree += delta;
+        precalculated_mask = (1ULL << size_degree) - 1;
+        precalculated_max_fill = 1ULL << (size_degree - 1);
+    }
+
+    static constexpr auto initial_count = 1ULL << initial_size_degree;
+
+    /// If collision resolution chains are contiguous, we can implement erase operation by moving the elements.
+    static constexpr auto performs_linear_probing_with_single_step = true;
+
+    /// The size of the hash table in the cells.
+    size_t bufSize() const { return 1ULL << size_degree; }
+
+    /// From the hash value, get the cell number in the hash table.
+    size_t place(size_t x) const { return x & precalculated_mask; }
+
+    /// The next cell in the collision resolution chain.
+    size_t next(size_t pos) const { return (pos + 1) & precalculated_mask; }
+
+    /// Whether the hash table is sufficiently full. You need to increase the size of the hash table, or remove something unnecessary from it.
+    bool overflow(size_t elems) const { return elems > precalculated_max_fill; }
+
+    /// Increase the size of the hash table.
+    void increaseSize() { increaseSizeDegree(size_degree >= max_size_degree ? 1 : 2); }
+
+    /// Set the buffer size by the number of elements in the hash table. Used when deserializing a hash table.
+    void set(size_t num_elems)
+    {
+        if (num_elems <= 1)
+            size_degree = initial_size_degree;
+        else if (initial_size_degree > static_cast<size_t>(log2(num_elems - 1)) + 2)
+            size_degree = initial_size_degree;
+        else
+            size_degree = static_cast<UInt8>(log2(num_elems - 1)) + 2;
+        increaseSizeDegree(0);
+    }
+
+    void setBufSize(size_t buf_size_)
+    {
+        size_degree = static_cast<UInt8>(log2(buf_size_ - 1) + 1);
+        increaseSizeDegree(0);
+    }
+};
+
+static_assert(sizeof(HashTableGrowerWithPrecalculation<>) == DB::CH_CACHE_LINE_SIZE);
 
 /** When used as a Grower, it turns a hash table into something like a lookup table.
   * It remains non-optimal - the cells store the keys.
@@ -257,13 +339,16 @@ template <size_t key_bits>
 struct HashTableFixedGrower
 {
     static constexpr auto initial_count = 1ULL << key_bits;
+
+    static constexpr auto performs_linear_probing_with_single_step = true;
+
     size_t bufSize() const               { return 1ULL << key_bits; }
     size_t place(size_t x) const         { return x; }
-    /// You could write __builtin_unreachable(), but the compiler does not optimize everything, and it turns out less efficiently.
+    /// You could write UNREACHABLE(), but the compiler does not optimize everything, and it turns out less efficiently.
     size_t next(size_t pos) const        { return pos + 1; }
     bool overflow(size_t /*elems*/) const { return false; }
 
-    void increaseSize() { __builtin_unreachable(); }
+    void increaseSize() { UNREACHABLE(); }
     void set(size_t /*num_elems*/) {}
     void setBufSize(size_t /*buf_size_*/) {}
 };
@@ -278,7 +363,7 @@ struct ZeroValueStorage<true, Cell>
 {
 private:
     bool has_zero = false;
-    std::aligned_storage_t<sizeof(Cell), alignof(Cell)> zero_value_storage; /// Storage of element with zero key.
+    alignas(Cell) std::byte zero_value_storage[sizeof(Cell)]; /// Storage of element with zero key.
 
 public:
     bool hasZero() const { return has_zero; }
@@ -295,37 +380,34 @@ public:
         zeroValue()->~Cell();
     }
 
-    Cell * zeroValue()             { return reinterpret_cast<Cell*>(&zero_value_storage); }
-    const Cell * zeroValue() const { return reinterpret_cast<const Cell*>(&zero_value_storage); }
+    void clearHasZeroFlag()
+    {
+        has_zero = false;
+    }
+
+    Cell * zeroValue()             { return std::launder(reinterpret_cast<Cell*>(&zero_value_storage)); }
+    const Cell * zeroValue() const { return std::launder(reinterpret_cast<const Cell*>(&zero_value_storage)); }
 };
 
 template <typename Cell>
 struct ZeroValueStorage<false, Cell>
 {
     bool hasZero() const { return false; }
-    void setHasZero() { throw DB::Exception("HashTable: logical error", DB::ErrorCodes::LOGICAL_ERROR); }
+    void setHasZero() { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "HashTable: logical error"); }
     void clearHasZero() {}
+    void clearHasZeroFlag() {}
 
     Cell * zeroValue()             { return nullptr; }
     const Cell * zeroValue() const { return nullptr; }
 };
 
-
 // The HashTable
-template
-<
-    typename Key,
-    typename Cell,
-    typename Hash,
-    typename Grower,
-    typename Allocator
->
-class HashTable :
-    private boost::noncopyable,
-    protected Hash,
-    protected Allocator,
-    protected Cell::State,
-    protected ZeroValueStorage<Cell::need_zero_value_storage, Cell>     /// empty base optimization
+template <typename Key, typename Cell, typename Hash, typename Grower, typename Allocator>
+class HashTable : private boost::noncopyable,
+                  protected Hash,
+                  protected Allocator,
+                  protected Cell::State,
+                  public ZeroValueStorage<Cell::need_zero_value_storage, Cell> /// empty base optimization
 {
 public:
     // If we use an allocator with inline memory, check that the initial
@@ -389,9 +471,21 @@ protected:
         return place_value;
     }
 
+    static size_t allocCheckOverflow(size_t buffer_size)
+    {
+        size_t size = 0;
+        if (common::mulOverflow(buffer_size, sizeof(Cell), size))
+            throw DB::Exception(
+                DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY,
+                "Integer overflow trying to allocate memory for HashTable. Trying to allocate {} cells of {} bytes each",
+                buffer_size, sizeof(Cell));
+
+        return size;
+    }
+
     void alloc(const Grower & new_grower)
     {
-        buf = reinterpret_cast<Cell *>(Allocator::alloc(new_grower.bufSize() * sizeof(Cell)));
+        buf = reinterpret_cast<Cell *>(Allocator::alloc(allocCheckOverflow(new_grower.bufSize())));
         grower = new_grower;
     }
 
@@ -403,7 +497,6 @@ protected:
             buf = nullptr;
         }
     }
-
 
     /// Increase the size of the buffer.
     void resize(size_t for_num_elems = 0, size_t for_buf_size = 0)
@@ -437,28 +530,33 @@ protected:
             new_grower.increaseSize();
 
         /// Expand the space.
-        buf = reinterpret_cast<Cell *>(Allocator::realloc(buf, getBufferSizeInBytes(), new_grower.bufSize() * sizeof(Cell)));
+        size_t old_buffer_size = getBufferSizeInBytes();
+        buf = reinterpret_cast<Cell *>(Allocator::realloc(buf, old_buffer_size, allocCheckOverflow(new_grower.bufSize())));
         grower = new_grower;
 
-        /** Now some items may need to be moved to a new location.
-          * The element can stay in place, or move to a new location "on the right",
-          *  or move to the left of the collision resolution chain, because the elements to the left of it have been moved to the new "right" location.
-          */
-        size_t i = 0;
-        for (; i < old_size; ++i)
-            if (!buf[i].isZero(*this) && !buf[i].isDeleted())
-                reinsert(buf[i], buf[i].getHash(*this));
+        if (!empty())
+        {
+            /** Now some items may need to be moved to a new location.
+              * The element can stay in place, or move to a new location "on the right",
+              *  or move to the left of the collision resolution chain, because the elements to the left of it have been moved to the new "right" location.
+              */
+            size_t i = 0;
+            for (; i < old_size; ++i)
+                if (!buf[i].isZero(*this))
+                    reinsert(buf[i], buf[i].getHash(*this));
 
-        /** There is also a special case:
-          *    if the element was to be at the end of the old buffer,                  [        x]
-          *    but is at the beginning because of the collision resolution chain,      [o       x]
-          *    then after resizing, it will first be out of place again,               [        xo        ]
-          *    and in order to transfer it where necessary,
-          *    after transferring all the elements from the old halves you need to     [         o   x    ]
-          *    process tail from the collision resolution chain immediately after it   [        o    x    ]
-          */
-        for (; !buf[i].isZero(*this) && !buf[i].isDeleted(); ++i)
-            reinsert(buf[i], buf[i].getHash(*this));
+            /** There is also a special case:
+              *    if the element was to be at the end of the old buffer,                  [        x]
+              *    but is at the beginning because of the collision resolution chain,      [o       x]
+              *    then after resizing, it will first be out of place again,               [        xo        ]
+              *    and in order to transfer it where necessary,
+              *    after transferring all the elements from the old halves you need to     [         o   x    ]
+              *    process tail from the collision resolution chain immediately after it   [        o    x    ]
+              */
+            size_t new_size = grower.bufSize();
+            for (; i < new_size && !buf[i].isZero(*this); ++i)
+                reinsert(buf[i], buf[i].getHash(*this));
+        }
 
 #ifdef DBMS_HASH_MAP_DEBUG_RESIZES
         watch.stop();
@@ -489,23 +587,140 @@ protected:
 
         /// Copy to a new location and zero the old one.
         x.setHash(hash_value);
-        memcpy(static_cast<void*>(&buf[place_value]), &x, sizeof(x));
+        memcpy(static_cast<void*>(&buf[place_value]), &x, sizeof(x)); /// NOLINT(bugprone-undefined-memory-manipulation)
         x.setZero();
-
-        /// Then the elements that previously were in collision with this can move to the old place.
     }
 
 
     void destroyElements()
     {
         if (!std::is_trivially_destructible_v<Cell>)
-            for (iterator it = begin(), it_end = end(); it != it_end; ++it)
-                it.ptr->~Cell();
+        {
+            for (iterator it = begin(), it_end = end(); it != it_end;)
+            {
+                auto ptr = it.ptr;
+                ++it;
+                ptr->~Cell();
+            }
+
+            /// Everything had been destroyed in the loop above, reset the flag
+            /// only, without calling destructor.
+            this->clearHasZeroFlag();
+        }
+        else
+        {
+            /// NOTE: it is OK to call dtor for trivially destructible type
+            /// even the object hadn't been initialized, so no need to has
+            /// hasZero() check.
+            this->clearHasZero();
+        }
     }
 
+    // Prefetching keys will reduce cache misses and improve performance.
+    // Maybe reusing iterator_base is better
+    template <typename Derived, bool is_const>
+    class prefetching_iterator_base
+    {
+        using Container = std::conditional_t<is_const, const Self, Self>;
+        using cell_type = std::conditional_t<is_const, const Cell, Cell>;
+        Container * container;
+        cell_type * ptr;
+        cell_type * prefetch_ptr = nullptr;
+        DB::PrefetchingHelper prefetching;
+        size_t prefetch_ahead = 2;
+        size_t prefetched_count = 0;
+        size_t iter_count = 0;
+
+        friend class HashTable;
+
+    public:
+        prefetching_iterator_base() {} /// NOLINT
+        prefetching_iterator_base(Container * container_, cell_type * ptr_) : container(container_), ptr(ptr_) {}
+
+        bool operator== (const prefetching_iterator_base & rhs) const { return ptr == rhs.ptr; }
+        bool operator!= (const prefetching_iterator_base & rhs) const { return ptr != rhs.ptr; }
+
+        Derived & operator++()
+        {
+            if (ptr->isZero(*container)) [[unlikely]]
+            {
+                ptr = container->buf;
+                prefetch_ptr = ptr;
+            }
+            else if (!prefetch_ptr) [[unlikely]]
+            {
+                ++ptr;
+                prefetch_ptr = ptr;
+            }
+            else
+                ++ptr;
+
+            prefetch();
+
+            /// Skip empty cells in the main buffer.
+            auto * buf_end = container->buf + container->grower.bufSize();
+            while (ptr < buf_end && ptr->isZero(*container))
+                ++ptr;
+
+            if (prefetched_count > 0)
+                prefetched_count--;
+            return static_cast<Derived &>(*this);
+        }
+
+        auto & operator* () const { return *ptr; }
+        auto * operator->() const { return ptr; }
+        operator Cell * () const { return nullptr; } /// NOLINT
+
+    private:
+
+        void prefetch()
+        {
+            static_assert(CouldPrefetchKey<cell_type>);
+            auto * buf_end = container->buf + container->grower.bufSize();
+            iter_count++;
+            if (prefetch_ptr < buf_end && prefetched_count < prefetch_ahead) [[likely]]
+            {
+                if (iter_count == DB::PrefetchingHelper::iterationsToMeasure()) [[unlikely]]
+                    prefetch_ahead = prefetching.calcPrefetchLookAhead();
+                auto n = prefetch_ahead - prefetched_count;
+                cell_type * last_ptr = nullptr;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    while (prefetch_ptr < buf_end && prefetch_ptr->isZero(*container))
+                        ++prefetch_ptr;
+
+                    if (prefetch_ptr < buf_end) [[likely]]
+                    {
+                        last_ptr = prefetch_ptr;
+                        prefetch_ptr++;
+                        prefetched_count++;
+                    }
+                    else
+                        break;
+                }
+
+                if (last_ptr) [[likely]]
+                    keyPrefetch(last_ptr->getKey());
+            }
+        }
+    };
+
+    class const_prefetching_iterator
+        : public prefetching_iterator_base<const const_prefetching_iterator, true>
+    {
+    public:
+        using prefetching_iterator_base<const const_prefetching_iterator, true>::prefetching_iterator_base;
+    };
+
+    class prefetching_iterator
+        : public prefetching_iterator_base<prefetching_iterator, false>
+    {
+    public:
+        using prefetching_iterator_base<prefetching_iterator, false>::prefetching_iterator_base;
+    };
 
     template <typename Derived, bool is_const>
-    class iterator_base
+    class iterator_base /// NOLINT
     {
         using Container = std::conditional_t<is_const, const Self, Self>;
         using cell_type = std::conditional_t<is_const, const Cell, Cell>;
@@ -516,7 +731,7 @@ protected:
         friend class HashTable;
 
     public:
-        iterator_base() {}
+        iterator_base() {} /// NOLINT
         iterator_base(Container * container_, cell_type * ptr_) : container(container_), ptr(ptr_) {}
 
         bool operator== (const iterator_base & rhs) const { return ptr == rhs.ptr; }
@@ -531,10 +746,9 @@ protected:
                 ++ptr;
 
             /// Skip empty cells in the main buffer.
-            auto buf_end = container->buf + container->grower.bufSize();
+            auto * buf_end = container->buf + container->grower.bufSize();
             while (ptr < buf_end && ptr->isZero(*container))
                 ++ptr;
-
             return static_cast<Derived &>(*this);
         }
 
@@ -564,12 +778,13 @@ protected:
           * compatibility with std find(). Unfortunately, now is not the time to
           * do this.
           */
-        operator Cell * () const { return nullptr; }
+        operator Cell * () const { return nullptr; } /// NOLINT
     };
 
 
 public:
     using key_type = Key;
+    using grower_type = Grower;
     using mapped_type = typename Cell::mapped_type;
     using value_type = typename Cell::value_type;
     using cell_type = Cell;
@@ -587,7 +802,15 @@ public:
         alloc(grower);
     }
 
-    HashTable(size_t reserve_for_num_elements)
+    explicit HashTable(const Grower & grower_)
+        : grower(grower_)
+    {
+        if (Cell::need_zero_value_storage)
+            this->zeroValue()->setZero();
+        alloc(grower);
+    }
+
+    HashTable(size_t reserve_for_num_elements) /// NOLINT
     {
         if (Cell::need_zero_value_storage)
             this->zeroValue()->setZero();
@@ -595,7 +818,7 @@ public:
         alloc(grower);
     }
 
-    HashTable(HashTable && rhs)
+    HashTable(HashTable && rhs) noexcept
         : buf(nullptr)
     {
         *this = std::move(rhs);
@@ -607,7 +830,7 @@ public:
         free();
     }
 
-    HashTable & operator= (HashTable && rhs)
+    HashTable & operator=(HashTable && rhs) noexcept
     {
         destroyElements();
         free();
@@ -616,10 +839,36 @@ public:
         std::swap(m_size, rhs.m_size);
         std::swap(grower, rhs.grower);
 
-        Hash::operator=(std::move(rhs));
-        Allocator::operator=(std::move(rhs));
-        Cell::State::operator=(std::move(rhs));
-        ZeroValueStorage<Cell::need_zero_value_storage, Cell>::operator=(std::move(rhs));
+        Hash::operator=(std::move(rhs)); ///NOLINT
+        Allocator::operator=(std::move(rhs)); ///NOLINT
+        Cell::State::operator=(std::move(rhs)); ///NOLINT
+        ZeroValueStorage<Cell::need_zero_value_storage, Cell>::operator=(std::move(rhs)); ///NOLINT
+
+        return *this;
+    }
+
+    HashTable & operator=(const HashTable & rhs)
+    {
+        if (this == &rhs)
+            return *this;
+
+        size_t new_buffer_size = rhs.getBufferSizeInBytes();
+        size_t old_buffer_size = getBufferSizeInBytes();
+        destroyElements();
+        if (new_buffer_size != old_buffer_size)
+        {
+            free();
+            buf = reinterpret_cast<Cell *>(Allocator::alloc(new_buffer_size));
+        }
+
+        grower = rhs.grower;
+        m_size = rhs.m_size;
+        static_assert(std::is_trivially_copyable_v<Cell>);
+        std::memcpy(buf, rhs.buf, new_buffer_size);
+
+        Hash::operator=(rhs);
+        Cell::State::operator=(rhs);
+        ZeroValueStorage<Cell::need_zero_value_storage, Cell>::operator=(rhs);
 
         return *this;
     }
@@ -627,7 +876,7 @@ public:
     class Reader final : private Cell::State
     {
     public:
-        Reader(DB::ReadBuffer & in_)
+        explicit Reader(DB::ReadBuffer & in_)
             : in(in_)
         {
         }
@@ -656,85 +905,94 @@ public:
             return true;
         }
 
-        inline const value_type & get() const
+        const value_type & get() const
         {
             if (!is_initialized || is_eof)
-                throw DB::Exception("No available data", DB::ErrorCodes::NO_AVAILABLE_DATA);
+                throw DB::Exception(DB::ErrorCodes::NO_AVAILABLE_DATA, "No available data");
 
             return cell.getValue();
         }
 
     private:
         DB::ReadBuffer & in;
-        Cell cell;
+        Cell cell{};
         size_t read_count = 0;
         size_t size = 0;
         bool is_eof = false;
         bool is_initialized = false;
     };
 
-
-    class iterator : public iterator_base<iterator, false>
+    class iterator : public iterator_base<iterator, false> /// NOLINT
     {
     public:
         using iterator_base<iterator, false>::iterator_base;
     };
 
-    class const_iterator : public iterator_base<const_iterator, true>
+    class const_iterator : public iterator_base<const_iterator, true> /// NOLINT
     {
     public:
         using iterator_base<const_iterator, true>::iterator_base;
     };
 
 
-    const_iterator begin() const
+    template <bool prefetch = false>
+    auto begin() const
     {
+        using ConstIterator = std::conditional_t<prefetch && CouldPrefetchKey<cell_type>, const_prefetching_iterator, const_iterator>;
         if (!buf)
-            return end();
+            return end<prefetch>();
 
         if (this->hasZero())
-            return iteratorToZero();
+            return ConstIterator(this, this->zeroValue());
 
         const Cell * ptr = buf;
         auto buf_end = buf + grower.bufSize();
         while (ptr < buf_end && ptr->isZero(*this))
             ++ptr;
 
-        return const_iterator(this, ptr);
+        return ConstIterator(this, ptr);
     }
 
-    const_iterator cbegin() const { return begin(); }
+    template <bool prefetch = false>
+    auto cbegin() const { return begin<prefetch>(); }
 
-    iterator begin()
+    template <bool prefetch = false>
+    auto begin()
     {
+        using Iterator = std::conditional_t<prefetch && CouldPrefetchKey<cell_type>, prefetching_iterator, iterator>;
         if (!buf)
-            return end();
+            return end<prefetch>();
 
         if (this->hasZero())
-            return iteratorToZero();
+            return Iterator(this, this->zeroValue());
 
         Cell * ptr = buf;
-        auto buf_end = buf + grower.bufSize();
+        auto * buf_end = buf + grower.bufSize();
         while (ptr < buf_end && ptr->isZero(*this))
             ++ptr;
 
-        return iterator(this, ptr);
+        return Iterator(this, ptr);
     }
 
-    const_iterator end() const
+    template <bool prefetch = false>
+    auto end() const
     {
+        using ConstIterator = std::conditional_t<prefetch && CouldPrefetchKey<cell_type>, const_prefetching_iterator, const_iterator>;
         /// Avoid UBSan warning about adding zero to nullptr. It is valid in C++20 (and earlier) but not valid in C.
-        return const_iterator(this, buf ? buf + grower.bufSize() : buf);
+        return ConstIterator(this, buf ? buf + grower.bufSize() : buf);
     }
 
-    const_iterator cend() const
+    template <bool prefetch = false>
+    auto cend() const
     {
-        return end();
+        return end<prefetch>();
     }
 
-    iterator end()
+    template <bool prefetch = false>
+    auto end()
     {
-        return iterator(this, buf ? buf + grower.bufSize() : buf);
+        using Iterator = std::conditional_t<prefetch && CouldPrefetchKey<cell_type>, prefetching_iterator, iterator>;
+        return Iterator(this, buf ? buf + grower.bufSize() : buf);
     }
 
 
@@ -751,10 +1009,10 @@ protected:
     bool ALWAYS_INLINE emplaceIfZero(const Key & x, LookupResult & it, bool & inserted, size_t hash_value)
     {
         /// If it is claimed that the zero key can not be inserted into the table.
-        if (!Cell::need_zero_value_storage)
+        if constexpr (!Cell::need_zero_value_storage)
             return false;
 
-        if (Cell::isZero(x, *this))
+        if (unlikely(Cell::isZero(x, *this)))
         {
             it = this->zeroValue();
 
@@ -809,6 +1067,8 @@ protected:
                   */
                 --m_size;
                 buf[place_value].setZero();
+                inserted = false;
+                keyHolderDiscardKey(key_holder);
                 throw;
             }
 
@@ -829,8 +1089,18 @@ protected:
         emplaceNonZeroImpl(place_value, key_holder, it, inserted, hash_value);
     }
 
+    void ALWAYS_INLINE prefetchByHash(size_t hash_key) const
+    {
+        const auto place = grower.place(hash_key);
+        __builtin_prefetch(&buf[place]);
+    }
 
 public:
+    void reserve(size_t num_elements)
+    {
+        resize(num_elements);
+    }
+
     /// Insert a value. In the case of any more complex values, it is better to use the `emplace` function.
     std::pair<LookupResult, bool> ALWAYS_INLINE insert(const value_type & x)
     {
@@ -843,18 +1113,39 @@ public:
         }
 
         if (res.second)
-            insertSetMapped(res.first->getMapped(), x);
+            res.first->setMapped(x);
 
         return res;
     }
 
-
-    /// Reinsert node pointed to by iterator
-    void ALWAYS_INLINE reinsert(iterator & it, size_t hash_value)
+    std::pair<LookupResult, bool> ALWAYS_INLINE insert(const Cell & cell)
     {
-        reinsert(*it.getPtr(), hash_value);
+        std::pair<LookupResult, bool> res;
+        auto hash = cell.getHash(*this);
+        const value_type & x = cell.getValue();
+        const Key & key = cell.getKey();
+
+        if (!emplaceIfZero(key, res.first, res.second, hash))
+        {
+            emplaceNonZero(key, res.first, res.second, hash);
+        }
+
+        if (res.second)
+            res.first->setMapped(x);
+
+        return res;
     }
 
+    /// Reinsert node pointed to by iterator
+    void ALWAYS_INLINE reinsert(iterator & it, size_t hash_value) { reinsert(*it.getPtr(), hash_value); }
+
+    template <typename KeyHolder>
+    void ALWAYS_INLINE prefetch(KeyHolder && key_holder) const
+    {
+        const auto & key = keyHolderGetKey(key_holder);
+        const auto key_hash = hash(key);
+        prefetchByHash(key_hash);
+    }
 
     /** Insert the key.
       * Return values:
@@ -929,6 +1220,117 @@ public:
         return const_cast<std::decay_t<decltype(*this)> *>(this)->find(x, hash_value);
     }
 
+    ALWAYS_INLINE bool erase(const Key & x)
+    requires Grower::performs_linear_probing_with_single_step
+    {
+        return erase(x, hash(x));
+    }
+
+    ALWAYS_INLINE bool erase(const Key & x, size_t hash_value)
+    requires Grower::performs_linear_probing_with_single_step
+    {
+        /** Deletion from open addressing hash table without tombstones
+          *
+          * https://en.wikipedia.org/wiki/Linear_probing
+          * https://en.wikipedia.org/wiki/Open_addressing
+          * Algorithm without recomputing hash but keep probes difference value (difference of natural cell position and inserted one)
+          * in cell https://arxiv.org/ftp/arxiv/papers/0909/0909.2547.pdf
+          *
+          * Currently we use algorithm with hash recomputing on each step from https://en.wikipedia.org/wiki/Open_addressing
+          */
+
+        if (Cell::isZero(x, *this))
+        {
+            if (this->hasZero())
+            {
+                --m_size;
+                this->clearHasZero();
+                return true;
+            }
+
+            return false;
+        }
+
+        size_t erased_key_position = findCell(x, hash_value, grower.place(hash_value));
+
+        /// Key is not found
+        if (buf[erased_key_position].isZero(*this))
+            return false;
+
+        /// We need to guarantee loop termination because there will be empty position
+        assert(m_size < grower.bufSize());
+
+        size_t next_position = erased_key_position;
+
+        /**
+         * During element deletion there is a possibility that the search will be broken for one
+         * of the following elements, because this place erased_key_position is empty. We will check
+         * next_element. Consider a sequence from (erased_key_position, next_element], if the
+         * optimal_position of next_element falls into it, then removing erased_key_position
+         * will not break search for next_element.
+         * If optimal_position of the element does not fall into the sequence (erased_key_position, next_element]
+         * then deleting a erased_key_position will break search for it, so we need to move next_element
+         * to erased_key_position. Now we have empty place at next_element, so we apply the identical
+         * procedure for it.
+         * If an empty element is encountered then means that there is no more next elements for which we can
+         * break the search so we can exit.
+        */
+
+        /// Walk to the right through collision resolution chain and move elements to better positions
+        while (true)
+        {
+            next_position = grower.next(next_position);
+
+            /// If there's no more elements in the chain
+            if (buf[next_position].isZero(*this))
+                break;
+
+            /// The optimal position of the element in the cell at next_position
+            size_t optimal_position = grower.place(buf[next_position].getHash(*this));
+
+            /// If position of this element is already optimal - proceed to the next element.
+            if (optimal_position == next_position)
+                continue;
+
+            /// Cannot move this element because optimal position is after the freed place
+            /// The second condition is tricky - if the chain was overlapped before erased_key_position,
+            ///  and the optimal position is actually before in collision resolution chain:
+            ///
+            /// [*xn***----------------***]
+            ///   ^^-next elem          ^
+            ///   |                     |
+            ///   erased elem           the optimal position of the next elem
+            ///
+            /// so, the next elem should be moved to position of erased elem
+
+            /// The case of non overlapping part of chain
+            if (next_position > erased_key_position
+               && (optimal_position > erased_key_position) && (optimal_position < next_position))
+            {
+                continue;
+            }
+
+            /// The case of overlapping chain
+            if (next_position < erased_key_position
+                /// Cannot move this element because optimal position is after the freed place
+                && ((optimal_position > erased_key_position) || (optimal_position < next_position)))
+            {
+                continue;
+            }
+
+            /// Move the element to the freed place
+            memcpy(static_cast<void *>(&buf[erased_key_position]), static_cast<void *>(&buf[next_position]), sizeof(Cell));
+
+            /// Now we have another freed place
+            erased_key_position = next_position;
+        }
+
+        buf[erased_key_position].setZero();
+        --m_size;
+
+        return true;
+    }
+
     bool ALWAYS_INLINE has(const Key & x) const
     {
         if (Cell::isZero(x, *this))
@@ -949,6 +1351,10 @@ public:
         return !buf[place_value].isZero(*this);
     }
 
+    bool ALWAYS_INLINE contains(const Key & x) const
+    {
+        return has(x);
+    }
 
     void write(DB::WriteBuffer & wb) const
     {
@@ -995,11 +1401,12 @@ public:
         Cell::State::read(rb);
 
         destroyElements();
-        this->clearHasZero();
         m_size = 0;
 
         size_t new_size = 0;
         DB::readVarUInt(new_size, rb);
+        if (new_size > 100'000'000'000)
+            throw DB::Exception(DB::ErrorCodes::TOO_LARGE_ARRAY_SIZE, "The size of serialized hash table is suspiciously large: {}", new_size);
 
         free();
         Grower new_grower = grower;
@@ -1019,7 +1426,6 @@ public:
         Cell::State::readText(rb);
 
         destroyElements();
-        this->clearHasZero();
         m_size = 0;
 
         size_t new_size = 0;
@@ -1053,7 +1459,6 @@ public:
     void clear()
     {
         destroyElements();
-        this->clearHasZero();
         m_size = 0;
 
         memset(static_cast<void*>(buf), 0, grower.bufSize() * sizeof(*buf));
@@ -1064,7 +1469,6 @@ public:
     void clearAndShrink()
     {
         destroyElements();
-        this->clearHasZero();
         m_size = 0;
         free();
     }
@@ -1077,6 +1481,17 @@ public:
     size_t getBufferSizeInCells() const
     {
         return grower.bufSize();
+    }
+
+    /// Return offset for result in internal buffer.
+    /// Result can have value up to `getBufferSizeInCells() + 1`
+    /// because offset for zero value considered to be 0
+    /// and for other values it will be `offset in buffer + 1`
+    size_t offsetInternal(ConstLookupResult ptr) const
+    {
+        if (ptr->isZero(*this))
+            return 0;
+        return ptr - buf + 1;
     }
 
 #ifdef DBMS_HASH_MAP_COUNT_COLLISIONS

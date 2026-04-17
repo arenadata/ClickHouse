@@ -3,7 +3,7 @@
 #include <Functions/VectorExtension.h>
 #include <Common/HashTable/Hash.h>
 #include <Common/randomSeed.h>
-#include <common/unaligned.h>
+#include <base/unaligned.h>
 #if USE_MULTITARGET_CODE
 #  include <x86intrin.h>
 #endif
@@ -37,7 +37,7 @@ namespace
         UInt32 next()
         {
             current = current * a + c;
-            return current >> 16;
+            return static_cast<UInt32>(current >> 16);
         }
     };
 
@@ -94,7 +94,7 @@ void RandImpl::execute(char * output, size_t size)
 
 ) // DECLARE_DEFAULT_CODE
 
-DECLARE_AVX2_SPECIFIC_CODE(
+DECLARE_X86_64_V3_SPECIFIC_CODE(
 
 using namespace VectorExtension;
 
@@ -124,19 +124,12 @@ void RandImpl::execute(char * output, size_t size)
     char * end = output + size;
 
     constexpr int vec_size = 4;
-    constexpr int safe_overwrite = 15;
+    constexpr int safe_overwrite = PADDING_FOR_SIMD - 1;
     constexpr int bytes_per_write = 4 * sizeof(UInt64x4);
 
     UInt64 rand_seed = randomSeed();
 
     UInt64 a = LinearCongruentialGenerator::a;
-    // TODO(dakovalkov): try to remove this.
-    /// Note: GCC likes to expand multiplication by a constant into shifts + additions.
-    /// In this case a few multiplications become tens of shifts and additions. That leads to a huge slow down.
-    /// To avoid it we pretend that 'a' is not a constant. Actually we hope that rand_seed is never 0.
-    if (rand_seed == 0)
-        a = LinearCongruentialGenerator::a + 2;
-
     constexpr UInt64 c = LinearCongruentialGenerator::c;
 
     UInt64x4 gens1{};
@@ -183,6 +176,6 @@ void RandImpl::execute(char * output, size_t size)
     }
 }
 
-) // DECLARE_AVX2_SPECIFIC_CODE
+) // DECLARE_X86_64_V3_SPECIFIC_CODE
 
 }

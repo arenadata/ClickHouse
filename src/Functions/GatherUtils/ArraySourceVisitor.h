@@ -1,6 +1,6 @@
 #pragma once
 #include <Common/Visitor.h>
-#include <Core/TypeListNumber.h>
+#include <base/TypeLists.h>
 
 namespace DB::GatherUtils
 {
@@ -16,16 +16,20 @@ struct NullableArraySource;
 template <typename Base>
 struct ConstSource;
 
-using NumericArraySources = typename TypeListMap<NumericArraySource, TypeListNumbers>::Type;
-using BasicArraySources = typename AppendToTypeList<GenericArraySource, NumericArraySources>::Type;
-using NullableArraySources = typename TypeListMap<NullableArraySource, BasicArraySources>::Type;
-using BasicAndNullableArraySources = typename TypeListConcat<BasicArraySources, NullableArraySources>::Type;
-using ConstArraySources = typename TypeListMap<ConstSource, BasicAndNullableArraySources>::Type;
-using TypeListArraySources = typename TypeListConcat<BasicAndNullableArraySources, ConstArraySources>::Type;
+using NumericArraySources = TypeListMap<NumericArraySource, TypeListNumberWithUUID>;
+using BasicArraySources = TypeListAppend<GenericArraySource, NumericArraySources>;
 
-class ArraySourceVisitor : public ApplyTypeListForClass<Visitor, TypeListArraySources>::Type {};
+class ArraySourceVisitor : public TypeListChangeRoot<Visitor, BasicArraySources>
+{
+protected:
+    ~ArraySourceVisitor() = default;
+};
 
 template <typename Derived>
-class ArraySourceVisitorImpl : public VisitorImpl<Derived, ArraySourceVisitor> {};
+class ArraySourceVisitorImpl : public VisitorImpl<Derived, ArraySourceVisitor>
+{
+protected:
+    ~ArraySourceVisitorImpl() = default;
+};
 
 }

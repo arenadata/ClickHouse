@@ -12,23 +12,28 @@ struct GreatestBaseImpl
 {
     using ResultType = NumberTraits::ResultOfGreatest<A, B>;
     static const constexpr bool allow_fixed_string = false;
+    static const constexpr bool allow_string_integer = false;
 
     template <typename Result = ResultType>
-    static inline Result apply(A a, B b)
+    static Result apply(A a, B b)
     {
-        return static_cast<Result>(a) > static_cast<Result>(b) ? static_cast<Result>(a) : static_cast<Result>(b);
+        return static_cast<Result>(a) > static_cast<Result>(b) ?
+               static_cast<Result>(a) : static_cast<Result>(b);
     }
 
 #if USE_EMBEDDED_COMPILER
     static constexpr bool compilable = true;
 
-    static inline llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * left, llvm::Value * right, bool is_signed)
+    static llvm::Value * compile(llvm::IRBuilder<> & b, llvm::Value * left, llvm::Value * right, bool is_signed)
     {
         if (!left->getType()->isIntegerTy())
-            /// XXX maxnum is basically fmax(), it may or may not match whatever apply() does
-            /// XXX CreateMaxNum is broken on LLVM 5.0 and 6.0 (generates minnum instead; fixed in 7)
-            return b.CreateBinaryIntrinsic(llvm::Intrinsic::maxnum, left, right);
-        return b.CreateSelect(is_signed ? b.CreateICmpSGT(left, right) : b.CreateICmpUGT(left, right), left, right);
+        {
+            /// Follows the IEEE-754 semantics for maxNum except for the handling of signaling NaNs. This matches the behavior of libc fmax.
+            return b.CreateMaxNum(left, right);
+        }
+
+        auto * compare_value = is_signed ? b.CreateICmpSGT(left, right) : b.CreateICmpUGT(left, right);
+        return b.CreateSelect(compare_value, left, right);
     }
 #endif
 };
@@ -36,11 +41,12 @@ struct GreatestBaseImpl
 template <typename A, typename B>
 struct GreatestSpecialImpl
 {
-    using ResultType = std::make_unsigned_t<A>;
+    using ResultType = make_unsigned_t<A>;
     static const constexpr bool allow_fixed_string = false;
+    static const constexpr bool allow_string_integer = false;
 
     template <typename Result = ResultType>
-    static inline Result apply(A a, B b)
+    static Result apply(A a, B b)
     {
         static_assert(std::is_same_v<Result, ResultType>, "ResultType != Result");
         return accurate::greaterOp(a, b) ? static_cast<Result>(a) : static_cast<Result>(b);
@@ -57,9 +63,67 @@ using GreatestImpl = std::conditional_t<!NumberTraits::LeastGreatestSpecialCase<
 struct NameGreatest { static constexpr auto name = "greatest"; };
 using FunctionGreatest = FunctionBinaryArithmetic<GreatestImpl, NameGreatest>;
 
-void registerFunctionGreatest(FunctionFactory & factory)
+REGISTER_FUNCTION(Greatest)
 {
-    factory.registerFunction<LeastGreatestOverloadResolver<LeastGreatest::Greatest, FunctionGreatest>>(FunctionFactory::CaseInsensitive);
+    FunctionDocumentation::Description description = R"(
+Returns the greatest value among the arguments.
+`NULL` arguments are ignored.
+
+- For arrays, returns the lexicographically greatest array.
+- For `DateTime` types, the result type is promoted to the largest type (e.g., `DateTime64` if mixed with `DateTime32`).
+
+:::note Use setting `least_greatest_legacy_null_behavior` to change `NULL` behavior
+Version [24.12](/whats-new/changelog/2024#a-id2412a-clickhouse-release-2412-2024-12-19) introduced a backwards-incompatible change such that `NULL` values are ignored, while previously it returned `NULL` if one of the arguments was `NULL`.
+To retain the previous behavior, set setting `least_greatest_legacy_null_behavior` (default: `false`) to `true`.
+:::
+    )";
+    FunctionDocumentation::Syntax syntax = "greatest(x1[, x2, ...])";
+    FunctionDocumentation::Arguments arguments = {
+        {"x1[, x2, ...]", "One or multiple values to compare. All arguments must be of comparable types.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the greatest value among the arguments, promoted to the largest compatible type.", {"Any"}};
+    FunctionDocumentation::Examples examples = {
+    {
+        "Numeric types",
+        R"(
+SELECT greatest(1, 2, toUInt8(3), 3.) AS result, toTypeName(result) AS type;
+-- The type returned is a Float64 as the UInt8 must be promoted to 64 bit for the comparison.
+        )",
+        R"(
+┌─result─┬─type────┐
+│      3 │ Float64 │
+└────────┴─────────┘
+        )"
+    },
+    {
+        "Arrays",
+        R"(
+SELECT greatest(['hello'], ['there'], ['world']);
+        )",
+        R"(
+┌─greatest(['hello'], ['there'], ['world'])─┐
+│ ['world']                                 │
+└───────────────────────────────────────────┘
+        )"
+    },
+    {
+        "DateTime types",
+        R"(
+SELECT greatest(toDateTime32(now() + toIntervalDay(1)), toDateTime64(now(), 3));
+-- The type returned is a DateTime64 as the DateTime32 must be promoted to 64 bit for the comparison.
+        )",
+        R"(
+┌─greatest(toD⋯(now(), 3))─┐
+│  2025-05-28 15:50:53.000 │
+└──────────────────────────┘
+        )"
+    }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Conditional;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction<LeastGreatestOverloadResolver<LeastGreatest::Greatest, FunctionGreatest>>(documentation, FunctionFactory::Case::Insensitive);
 }
 
 }

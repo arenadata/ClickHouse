@@ -1,12 +1,14 @@
 #include <Access/RowPolicyCache.h>
+#include <Access/AccessControl.h>
 #include <Access/EnabledRowPolicies.h>
-#include <Access/AccessControlManager.h>
+#include <Access/RowPolicy.h>
 #include <Parsers/ExpressionListParsers.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/makeASTForLogicalFunction.h>
 #include <Common/Exception.h>
+#include <Common/Logger.h>
 #include <Common/quoteString.h>
-#include <ext/range.h>
+#include <base/range.h>
 #include <boost/smart_ptr/make_shared.hpp>
 #include <Core/Defines.h>
 
@@ -15,35 +17,40 @@ namespace DB
 {
 namespace
 {
-    using ConditionType = RowPolicy::ConditionType;
-    constexpr auto MAX_CONDITION_TYPE = RowPolicy::MAX_CONDITION_TYPE;
-
-
-    /// Accumulates conditions from multiple row policies and joins them using the AND logical operation.
-    class ConditionsMixer
+    /// Helper to accumulate filters from multiple row policies and join them together
+    ///   by AND or OR logical operations.
+    class FiltersMixer
     {
     public:
-        void add(const ASTPtr & condition, bool is_restrictive)
+        void add(const ASTPtr & filter, bool is_restrictive)
         {
             if (is_restrictive)
-                restrictions.push_back(condition);
+                restrictions.push_back(filter);
             else
-                permissions.push_back(condition);
+                permissions.push_back(filter);
         }
 
-        ASTPtr getResult() &&
+        ASTPtr getResult(bool users_without_row_policies_can_read_rows) &&
         {
-            /// Process permissive conditions.
-            restrictions.push_back(makeASTForLogicalOr(std::move(permissions)));
+            if (!permissions.empty() || !users_without_row_policies_can_read_rows)
+            {
+                /// Process permissive filters.
+                restrictions.push_back(makeASTForLogicalOr(std::move(permissions)));
+            }
 
-            /// Process restrictive conditions.
-            auto condition = makeASTForLogicalAnd(std::move(restrictions));
+            /// Process restrictive filters.
+            ASTPtr result;
+            if (!restrictions.empty())
+                result = makeASTForLogicalAnd(std::move(restrictions));
 
-            bool value;
-            if (tryGetLiteralBool(condition.get(), value) && value)
-                condition = nullptr;  /// The condition is always true, no need to check it.
+            if (result)
+            {
+                bool value;
+                if (tryGetLiteralBool(result.get(), value) && value)
+                    result = nullptr; /// The condition is always true, no need to check it.
+            }
 
-            return condition;
+            return result;
         }
 
     private:
@@ -59,41 +66,42 @@ void RowPolicyCache::PolicyInfo::setPolicy(const RowPolicyPtr & policy_)
     roles = &policy->to_roles;
     database_and_table_name = std::make_shared<std::pair<String, String>>(policy->getDatabase(), policy->getTableName());
 
-    for (auto type : ext::range(0, MAX_CONDITION_TYPE))
+    for (auto filter_type : collections::range(0, RowPolicyFilterType::MAX))
     {
-        parsed_conditions[type] = nullptr;
-        const String & condition = policy->conditions[type];
-        if (condition.empty())
+        auto filter_type_i = static_cast<size_t>(filter_type);
+        parsed_filters[filter_type_i] = nullptr;
+        const String & filter = policy->filters[filter_type_i];
+        if (filter.empty())
             continue;
 
-        auto previous_range = std::pair(std::begin(policy->conditions), std::begin(policy->conditions) + type);
-        const auto * previous_it = std::find(previous_range.first, previous_range.second, condition);
+        auto previous_range = std::pair(std::begin(policy->filters), std::begin(policy->filters) + filter_type_i);
+        const auto previous_it = std::find(previous_range.first, previous_range.second, filter);
         if (previous_it != previous_range.second)
         {
-            /// The condition is already parsed before.
-            parsed_conditions[type] = parsed_conditions[previous_it - previous_range.first];
+            /// The filter is already parsed before.
+            parsed_filters[filter_type_i] = parsed_filters[previous_it - previous_range.first];
             continue;
         }
 
-        /// Try to parse the condition.
+        /// Try to parse the filter.
         try
         {
             ParserExpression parser;
-            parsed_conditions[type] = parseQuery(parser, condition, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH);
+            parsed_filters[filter_type_i] = parseQuery(parser, filter, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
         }
         catch (...)
         {
             tryLogCurrentException(
-                &Poco::Logger::get("RowPolicy"),
-                String("Could not parse the condition ") + toString(type) + " of row policy "
+                getLogger("RowPolicy"),
+                String("Could not parse the condition ") + toString(filter_type) + " of row policy "
                     + backQuote(policy->getName()));
         }
     }
 }
 
 
-RowPolicyCache::RowPolicyCache(const AccessControlManager & access_control_manager_)
-    : access_control_manager(access_control_manager_)
+RowPolicyCache::RowPolicyCache(const AccessControl & access_control_)
+    : access_control(access_control_)
 {
 }
 
@@ -119,7 +127,7 @@ std::shared_ptr<const EnabledRowPolicies> RowPolicyCache::getEnabledRowPolicies(
 
     auto res = std::shared_ptr<EnabledRowPolicies>(new EnabledRowPolicies(params));
     enabled_row_policies.emplace(std::move(params), res);
-    mixConditionsFor(*res);
+    mixFiltersFor(*res);
     return res;
 }
 
@@ -131,7 +139,7 @@ void RowPolicyCache::ensureAllRowPoliciesRead()
         return;
     all_policies_read = true;
 
-    subscription = access_control_manager.subscribeForChanges<RowPolicy>(
+    subscription = access_control.subscribeForChanges<RowPolicy>(
         [&](const UUID & id, const AccessEntityPtr & entity)
         {
             if (entity)
@@ -140,11 +148,13 @@ void RowPolicyCache::ensureAllRowPoliciesRead()
                 rowPolicyRemoved(id);
         });
 
-    for (const UUID & id : access_control_manager.findAll<RowPolicy>())
+    for (const UUID & id : access_control.findAll<RowPolicy>())
     {
-        auto quota = access_control_manager.tryRead<RowPolicy>(id);
-        if (quota)
-            all_policies.emplace(id, PolicyInfo(quota));
+        auto policy = access_control.tryRead<RowPolicy>(id);
+        if (policy)
+        {
+            all_policies.emplace(id, PolicyInfo(policy));
+        }
     }
 }
 
@@ -165,7 +175,7 @@ void RowPolicyCache::rowPolicyAddedOrChanged(const UUID & policy_id, const RowPo
 
     auto & info = it->second;
     info.setPolicy(new_policy);
-    mixConditions();
+    mixFilters();
 }
 
 
@@ -173,11 +183,11 @@ void RowPolicyCache::rowPolicyRemoved(const UUID & policy_id)
 {
     std::lock_guard lock{mutex};
     all_policies.erase(policy_id);
-    mixConditions();
+    mixFilters();
 }
 
 
-void RowPolicyCache::mixConditions()
+void RowPolicyCache::mixFilters()
 {
     /// `mutex` is already locked.
     for (auto i = enabled_row_policies.begin(), e = enabled_row_policies.end(); i != e;)
@@ -187,58 +197,130 @@ void RowPolicyCache::mixConditions()
             i = enabled_row_policies.erase(i);
         else
         {
-            mixConditionsFor(*elem);
+            mixFiltersFor(*elem);
             ++i;
         }
     }
 }
 
 
-void RowPolicyCache::mixConditionsFor(EnabledRowPolicies & enabled)
+void RowPolicyCache::mixFiltersFor(EnabledRowPolicies & enabled)
 {
     /// `mutex` is already locked.
 
-    using MapOfMixedConditions = EnabledRowPolicies::MapOfMixedConditions;
-    using MixedConditionKey = EnabledRowPolicies::MixedConditionKey;
+    using MixedFiltersMap = EnabledRowPolicies::MixedFiltersMap;
+    using MixedFiltersKey = EnabledRowPolicies::MixedFiltersKey;
     using Hash = EnabledRowPolicies::Hash;
 
     struct MixerWithNames
     {
-        ConditionsMixer mixer;
+        FiltersMixer mixer;
         std::shared_ptr<const std::pair<String, String>> database_and_table_name;
+        std::vector<RowPolicyPtr> policies;
     };
 
-    std::unordered_map<MixedConditionKey, MixerWithNames, Hash> map_of_mixers;
+    std::unordered_map<MixedFiltersKey, MixerWithNames, Hash> database_mixers;
 
+    /// populate database_mixers using database-level policies
+    ///  to aggregate (mix) rules per database
     for (const auto & [policy_id, info] : all_policies)
     {
-        const auto & policy = *info.policy;
-        bool match = info.roles->match(enabled.params.user_id, enabled.params.enabled_roles);
-        MixedConditionKey key;
-        key.database = info.database_and_table_name->first;
-        key.table_name = info.database_and_table_name->second;
-        for (auto type : ext::range(0, MAX_CONDITION_TYPE))
+        if (info.isForDatabase())
         {
-            if (info.parsed_conditions[type])
+            const auto & policy = *info.policy;
+            bool match = info.roles->match(enabled.params.user_id, enabled.params.enabled_roles);
+            for (auto filter_type : collections::range(0, RowPolicyFilterType::MAX))
             {
-                key.condition_type = type;
-                auto & mixer = map_of_mixers[key];
-                mixer.database_and_table_name = info.database_and_table_name;
-                if (match)
-                    mixer.mixer.add(info.parsed_conditions[type], policy.isRestrictive());
+                auto filter_type_i = static_cast<size_t>(filter_type);
+                if (info.parsed_filters[filter_type_i])
+                {
+                    MixedFiltersKey key{info.database_and_table_name->first,
+                        info.database_and_table_name->second,
+                        filter_type};
+
+                    auto & mixer = database_mixers[key];
+                    mixer.database_and_table_name = info.database_and_table_name;
+                    if (match)
+                    {
+                        mixer.mixer.add(info.parsed_filters[filter_type_i], policy.isRestrictive());
+                        mixer.policies.push_back(info.policy);
+                    }
+                }
             }
         }
     }
 
-    auto map_of_mixed_conditions = boost::make_shared<MapOfMixedConditions>();
-    for (auto & [key, mixer] : map_of_mixers)
+    std::unordered_map<MixedFiltersKey, MixerWithNames, Hash> table_mixers;
+
+    /// populate table_mixers using database_mixers and table-level policies
+    for (const auto & [policy_id, info] : all_policies)
     {
-        auto & mixed_condition = (*map_of_mixed_conditions)[key];
-        mixed_condition.database_and_table_name = mixer.database_and_table_name;
-        mixed_condition.ast = std::move(mixer.mixer).getResult();
+        if (!info.isForDatabase())
+        {
+            const auto & policy = *info.policy;
+            bool match = info.roles->match(enabled.params.user_id, enabled.params.enabled_roles);
+            for (auto filter_type : collections::range(0, RowPolicyFilterType::MAX))
+            {
+                auto filter_type_i = static_cast<size_t>(filter_type);
+                if (info.parsed_filters[filter_type_i])
+                {
+                    MixedFiltersKey key{info.database_and_table_name->first,
+                        info.database_and_table_name->second,
+                        filter_type};
+                    auto table_it = table_mixers.find(key);
+                    if (table_it == table_mixers.end())
+                    {   /// no exact match - create new mixer
+                        MixedFiltersKey database_key = key;
+                        database_key.table_name = RowPolicyName::ANY_TABLE_MARK;
+
+                        auto database_it = database_mixers.find(database_key);
+
+                        if (database_it == database_mixers.end())
+                        {
+                            table_it = table_mixers.try_emplace(key).first;
+                        }
+                        else
+                        {
+                            /// table policies are based on database ones
+                            table_it = table_mixers.insert({key, database_it->second}).first;
+                        }
+                    }
+
+                    auto & mixer = table_it->second; ///  getting table level mixer
+                    mixer.database_and_table_name = info.database_and_table_name;
+                    if (match)
+                    {
+                        mixer.mixer.add(info.parsed_filters[filter_type_i], policy.isRestrictive());
+                        mixer.policies.push_back(info.policy);
+                    }
+                }
+            }
+        }
     }
 
-    enabled.map_of_mixed_conditions.store(map_of_mixed_conditions);
+    auto mixed_filters = boost::make_shared<MixedFiltersMap>();
+
+    /// Retrieve aggregated policies from mixers
+    ///  if a table has a policy for this particular table, we have all needed information in table_mixers
+    ///    (policies for the database are already applied)
+    ///  otherwise we would look for a policy for database using RowPolicy::ANY_TABLE_MARK
+    /// Consider restrictive policies a=1 for db.t, b=2 for db.* and c=3 for db.*
+    ///   We are going to have two items in mixed_filters:
+    ///     1. a=1 AND b=2 AND c=3   for db.t (comes from table_mixers, where it had been created with the help of database_mixers)
+    ///     2. b=2 AND c=3  for db.* (comes directly from database_mixers)
+    for (auto * mixer_map_ptr : {&table_mixers, &database_mixers})
+    {
+        for (auto & [key, mixer] : *mixer_map_ptr)
+        {
+            auto mixed_filter = std::make_shared<RowPolicyFilter>();
+            mixed_filter->database_and_table_name = std::move(mixer.database_and_table_name);
+            mixed_filter->expression = std::move(mixer.mixer).getResult(access_control.isEnabledUsersWithoutRowPoliciesCanReadRows());
+            mixed_filter->policies = std::move(mixer.policies);
+            mixed_filters->emplace(key, std::move(mixed_filter));
+        }
+    }
+
+    enabled.mixed_filters.store(mixed_filters);
 }
 
 }

@@ -2,17 +2,15 @@
 
 #include <Core/Block.h>
 
-#if !defined(ARCADIA_BUILD)
-#    include "config_core.h"
-#endif
+#include "config.h"
 
 #if USE_MYSQL
-#    include <common/LocalDateTime.h>
+#    include <Common/LocalDateTime.h>
 #    include <mysqlxx/PoolWithFailover.h>
-#    include "DictionaryStructure.h"
-#    include "ExternalQueryBuilder.h"
-#    include "IDictionarySource.h"
-
+#    include <Dictionaries/DictionaryStructure.h>
+#    include <Dictionaries/ExternalQueryBuilder.h>
+#    include <Dictionaries/IDictionarySource.h>
+#    include <Processors/Sources/MySQLSource.h>
 
 namespace Poco
 {
@@ -31,23 +29,36 @@ namespace DB
 class MySQLDictionarySource final : public IDictionarySource
 {
 public:
+    struct Configuration
+    {
+        const std::string db;
+        const std::string table;
+        const std::string query;
+        const std::string where;
+        const std::string invalidate_query;
+        const std::string update_field;
+        const UInt64 update_lag;
+        const bool bg_reconnect;
+    };
+
     MySQLDictionarySource(
         const DictionaryStructure & dict_struct_,
-        const Poco::Util::AbstractConfiguration & config,
-        const std::string & config_prefix,
-        const Block & sample_block_);
+        const Configuration & configuration_,
+        mysqlxx::PoolWithFailoverPtr pool_,
+        const Block & sample_block_,
+        const StreamSettings & settings_);
 
     /// copy-constructor is provided in order to support cloneability
     MySQLDictionarySource(const MySQLDictionarySource & other);
     MySQLDictionarySource & operator=(const MySQLDictionarySource &) = delete;
 
-    BlockInputStreamPtr loadAll() override;
+    BlockIO loadAll() override;
 
-    BlockInputStreamPtr loadUpdatedAll() override;
+    BlockIO loadUpdatedAll() override;
 
-    BlockInputStreamPtr loadIds(const std::vector<UInt64> & ids) override;
+    BlockIO loadIds(const VectorWithMemoryTracking<UInt64> & ids) override;
 
-    BlockInputStreamPtr loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows) override;
+    BlockIO loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows) override;
 
     bool isModified() const override;
 
@@ -60,32 +71,26 @@ public:
     std::string toString() const override;
 
 private:
+    QueryPipeline loadFromQuery(const String & query);
+
     std::string getUpdateFieldAndDate();
 
-    static std::string quoteForLike(const std::string s);
-
-    LocalDateTime getLastModification(mysqlxx::Pool::Entry & connection, bool allow_connection_closure) const;
+    static std::string quoteForLike(const std::string & value);
 
     // execute invalidate_query. expects single cell in result
     std::string doInvalidateQuery(const std::string & request) const;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     std::chrono::time_point<std::chrono::system_clock> update_time;
     const DictionaryStructure dict_struct;
-    const std::string db;
-    const std::string table;
-    const std::string where;
-    const std::string update_field;
-    const bool dont_check_update_time;
+    const Configuration configuration;
+    mysqlxx::PoolWithFailoverPtr pool;
     Block sample_block;
-    mutable mysqlxx::PoolWithFailover pool;
     ExternalQueryBuilder query_builder;
     const std::string load_all_query;
-    LocalDateTime last_modification;
-    std::string invalidate_query;
     mutable std::string invalidate_query_response;
-    const bool close_connection;
+    const StreamSettings settings;
 };
 
 }

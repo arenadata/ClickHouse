@@ -5,9 +5,6 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 
-#include <functional>
-
-
 namespace DB
 {
 
@@ -30,39 +27,43 @@ enum EscapeManip        { escape };           /// For strings - escape special c
 enum QuoteManip         { quote };            /// For strings, dates, datetimes - enclose in single quotes with escaping. In the rest, as usual.
 enum DoubleQuoteManip   { double_quote };     /// For strings, dates, datetimes - enclose in double quotes with escaping. In the rest, as usual.
 enum BinaryManip        { binary };           /// Output in binary format.
+enum XMLManip           { xml };              /// Output strings with XML escaping.
 
 struct EscapeManipWriteBuffer        : std::reference_wrapper<WriteBuffer> { using std::reference_wrapper<WriteBuffer>::reference_wrapper; };
 struct QuoteManipWriteBuffer         : std::reference_wrapper<WriteBuffer> { using std::reference_wrapper<WriteBuffer>::reference_wrapper; };
 struct DoubleQuoteManipWriteBuffer   : std::reference_wrapper<WriteBuffer> { using std::reference_wrapper<WriteBuffer>::reference_wrapper; };
 struct BinaryManipWriteBuffer        : std::reference_wrapper<WriteBuffer> { using std::reference_wrapper<WriteBuffer>::reference_wrapper; };
+struct XMLManipWriteBuffer           : std::reference_wrapper<WriteBuffer> { using std::reference_wrapper<WriteBuffer>::reference_wrapper; };
 
 struct EscapeManipReadBuffer         : std::reference_wrapper<ReadBuffer> { using std::reference_wrapper<ReadBuffer>::reference_wrapper; };
 struct QuoteManipReadBuffer          : std::reference_wrapper<ReadBuffer> { using std::reference_wrapper<ReadBuffer>::reference_wrapper; };
 struct DoubleQuoteManipReadBuffer    : std::reference_wrapper<ReadBuffer> { using std::reference_wrapper<ReadBuffer>::reference_wrapper; };
 struct BinaryManipReadBuffer         : std::reference_wrapper<ReadBuffer> { using std::reference_wrapper<ReadBuffer>::reference_wrapper; };
 
-
-template <typename T>     WriteBuffer & operator<< (WriteBuffer & buf, const T & x)        { writeText(x, buf);     return buf; }
-/// If you do not use the manipulators, the string is displayed without an escape, as is.
-template <> inline        WriteBuffer & operator<< (WriteBuffer & buf, const String & x)   { writeString(x, buf);   return buf; }
-template <> inline        WriteBuffer & operator<< (WriteBuffer & buf, const char & x)     { writeChar(x, buf);     return buf; }
-
-inline WriteBuffer & operator<< (WriteBuffer & buf, const char * x)     { writeCString(x, buf); return buf; }
+inline WriteBuffer & operator<<(WriteBuffer & buf, const auto & x) { writeText(x, buf); return buf; }
 
 inline EscapeManipWriteBuffer      operator<< (WriteBuffer & buf, EscapeManip)      { return buf; }
 inline QuoteManipWriteBuffer       operator<< (WriteBuffer & buf, QuoteManip)       { return buf; }
 inline DoubleQuoteManipWriteBuffer operator<< (WriteBuffer & buf, DoubleQuoteManip) { return buf; }
 inline BinaryManipWriteBuffer      operator<< (WriteBuffer & buf, BinaryManip)      { return buf; }
+inline XMLManipWriteBuffer         operator<< (WriteBuffer & buf, XMLManip)         { return buf; }
 
 template <typename T> WriteBuffer & operator<< (EscapeManipWriteBuffer buf,        const T & x) { writeText(x, buf.get());         return buf; }
 template <typename T> WriteBuffer & operator<< (QuoteManipWriteBuffer buf,         const T & x) { writeQuoted(x, buf.get());       return buf; }
 template <typename T> WriteBuffer & operator<< (DoubleQuoteManipWriteBuffer buf,   const T & x) { writeDoubleQuoted(x, buf.get()); return buf; }
 template <typename T> WriteBuffer & operator<< (BinaryManipWriteBuffer buf,        const T & x) { writeBinary(x, buf.get());       return buf; }
+template <typename T> WriteBuffer & operator<< (XMLManipWriteBuffer buf,           const T & x) { writeText(x, buf.get());         return buf; }
 
-inline WriteBuffer & operator<< (EscapeManipWriteBuffer buf,      const char * x) { writeAnyEscapedString<'\''>(x, x + strlen(x), buf.get()); return buf; }
+inline  WriteBuffer & operator<< (EscapeManipWriteBuffer buf, const String & x)   { writeEscapedString(x, buf); return buf; }
+inline  WriteBuffer & operator<< (EscapeManipWriteBuffer buf, std::string_view x) { writeEscapedString(x, buf); return buf; }
+inline  WriteBuffer & operator<< (EscapeManipWriteBuffer buf, const char * x)     { writeEscapedString(x, strlen(x), buf); return buf; }
+
 inline WriteBuffer & operator<< (QuoteManipWriteBuffer buf,       const char * x) { writeAnyQuotedString<'\''>(x, x + strlen(x), buf.get()); return buf; }
 inline WriteBuffer & operator<< (DoubleQuoteManipWriteBuffer buf, const char * x) { writeAnyQuotedString<'"'>(x, x + strlen(x), buf.get()); return buf; }
 inline WriteBuffer & operator<< (BinaryManipWriteBuffer buf,      const char * x) { writeStringBinary(x, buf.get()); return buf; }
+
+inline  WriteBuffer & operator<< (XMLManipWriteBuffer buf, std::string_view x) { writeXMLStringForTextElementOrAttributeValue(x, buf); return buf; }
+inline  WriteBuffer & operator<< (XMLManipWriteBuffer buf, const char * x)     { writeXMLStringForTextElementOrAttributeValue(std::string_view(x), buf); return buf; }
 
 /// The manipulator calls the WriteBuffer method `next` - this makes the buffer reset. For nested buffers, the reset is not recursive.
 enum FlushManip { flush };

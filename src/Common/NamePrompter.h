@@ -1,7 +1,7 @@
 #pragma once
 
-#include <Core/Types.h>
-#include <Common/PODArray.h>
+#include <base/types.h>
+#include <Common/levenshteinDistance.h>
 
 #include <algorithm>
 #include <cctype>
@@ -12,6 +12,7 @@
 
 namespace DB
 {
+
 template <size_t MaxNumHints>
 class NamePrompter
 {
@@ -28,31 +29,6 @@ public:
     }
 
 private:
-    static size_t levenshteinDistance(const String & lhs, const String & rhs)
-    {
-        size_t m = lhs.size();
-        size_t n = rhs.size();
-
-        PODArrayWithStackMemory<size_t, 64> row(n + 1);
-
-        for (size_t i = 1; i <= n; ++i)
-            row[i] = i;
-
-        for (size_t j = 1; j <= m; ++j)
-        {
-            row[0] = j;
-            size_t prev = j - 1;
-            for (size_t i = 1; i <= n; ++i)
-            {
-                size_t old = row[i];
-                row[i] = std::min(prev + (std::tolower(lhs[j - 1]) != std::tolower(rhs[i - 1])),
-                    std::min(row[i - 1], row[i]) + 1);
-                prev = old;
-            }
-        }
-        return row[n];
-    }
-
     static void appendToQueue(size_t ind, const String & name, DistanceIndexQueue & queue, const std::vector<String> & prompting_strings)
     {
         const String & prompt = prompting_strings[ind];
@@ -65,7 +41,7 @@ private:
 
         if (prompt.size() <= name.size() + mistake_factor && prompt.size() + mistake_factor >= name.size())
         {
-            size_t distance = levenshteinDistance(prompt, name);
+            size_t distance = levenshteinDistanceCaseInsensitive(prompt, name);
             if (distance <= mistake_factor)
             {
                 queue.emplace(distance, ind);
@@ -77,36 +53,60 @@ private:
 
     static std::vector<String> release(DistanceIndexQueue & queue, const std::vector<String> & prompting_strings)
     {
-        std::vector<String> ans;
-        ans.reserve(queue.size());
+        std::vector<String> answer;
+        answer.reserve(queue.size());
         while (!queue.empty())
         {
             auto top = queue.top();
             queue.pop();
-            ans.push_back(prompting_strings[top.second]);
+            answer.push_back(prompting_strings[top.second]);
         }
-        std::reverse(ans.begin(), ans.end());
-        return ans;
+        std::reverse(answer.begin(), answer.end());
+        return answer;
     }
 };
 
-template <size_t MaxNumHints, class Self>
+String getHintsErrorMessageSuffix(const std::vector<String> & hints);
+
+void appendHintsMessage(String & error_message, const std::vector<String> & hints);
+
+template <size_t MaxNumHints = 1>
 class IHints
 {
 public:
-
     virtual std::vector<String> getAllRegisteredNames() const = 0;
 
     std::vector<String> getHints(const String & name) const
     {
-        static const auto registered_names = getAllRegisteredNames();
-        return prompter.getHints(name, registered_names);
+        return prompter.getHints(name, getAllRegisteredNames());
     }
+
+    std::vector<String> getHints(const String & name, const std::vector<String> & prompting_strings) const
+    {
+        return prompter.getHints(name, prompting_strings);
+    }
+
+    void appendHintsMessage(String & error_message, const String & name) const
+    {
+        auto hints = getHints(name);
+        DB::appendHintsMessage(error_message, hints);
+    }
+
+    String getHintsMessage(const String & name) const
+    {
+        return getHintsErrorMessageSuffix(getHints(name));
+    }
+
+    IHints() = default;
+
+    IHints(const IHints &) = default;
+    IHints(IHints &&) noexcept = default;
+    IHints & operator=(const IHints &) = default;
+    IHints & operator=(IHints &&) noexcept = default;
 
     virtual ~IHints() = default;
 
 private:
     NamePrompter<MaxNumHints> prompter;
 };
-
 }

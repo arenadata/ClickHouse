@@ -1,50 +1,30 @@
 #include <Processors/QueryPlan/ITransformingStep.h>
-#include <Processors/QueryPipeline.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 
 namespace DB
 {
 
-ITransformingStep::ITransformingStep(DataStream input_stream, Block output_header, DataStreamTraits traits, bool collect_processors_)
-    : collect_processors(collect_processors_)
+ITransformingStep::ITransformingStep(SharedHeader input_header, SharedHeader output_header_, Traits traits, bool collect_processors_)
+    : transform_traits(std::move(traits.transform_traits))
+    , collect_processors(collect_processors_)
+    , data_stream_traits(std::move(traits.data_stream_traits))
 {
-    output_stream = DataStream{.header = std::move(output_header)};
-
-    if (traits.preserves_distinct_columns)
-        output_stream->distinct_columns = input_stream.distinct_columns;
-
-    output_stream->has_single_port = traits.returns_single_stream
-                                     || (input_stream.has_single_port && traits.preserves_number_of_streams);
-
-    input_streams.emplace_back(std::move(input_stream));
+    input_headers.emplace_back(std::move(input_header));
+    output_header = std::move(output_header_);
 }
 
-QueryPipelinePtr ITransformingStep::updatePipeline(QueryPipelines pipelines)
+QueryPipelineBuilderPtr ITransformingStep::updatePipeline(QueryPipelineBuilders pipelines, const BuildQueryPipelineSettings & settings)
 {
     if (collect_processors)
     {
         QueryPipelineProcessorsCollector collector(*pipelines.front(), this);
-        transformPipeline(*pipelines.front());
+        transformPipeline(*pipelines.front(), settings);
         processors = collector.detachProcessors();
     }
     else
-        transformPipeline(*pipelines.front());
+        transformPipeline(*pipelines.front(), settings);
 
     return std::move(pipelines.front());
-}
-
-void ITransformingStep::updateDistinctColumns(const Block & res_header, NameSet & distinct_columns)
-{
-    if (distinct_columns.empty())
-        return;
-
-    for (const auto & column : res_header)
-    {
-        if (distinct_columns.count(column.name) == 0)
-        {
-            distinct_columns.clear();
-            break;
-        }
-    }
 }
 
 void ITransformingStep::describePipeline(FormatSettings & settings) const

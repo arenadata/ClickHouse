@@ -1,173 +1,150 @@
-#include "ClickHouseDictionarySource.h"
+#include <Dictionaries/ClickHouseDictionarySource.h>
 #include <memory>
 #include <Client/ConnectionPool.h>
-#include <DataStreams/RemoteBlockInputStream.h>
-#include <DataStreams/ConvertingBlockInputStream.h>
+#include <Common/CurrentThread.h>
+#include <Common/QueryScope.h>
+#include <Common/DateLUTImpl.h>
+#include <Common/RemoteHostFilter.h>
+#include <Processors/Sources/RemoteSource.h>
+#include <QueryPipeline/RemoteQueryExecutor.h>
+#include <Interpreters/ActionsDAG.h>
+#include <Processors/Transforms/ExpressionTransform.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
+#include <Storages/checkAndGetLiteralArgument.h>
 #include <IO/ConnectionTimeouts.h>
+#include <Interpreters/Session.h>
 #include <Interpreters/executeQuery.h>
+#include <Interpreters/Context.h>
+#include <Storages/NamedCollectionsHelpers.h>
 #include <Common/isLocalAddress.h>
-#include <common/logger_useful.h>
-#include "DictionarySourceFactory.h"
-#include "DictionaryStructure.h"
-#include "ExternalQueryBuilder.h"
-#include "readInvalidateQuery.h"
-#include "writeParenthesisedString.h"
-#include "DictionaryFactory.h"
-#include "DictionarySourceHelpers.h"
+#include <Common/logger_useful.h>
+#include <QueryPipeline/BlockIO.h>
+#include <Parsers/ParserQuery.h>
+#include <Parsers/parseQuery.h>
+#include <Dictionaries/DictionarySourceFactory.h>
+#include <Dictionaries/DictionaryStructure.h>
+#include <Dictionaries/ExternalQueryBuilder.h>
+#include <Dictionaries/readInvalidateQuery.h>
+#include <Dictionaries/DictionaryFactory.h>
+#include <Dictionaries/DictionarySourceHelpers.h>
 
 namespace DB
 {
+
 namespace ErrorCodes
 {
+    extern const int BAD_ARGUMENTS;
+    extern const int INCORRECT_QUERY;
 }
 
-
-static const size_t MAX_CONNECTIONS = 16;
-
-static ConnectionPoolWithFailoverPtr createPool(
-    const std::string & host,
-    UInt16 port,
-    bool secure,
-    const std::string & db,
-    const std::string & user,
-    const std::string & password)
+namespace
 {
-    ConnectionPoolPtrs pools;
-    pools.emplace_back(std::make_shared<ConnectionPool>(
-        MAX_CONNECTIONS,
-        host,
-        port,
-        db,
-        user,
-        password,
-        "ClickHouseDictionarySource",
-        Protocol::Compression::Enable,
-        secure ? Protocol::Secure::Enable : Protocol::Secure::Disable));
-    return std::make_shared<ConnectionPoolWithFailover>(pools, LoadBalancing::RANDOM);
-}
+    constexpr size_t MAX_CONNECTIONS = 16;
 
+    inline UInt16 getPortFromContext(ContextPtr context, bool secure)
+    {
+        return secure ? context->getTCPPortSecure().value_or(0) : context->getTCPPort();
+    }
+
+    ConnectionPoolWithFailoverPtr createPool(const ClickHouseDictionarySource::Configuration & configuration)
+    {
+        if (configuration.is_local)
+            return nullptr;
+
+        ConnectionPoolPtrs pools;
+        pools.emplace_back(std::make_shared<ConnectionPool>(
+            MAX_CONNECTIONS,
+            configuration.host,
+            configuration.port,
+            configuration.db,
+            configuration.user,
+            configuration.password,
+            configuration.proto_send_chunked,
+            configuration.proto_recv_chunked,
+            configuration.quota_key,
+            "", /* cluster */
+            "", /* cluster_secret */
+            "ClickHouseDictionarySource",
+            Protocol::Compression::Enable,
+            configuration.secure ? Protocol::Secure::Enable : Protocol::Secure::Disable,
+            "" /* bind_host */));
+
+        return std::make_shared<ConnectionPoolWithFailover>(pools, LoadBalancing::RANDOM);
+    }
+
+}
 
 ClickHouseDictionarySource::ClickHouseDictionarySource(
     const DictionaryStructure & dict_struct_,
-    const Poco::Util::AbstractConfiguration & config,
-    const std::string & path_to_settings,
-    const std::string & config_prefix,
+    const Configuration & configuration_,
     const Block & sample_block_,
-    const Context & context_)
+    ContextMutablePtr context_)
     : update_time{std::chrono::system_clock::from_time_t(0)}
     , dict_struct{dict_struct_}
-    , host{config.getString(config_prefix + ".host")}
-    , port(config.getInt(config_prefix + ".port"))
-    , secure(config.getBool(config_prefix + ".secure", false))
-    , user{config.getString(config_prefix + ".user", "")}
-    , password{config.getString(config_prefix + ".password", "")}
-    , db{config.getString(config_prefix + ".db", "")}
-    , table{config.getString(config_prefix + ".table")}
-    , where{config.getString(config_prefix + ".where", "")}
-    , update_field{config.getString(config_prefix + ".update_field", "")}
-    , invalidate_query{config.getString(config_prefix + ".invalidate_query", "")}
-    , query_builder{dict_struct, db, "", table, where, IdentifierQuotingStyle::Backticks}
+    , configuration{configuration_}
+    , query_builder(std::make_shared<ExternalQueryBuilder>(dict_struct, configuration.db, "", configuration.table, configuration.query, configuration.where, IdentifierQuotingStyle::Backticks))
     , sample_block{sample_block_}
     , context(context_)
-    , is_local{isLocalAddress({host, port}, secure ? context.getTCPPortSecure().value_or(0) : context.getTCPPort())}
-    , pool{is_local ? nullptr : createPool(host, port, secure, db, user, password)}
-    , load_all_query{query_builder.composeLoadAllQuery()}
+    , pool{createPool(configuration)}
+    , load_all_query{query_builder->composeLoadAllQuery()}
 {
-    /// We should set user info even for the case when the dictionary is loaded in-process (without TCP communication).
-    context.setUser(user, password, Poco::Net::SocketAddress("127.0.0.1", 0));
-    context = copyContextAndApplySettings(path_to_settings, context, config);
-
-    /// Query context is needed because some code in executeQuery function may assume it exists.
-    /// Current example is Context::getSampleBlockCache from InterpreterSelectWithUnionQuery::getSampleBlock.
-    context.makeQueryContext();
 }
-
 
 ClickHouseDictionarySource::ClickHouseDictionarySource(const ClickHouseDictionarySource & other)
     : update_time{other.update_time}
     , dict_struct{other.dict_struct}
-    , host{other.host}
-    , port{other.port}
-    , secure{other.secure}
-    , user{other.user}
-    , password{other.password}
-    , db{other.db}
-    , table{other.table}
-    , where{other.where}
-    , update_field{other.update_field}
-    , invalidate_query{other.invalidate_query}
+    , configuration{other.configuration}
     , invalidate_query_response{other.invalidate_query_response}
-    , query_builder{dict_struct, db, "", table, where, IdentifierQuotingStyle::Backticks}
+    , query_builder(std::make_shared<ExternalQueryBuilder>(dict_struct, configuration.db, "", configuration.table, configuration.query, configuration.where, IdentifierQuotingStyle::Backticks))
     , sample_block{other.sample_block}
-    , context(other.context)
-    , is_local{other.is_local}
-    , pool{is_local ? nullptr : createPool(host, port, secure, db, user, password)}
+    , context(Context::createCopy(other.context))
+    , pool{createPool(configuration)}
     , load_all_query{other.load_all_query}
 {
-    context.makeQueryContext();
 }
 
 std::string ClickHouseDictionarySource::getUpdateFieldAndDate()
 {
     if (update_time != std::chrono::system_clock::from_time_t(0))
     {
-        auto tmp_time = update_time;
+        time_t hr_time = std::chrono::system_clock::to_time_t(update_time) - configuration.update_lag;
+        std::string str_time = DateLUT::instance().timeToString(hr_time);
         update_time = std::chrono::system_clock::now();
-        time_t hr_time = std::chrono::system_clock::to_time_t(tmp_time) - 1;
-        std::string str_time = std::to_string(LocalDateTime(hr_time));
-        return query_builder.composeUpdateQuery(update_field, str_time);
+        return query_builder->composeUpdateQuery(configuration.update_field, str_time);
     }
-    else
-    {
-        update_time = std::chrono::system_clock::now();
-        return query_builder.composeLoadAllQuery();
-    }
+
+    update_time = std::chrono::system_clock::now();
+    return query_builder->composeLoadAllQuery();
 }
 
-BlockInputStreamPtr ClickHouseDictionarySource::loadAll()
+BlockIO ClickHouseDictionarySource::loadAll()
 {
-    /** Query to local ClickHouse is marked internal in order to avoid
-      *    the necessity of holding process_list_element shared pointer.
-      */
-    if (is_local)
-    {
-        auto stream = executeQuery(load_all_query, context, true).getInputStream();
-        /// FIXME res.in may implicitly use some objects owned be res, but them will be destructed after return
-        stream = std::make_shared<ConvertingBlockInputStream>(stream, sample_block, ConvertingBlockInputStream::MatchColumnsMode::Position);
-        return stream;
-    }
-    return std::make_shared<RemoteBlockInputStream>(pool, load_all_query, sample_block, context);
+    return createStreamForQuery(load_all_query);
 }
 
-BlockInputStreamPtr ClickHouseDictionarySource::loadUpdatedAll()
+BlockIO ClickHouseDictionarySource::loadUpdatedAll()
 {
-    std::string load_update_query = getUpdateFieldAndDate();
-    if (is_local)
-    {
-        auto stream = executeQuery(load_update_query, context, true).getInputStream();
-        stream = std::make_shared<ConvertingBlockInputStream>(stream, sample_block, ConvertingBlockInputStream::MatchColumnsMode::Position);
-        return stream;
-    }
-    return std::make_shared<RemoteBlockInputStream>(pool, load_update_query, sample_block, context);
+    String load_update_query = getUpdateFieldAndDate();
+    return createStreamForQuery(load_update_query);
 }
 
-BlockInputStreamPtr ClickHouseDictionarySource::loadIds(const std::vector<UInt64> & ids)
+BlockIO ClickHouseDictionarySource::loadIds(const VectorWithMemoryTracking<UInt64> & ids)
 {
-    return createStreamForSelectiveLoad(query_builder.composeLoadIdsQuery(ids));
+    return createStreamForQuery(query_builder->composeLoadIdsQuery(ids));
 }
 
 
-BlockInputStreamPtr ClickHouseDictionarySource::loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows)
+BlockIO ClickHouseDictionarySource::loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows)
 {
-    return createStreamForSelectiveLoad(
-        query_builder.composeLoadKeysQuery(key_columns, requested_rows, ExternalQueryBuilder::IN_WITH_TUPLES));
+    String query = query_builder->composeLoadKeysQuery(key_columns, requested_rows, ExternalQueryBuilder::IN_WITH_TUPLES);
+    return createStreamForQuery(query);
 }
 
 bool ClickHouseDictionarySource::isModified() const
 {
-    if (!invalidate_query.empty())
+    if (!configuration.invalidate_query.empty())
     {
-        auto response = doInvalidateQuery(invalidate_query);
+        auto response = doInvalidateQuery(configuration.invalidate_query);
         LOG_TRACE(log, "Invalidate query has returned: {}, previous value: {}", response, invalidate_query_response);
         if (invalidate_query_response == response)
             return false;
@@ -178,58 +155,187 @@ bool ClickHouseDictionarySource::isModified() const
 
 bool ClickHouseDictionarySource::hasUpdateField() const
 {
-    return !update_field.empty();
+    return !configuration.update_field.empty();
 }
 
 std::string ClickHouseDictionarySource::toString() const
 {
-    return "ClickHouse: " + db + '.' + table + (where.empty() ? "" : ", where: " + where);
+    const std::string & where = configuration.where;
+    return "ClickHouse: " + configuration.db + '.' + configuration.table + (where.empty() ? "" : ", where: " + where);
 }
 
-
-BlockInputStreamPtr ClickHouseDictionarySource::createStreamForSelectiveLoad(const std::string & query)
+BlockIO ClickHouseDictionarySource::createStreamForQuery(const String & query)
 {
-    if (is_local)
+    BlockIO io;
+
+    /// Sample block should not contain first row default values
+    auto empty_sample_block = std::make_shared<const Block>(sample_block.cloneEmpty());
+
+    /// Copy context because results of scalar subqueries potentially could be cached
+    auto context_copy = Context::createCopy(context);
+    context_copy->makeQueryContext();
+
+    const char * query_begin = query.data();
+    const char * query_end = query.data() + query.size();
+    ParserQuery parser(query_end);
+    ASTPtr ast = parseQuery(parser, query_begin, query_end, "Query for ClickHouse dictionary", 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+
+    if (!ast || ast->getQueryKind() != IAST::QueryKind::Select)
+        throw Exception(ErrorCodes::INCORRECT_QUERY, "Only SELECT query can be used as a dictionary source");
+
+    if (configuration.is_local)
     {
-        auto res = executeQuery(query, context, true).getInputStream();
-        res = std::make_shared<ConvertingBlockInputStream>(
-            res, sample_block, ConvertingBlockInputStream::MatchColumnsMode::Position);
-        return res;
+        context_copy->setCurrentQueryId({});
+
+        if (!CurrentThread::getGroup())
+            io.query_scope = QueryScope::create(context_copy);
+
+        io = executeQuery(query, context_copy, QueryFlags{ .internal = true }).second;
+
+        io.pipeline.convertStructureTo(empty_sample_block->getColumnsWithTypeAndName(), context_copy);
+    }
+    else
+    {
+        io.pipeline = QueryPipeline(std::make_shared<RemoteSource>(
+            std::make_shared<RemoteQueryExecutor>(pool, query, empty_sample_block, std::move(context_copy)), false, false, false));
     }
 
-    return std::make_shared<RemoteBlockInputStream>(pool, query, sample_block, context);
+    return io;
 }
 
 std::string ClickHouseDictionarySource::doInvalidateQuery(const std::string & request) const
 {
     LOG_TRACE(log, "Performing invalidate query");
-    if (is_local)
-    {
-        Context query_context = context;
-        auto input_block = executeQuery(request, query_context, true).getInputStream();
-        return readInvalidateQuery(*input_block);
-    }
-    else
-    {
-        /// We pass empty block to RemoteBlockInputStream, because we don't know the structure of the result.
-        Block invalidate_sample_block;
-        RemoteBlockInputStream invalidate_stream(pool, request, invalidate_sample_block, context);
-        return readInvalidateQuery(invalidate_stream);
-    }
-}
 
+    /// Copy context because results of scalar subqueries potentially could be cached
+    auto context_copy = Context::createCopy(context);
+    context_copy->makeQueryContext();
+    context_copy->setCurrentQueryId("");
+
+    if (configuration.is_local)
+    {
+        QueryScope query_scope;
+        if (!CurrentThread::getGroup())
+            query_scope = QueryScope::create(context_copy);
+
+        BlockIO io = executeQuery(request, context_copy, QueryFlags{ .internal = true }).second;
+        std::string result;
+        io.executeWithCallbacks([&]()
+        {
+            result = readInvalidateQuery(io.pipeline);
+        });
+        return result;
+    }
+
+    /// We pass empty block to RemoteQueryExecutor, because we don't know the structure of the result.
+    auto invalidate_sample_block = std::make_shared<const Block>(Block{});
+    QueryPipeline pipeline(std::make_shared<RemoteSource>(
+        std::make_shared<RemoteQueryExecutor>(pool, request, invalidate_sample_block, context_copy), false, false, false));
+    return readInvalidateQuery(pipeline);
+}
 
 void registerDictionarySourceClickHouse(DictionarySourceFactory & factory)
 {
-    auto create_table_source = [=](const DictionaryStructure & dict_struct,
+    auto create_table_source = [=](const String & /*name*/,
+                                 const DictionaryStructure & dict_struct,
                                  const Poco::Util::AbstractConfiguration & config,
                                  const std::string & config_prefix,
                                  Block & sample_block,
-                                 const Context & context,
-                                 bool /* check_config */) -> DictionarySourcePtr
+                                 ContextPtr global_context,
+                                 const std::string & default_database,
+                                 bool created_from_ddl) -> DictionarySourcePtr
     {
-        return std::make_unique<ClickHouseDictionarySource>(dict_struct, config, config_prefix, config_prefix + ".clickhouse", sample_block, context);
+        using Configuration = ClickHouseDictionarySource::Configuration;
+        std::optional<Configuration> configuration;
+
+        std::string settings_config_prefix = config_prefix + ".clickhouse";
+        auto named_collection = created_from_ddl ? tryGetNamedCollectionWithOverrides(config, settings_config_prefix, global_context) : nullptr;
+
+        if (named_collection)
+        {
+            validateNamedCollection(
+                *named_collection, {}, ValidateKeysMultiset<ExternalDatabaseEqualKeysSet>{
+                    "secure", "host", "hostname", "port", "user", "username", "password", "proto_send_chunked", "proto_recv_chunked", "quota_key", "name",
+                    "db", "database", "table","query", "where", "invalidate_query", "update_field", "update_lag"});
+
+            const auto secure = named_collection->getOrDefault("secure", false);
+            const auto default_port = getPortFromContext(global_context, secure);
+            const auto host = named_collection->getAnyOrDefault<String>({"host", "hostname"}, "localhost");
+            const auto port = static_cast<UInt16>(named_collection->getOrDefault<UInt64>("port", default_port));
+
+            configuration.emplace(Configuration{
+                .host = host,
+                .user = named_collection->getAnyOrDefault<String>({"user", "username"}, "default"),
+                .password = named_collection->getOrDefault<String>("password", ""),
+                .proto_send_chunked = named_collection->getOrDefault<String>("proto_send_chunked", "notchunked"),
+                .proto_recv_chunked = named_collection->getOrDefault<String>("proto_recv_chunked", "notchunked"),
+                .quota_key = named_collection->getOrDefault<String>("quota_key", ""),
+                .db = named_collection->getAnyOrDefault<String>({"db", "database"}, default_database),
+                .table = named_collection->getOrDefault<String>("table", ""),
+                .query = named_collection->getOrDefault<String>("query", ""),
+                .where = named_collection->getOrDefault<String>("where", ""),
+                .invalidate_query = named_collection->getOrDefault<String>("invalidate_query", ""),
+                .update_field = named_collection->getOrDefault<String>("update_field", ""),
+                .update_lag = named_collection->getOrDefault<UInt64>("update_lag", 1),
+                .port = port,
+                .is_local = isLocalAddress({host, port}, default_port),
+                .secure = secure,
+            });
+        }
+        else
+        {
+            const auto secure = config.getBool(settings_config_prefix + ".secure", false);
+            const auto default_port = getPortFromContext(global_context, secure);
+            const auto host = config.getString(settings_config_prefix + ".host", "localhost");
+            const auto port = static_cast<UInt16>(config.getUInt(settings_config_prefix + ".port", default_port));
+
+            configuration.emplace(Configuration{
+                .host = host,
+                .user = config.getString(settings_config_prefix + ".user", "default"),
+                .password = config.getString(settings_config_prefix + ".password", ""),
+                .proto_send_chunked = config.getString(settings_config_prefix + ".proto_caps.send", "notchunked"),
+                .proto_recv_chunked = config.getString(settings_config_prefix + ".proto_caps.recv", "notchunked"),
+                .quota_key = config.getString(settings_config_prefix + ".quota_key", ""),
+                .db = config.getString(settings_config_prefix + ".db", default_database),
+                .table = config.getString(settings_config_prefix + ".table", ""),
+                .query = config.getString(settings_config_prefix + ".query", ""),
+                .where = config.getString(settings_config_prefix + ".where", ""),
+                .invalidate_query = config.getString(settings_config_prefix + ".invalidate_query", ""),
+                .update_field = config.getString(settings_config_prefix + ".update_field", ""),
+                .update_lag = config.getUInt64(settings_config_prefix + ".update_lag", 1),
+                .port = port,
+                .is_local = isLocalAddress({host, port}, default_port),
+                .secure = secure,
+            });
+        }
+
+        ContextMutablePtr context;
+        if (configuration->is_local)
+        {
+            /// We should set user info even for the case when the dictionary is loaded in-process (without TCP communication).
+            Session session(global_context, ClientInfo::Interface::LOCAL);
+            session.authenticate(configuration->user, configuration->password, Poco::Net::SocketAddress{});
+            context = session.makeQueryContext();
+        }
+        else
+        {
+            context = Context::createCopy(global_context);
+
+            if (created_from_ddl)
+                context->getRemoteHostFilter().checkHostAndPort(configuration->host, toString(configuration->port));
+        }
+
+        context->applySettingsChanges(readSettingsFromDictionaryConfig(config, config_prefix));
+
+        String dictionary_name = config.getString(".dictionary.name", "");
+        String dictionary_database = config.getString(".dictionary.database", "");
+
+        if (dictionary_name == configuration->table && dictionary_database == configuration->db)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ClickHouseDictionarySource table cannot be dictionary table");
+
+        return std::make_unique<ClickHouseDictionarySource>(dict_struct, *configuration, sample_block, context);
     };
+
     factory.registerSource("clickhouse", create_table_source);
 }
 

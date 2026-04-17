@@ -6,28 +6,26 @@
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnTuple.h>
-#include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeTuple.h>
 #include <DataTypes/DataTypesNumber.h>
-
-#include <string>
 
 
 namespace DB
 {
-
 namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
 }
 
+namespace
+{
 
 // geohashDecode(string) => (lon float64, lat float64)
 class FunctionGeohashDecode : public IFunction
 {
 public:
     static constexpr auto name = "geohashDecode";
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionGeohashDecode>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionGeohashDecode>(); }
 
     String getName() const override
     {
@@ -36,10 +34,14 @@ public:
 
     size_t getNumberOfArguments() const override { return 1; }
     bool useDefaultImplementationForConstants() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
+    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
-        validateArgumentType(*this, arguments, 0, isStringOrFixedString, "string or fixed string");
+        FunctionArgumentDescriptors args{
+            {"encoded", static_cast<FunctionArgumentDescriptor::TypeValidator>(&isStringOrFixedString), nullptr, "String or FixedString"}
+        };
+        validateFunctionArguments(*this, arguments, args);
 
         return std::make_shared<DataTypeTuple>(
                 DataTypes{std::make_shared<DataTypeFloat64>(), std::make_shared<DataTypeFloat64>()},
@@ -47,24 +49,22 @@ public:
     }
 
     template <typename ColumnTypeEncoded>
-    bool tryExecute(const IColumn * encoded_column, ColumnPtr & result_column)
+    bool tryExecute(const IColumn * encoded_column, ColumnPtr & result_column, size_t input_rows_count) const
     {
         const auto * encoded = checkAndGetColumn<ColumnTypeEncoded>(encoded_column);
         if (!encoded)
             return false;
 
-        const size_t count = encoded->size();
-
-        auto latitude = ColumnFloat64::create(count);
-        auto longitude = ColumnFloat64::create(count);
+        auto latitude = ColumnFloat64::create(input_rows_count);
+        auto longitude = ColumnFloat64::create(input_rows_count);
 
         ColumnFloat64::Container & lon_data = longitude->getData();
         ColumnFloat64::Container & lat_data = latitude->getData();
 
-        for (size_t i = 0; i < count; ++i)
+        for (size_t i = 0; i < input_rows_count; ++i)
         {
-            StringRef encoded_string = encoded->getDataAt(i);
-            geohashDecode(encoded_string.data, encoded_string.size, &lon_data[i], &lat_data[i]);
+            std::string_view encoded_string = encoded->getDataAt(i);
+            geohashDecode(encoded_string.data(), encoded_string.size(), &lon_data[i], &lat_data[i]);
         }
 
         MutableColumns result;
@@ -75,25 +75,50 @@ public:
         return true;
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        const IColumn * encoded = block.getByPosition(arguments[0]).column.get();
-        ColumnPtr & res_column = block.getByPosition(result).column;
+        const IColumn * encoded = arguments[0].column.get();
+        ColumnPtr res_column;
 
-        if (tryExecute<ColumnString>(encoded, res_column) ||
-            tryExecute<ColumnFixedString>(encoded, res_column))
-            return;
+        if (tryExecute<ColumnString>(encoded, res_column, input_rows_count) ||
+            tryExecute<ColumnFixedString>(encoded, res_column, input_rows_count))
+            return res_column;
 
-        throw Exception("Unsupported argument type:" + block.getByPosition(arguments[0]).column->getName()
-                        + " of argument of function " + getName(),
-                        ErrorCodes::ILLEGAL_COLUMN);
+        throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Unsupported argument type:{} of argument of function {}",
+                        arguments[0].column->getName(), getName());
     }
 };
 
+}
 
-void registerFunctionGeohashDecode(FunctionFactory & factory)
+REGISTER_FUNCTION(GeohashDecode)
 {
-    factory.registerFunction<FunctionGeohashDecode>();
+    FunctionDocumentation::Description description = R"(
+Decodes any [geohash](https://en.wikipedia.org/wiki/Geohash)-encoded string into longitude and latitude coordinates.
+    )";
+    FunctionDocumentation::Syntax syntax = "geohashDecode(hash_str)";
+    FunctionDocumentation::Arguments arguments = {
+        {"hash_str", "Geohash-encoded string to decode.", {"String", "FixedString"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {
+        "Returns a tuple of `(longitude, latitude)` with `Float64` precision.",
+        {"Tuple(Float64, Float64)"}
+    };
+    FunctionDocumentation::Examples examples = {
+        {
+            "Basic usage",
+            "SELECT geohashDecode('ezs42') AS res",
+            R"(
+┌─res─────────────────────────────┐
+│ (-5.60302734375,42.60498046875) │
+└─────────────────────────────────┘
+            )"
+        }
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {20, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Geo;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction<FunctionGeohashDecode>(documentation);
 }
 
 }

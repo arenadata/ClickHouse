@@ -1,10 +1,12 @@
 ---
-toc_priority: 58
-toc_title: Expression
+description: 'Documentation for the Expression special data type'
+sidebar_label: 'Expression'
+sidebar_position: 58
+slug: /sql-reference/data-types/special-data-types/expression
+title: 'Expression'
+doc_type: 'reference'
 ---
 
-# Expression {#expression}
+# Expression
 
 Expressions are used for representing lambdas in high-order functions.
-
-[Original article](https://clickhouse.tech/docs/en/data_types/special_data_types/expression/) <!--hide-->

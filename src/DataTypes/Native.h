@@ -1,145 +1,117 @@
 #pragma once
 
-#if !defined(ARCADIA_BUILD)
-#    include "config_core.h"
-#endif
+#include "config.h"
+#include <DataTypes/DataTypesDecimal.h>
 
 #if USE_EMBEDDED_COMPILER
-#    include <DataTypes/DataTypeDate.h>
-#    include <DataTypes/DataTypeDateTime.h>
-#    include <DataTypes/DataTypeFixedString.h>
-#    include <DataTypes/DataTypeInterval.h>
-#    include <DataTypes/DataTypeNullable.h>
-#    include <DataTypes/DataTypeUUID.h>
-#    include <DataTypes/DataTypesNumber.h>
-#    include <Common/typeid_cast.h>
+#    include <Common/Exception.h>
+#    include <Core/ValueWithType.h>
+#    include <DataTypes/IDataType.h>
 
-#    pragma GCC diagnostic push
-#    pragma GCC diagnostic ignored "-Wunused-parameter"
-
-#    include <llvm/IR/IRBuilder.h>
-
-#    pragma GCC diagnostic pop
+namespace llvm
+{
+    class IRBuilderBase;
+    class Type;
+    class Value;
+    class Constant;
+}
 
 
 namespace DB
 {
+
 namespace ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
+    extern const int LOGICAL_ERROR;
 }
 
-template <typename... Ts>
-static inline bool typeIsEither(const IDataType & type)
+/// Returns true if type is signed, false otherwise
+bool typeIsSigned(const IDataType & type);
+
+/// Cast LLVM type to nullable LLVM type
+llvm::Type * toNullableType(llvm::IRBuilderBase & builder, llvm::Type * type);
+
+/// Returns true if type can be native LLVM type, false otherwise
+bool canBeNativeType(const IDataType & type);
+
+/// Returns true if type can be native LLVM type, false otherwise
+bool canBeNativeType(const DataTypePtr & type);
+
+/// LLVM supports up to 128-bit integers on x86_64 and AArch64
+#define MAX_NATIVE_INT_SIZE 16
+
+template <typename Type>
+static constexpr bool canBeNativeType()
 {
-    return (typeid_cast<const Ts *>(&type) || ...);
+    if constexpr (std::is_same_v<Type, Float32> || std::is_same_v<Type, Float64>)
+        return true;
+    else if constexpr (is_integer<Type> && sizeof(Type) <= MAX_NATIVE_INT_SIZE)
+        return true;
+    else if constexpr (is_decimal<Type> && sizeof(Type) <= MAX_NATIVE_INT_SIZE)
+        return true;
+    else
+        return false;
 }
 
-static inline bool typeIsSigned(const IDataType & type)
+/// Cast type to native LLVM type
+llvm::Type * toNativeType(llvm::IRBuilderBase & builder, const IDataType & type);
+
+/// Cast type to native LLVM type
+llvm::Type * toNativeType(llvm::IRBuilderBase & builder, const DataTypePtr & type);
+
+/// Cast type to native LLVM type (template version, defined in Native.cpp)
+template <typename ToType>
+llvm::Type * toNativeType(llvm::IRBuilderBase & builder);
+
+template <typename ToType>
+static inline DataTypePtr toNativeDataType()
 {
-    return typeIsEither<
-        DataTypeInt8, DataTypeInt16, DataTypeInt32, DataTypeInt64,
-        DataTypeFloat32, DataTypeFloat64, DataTypeInterval
-    >(type);
+    if constexpr (std::is_same_v<ToType, Int8> || std::is_same_v<ToType, UInt8> ||
+        std::is_same_v<ToType, Int16> || std::is_same_v<ToType, UInt16> ||
+        std::is_same_v<ToType, Int32> || std::is_same_v<ToType, UInt32> ||
+        std::is_same_v<ToType, Int64> || std::is_same_v<ToType, UInt64> ||
+        std::is_same_v<ToType, Int128> || std::is_same_v<ToType, UInt128> ||
+        std::is_same_v<ToType, Int256> || std::is_same_v<ToType, UInt256> ||
+        std::is_same_v<ToType, Float32> || std::is_same_v<ToType, Float64>)
+        return std::make_shared<DataTypeNumber<ToType>>();
+    else if constexpr (std::is_same_v<ToType, DateTime64>)
+        return std::make_shared<DataTypeDateTime64>(0);
+    else if constexpr (std::is_same_v<ToType, Decimal32>)
+        return createDecimalMaxPrecision<Decimal32>(0);
+    else if constexpr (std::is_same_v<ToType, Decimal64>)
+        return createDecimalMaxPrecision<Decimal64>(0);
+    else if constexpr (std::is_same_v<ToType, Decimal128>)
+        return createDecimalMaxPrecision<Decimal128>(0);
+    else if constexpr (std::is_same_v<ToType, Decimal256>)
+        return createDecimalMaxPrecision<Decimal256>(0);
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid cast to native data type");
 }
 
-static inline llvm::Type * toNativeType(llvm::IRBuilderBase & builder, const IDataType & type)
+/// Cast LLVM value with type to bool
+llvm::Value * nativeBoolCast(llvm::IRBuilderBase & b, const DataTypePtr & from_type, llvm::Value * value);
+
+/// Cast LLVM value with type to bool
+llvm::Value * nativeBoolCast(llvm::IRBuilderBase & b, const ValueWithType & value_with_type);
+
+/// Cast LLVM value with type to specified type
+llvm::Value * nativeCast(llvm::IRBuilderBase & b, const DataTypePtr & from_type, llvm::Value * value, const DataTypePtr & to_type);
+
+/// Cast LLVM value with type to specified type
+llvm::Value * nativeCast(llvm::IRBuilderBase & b, const ValueWithType & value, const DataTypePtr & to_type);
+
+template <typename FromType>
+static inline llvm::Value * nativeCast(llvm::IRBuilderBase & b, llvm::Value * value, const DataTypePtr & to)
 {
-    if (auto * nullable = typeid_cast<const DataTypeNullable *>(&type))
-    {
-        auto * wrapped = toNativeType(builder, *nullable->getNestedType());
-        return wrapped ? llvm::StructType::get(wrapped, /* is null = */ builder.getInt1Ty()) : nullptr;
-    }
-    /// LLVM doesn't have unsigned types, it has unsigned instructions.
-    if (typeIsEither<DataTypeInt8, DataTypeUInt8>(type))
-        return builder.getInt8Ty();
-    if (typeIsEither<DataTypeInt16, DataTypeUInt16, DataTypeDate>(type))
-        return builder.getInt16Ty();
-    if (typeIsEither<DataTypeInt32, DataTypeUInt32, DataTypeDateTime>(type))
-        return builder.getInt32Ty();
-    if (typeIsEither<DataTypeInt64, DataTypeUInt64, DataTypeInterval>(type))
-        return builder.getInt64Ty();
-    if (typeIsEither<DataTypeUUID>(type))
-        return builder.getInt128Ty();
-    if (typeIsEither<DataTypeFloat32>(type))
-        return builder.getFloatTy();
-    if (typeIsEither<DataTypeFloat64>(type))
-        return builder.getDoubleTy();
-    if (auto * fixed_string = typeid_cast<const DataTypeFixedString *>(&type))
-        return llvm::VectorType::get(builder.getInt8Ty(), fixed_string->getN());
-    return nullptr;
+    auto native_data_type = toNativeDataType<FromType>();
+    return nativeCast(b, native_data_type, value, to);
 }
 
-static inline bool canBeNativeType(const IDataType & type)
-{
-    if (auto * nullable = typeid_cast<const DataTypeNullable *>(&type))
-        return canBeNativeType(*nullable->getNestedType());
+/// Get column value for specified index as LLVM constant
+llvm::Constant * getColumnNativeValue(llvm::IRBuilderBase & builder, const DataTypePtr & column_type, const IColumn & column, size_t index);
 
-    return typeIsEither<DataTypeInt8, DataTypeUInt8>(type)
-        || typeIsEither<DataTypeInt16, DataTypeUInt16, DataTypeDate>(type)
-        || typeIsEither<DataTypeInt32, DataTypeUInt32, DataTypeDateTime>(type)
-        || typeIsEither<DataTypeInt64, DataTypeUInt64, DataTypeInterval>(type)
-        || typeIsEither<DataTypeUUID>(type)
-        || typeIsEither<DataTypeFloat32>(type)
-        || typeIsEither<DataTypeFloat64>(type)
-        || typeid_cast<const DataTypeFixedString *>(&type);
-}
-
-static inline llvm::Type * toNativeType(llvm::IRBuilderBase & builder, const DataTypePtr & type)
-{
-    return toNativeType(builder, *type);
-}
-
-static inline llvm::Value * nativeBoolCast(llvm::IRBuilder<> & b, const DataTypePtr & from, llvm::Value * value)
-{
-    if (from->isNullable())
-    {
-        auto * inner = nativeBoolCast(b, removeNullable(from), b.CreateExtractValue(value, {0}));
-        return b.CreateAnd(b.CreateNot(b.CreateExtractValue(value, {1})), inner);
-    }
-    auto * zero = llvm::Constant::getNullValue(value->getType());
-    if (value->getType()->isIntegerTy())
-        return b.CreateICmpNE(value, zero);
-    if (value->getType()->isFloatingPointTy())
-        return b.CreateFCmpONE(value, zero); /// QNaN is false
-    throw Exception("Cannot cast non-number " + from->getName() + " to bool", ErrorCodes::NOT_IMPLEMENTED);
-}
-
-static inline llvm::Value * nativeCast(llvm::IRBuilder<> & b, const DataTypePtr & from, llvm::Value * value, llvm::Type * to)
-{
-    auto * n_from = value->getType();
-    if (n_from == to)
-        return value;
-    if (n_from->isIntegerTy() && to->isFloatingPointTy())
-        return typeIsSigned(*from) ? b.CreateSIToFP(value, to) : b.CreateUIToFP(value, to);
-    if (n_from->isFloatingPointTy() && to->isIntegerTy())
-        return typeIsSigned(*from) ? b.CreateFPToSI(value, to) : b.CreateFPToUI(value, to);
-    if (n_from->isIntegerTy() && to->isIntegerTy())
-        return b.CreateIntCast(value, to, typeIsSigned(*from));
-    if (n_from->isFloatingPointTy() && to->isFloatingPointTy())
-        return b.CreateFPCast(value, to);
-    throw Exception("Cannot cast " + from->getName() + " to requested type", ErrorCodes::NOT_IMPLEMENTED);
-}
-
-static inline llvm::Value * nativeCast(llvm::IRBuilder<> & b, const DataTypePtr & from, llvm::Value * value, const DataTypePtr & to)
-{
-    auto * n_to = toNativeType(b, to);
-    if (value->getType() == n_to)
-        return value;
-    if (from->isNullable() && to->isNullable())
-    {
-        auto * inner = nativeCast(b, removeNullable(from), b.CreateExtractValue(value, {0}), to);
-        return b.CreateInsertValue(inner, b.CreateExtractValue(value, {1}), {1});
-    }
-    if (from->isNullable())
-        return nativeCast(b, removeNullable(from), b.CreateExtractValue(value, {0}), to);
-    if (to->isNullable())
-    {
-        auto * inner = nativeCast(b, from, value, removeNullable(to));
-        return b.CreateInsertValue(llvm::Constant::getNullValue(n_to), inner, {0});
-    }
-    return nativeCast(b, from, value, n_to);
-}
+/// Get value for specified field as LLVM constant
+llvm::Constant * getNativeValue(llvm::IRBuilderBase & builder, const DataTypePtr & column_type, const Field & field);
 
 }
 

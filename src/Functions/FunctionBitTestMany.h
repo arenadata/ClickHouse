@@ -2,10 +2,10 @@
 
 #include <DataTypes/DataTypesNumber.h>
 #include <Columns/ColumnVector.h>
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionHelpers.h>
-#include <IO/WriteHelpers.h>
-#include <ext/range.h>
+#include <Interpreters/Context_fwd.h>
+#include <base/range.h>
 
 
 namespace DB
@@ -15,6 +15,7 @@ namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
     extern const int ILLEGAL_TYPE_OF_ARGUMENT;
+    extern const int PARAMETER_OUT_OF_BOUND;
     extern const int TOO_FEW_ARGUMENTS_FOR_FUNCTION;
 }
 
@@ -24,126 +25,132 @@ struct FunctionBitTestMany : public IFunction
 {
 public:
     static constexpr auto name = Name::name;
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionBitTestMany>(); }
+    static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionBitTestMany>(); }
 
     String getName() const override { return name; }
 
     bool isVariadic() const override { return true; }
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
     size_t getNumberOfArguments() const override { return 0; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
     {
         if (arguments.size() < 2)
-            throw Exception{"Number of arguments for function " + getName() + " doesn't match: passed "
-                + toString(arguments.size()) + ", should be at least 2.", ErrorCodes::TOO_FEW_ARGUMENTS_FOR_FUNCTION};
+            throw Exception(ErrorCodes::TOO_FEW_ARGUMENTS_FOR_FUNCTION, "Number of arguments for function {} doesn't match: "
+                "passed {}, should be at least 2.", getName(), arguments.size());
 
         const auto & first_arg = arguments.front();
 
         if (!isInteger(first_arg))
-            throw Exception{"Illegal type " + first_arg->getName() + " of first argument of function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
+            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of first argument of function {}", first_arg->getName(), getName());
 
 
-        for (const auto i : ext::range(1, arguments.size()))
+        for (size_t i = 1; i < arguments.size(); ++i)
         {
             const auto & pos_arg = arguments[i];
 
-            if (!isUnsignedInteger(pos_arg))
-                throw Exception{"Illegal type " + pos_arg->getName() + " of " + toString(i) + " argument of function " + getName(), ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT};
+            if (!isUInt(pos_arg))
+                throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "Illegal type {} of {} argument of function {}", pos_arg->getName(), i, getName());
         }
 
         return std::make_shared<DataTypeUInt8>();
     }
 
-    void executeImpl(Block & block , const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
+    DataTypePtr getReturnTypeForDefaultImplementationForDynamic() const override
     {
-        const auto value_col = block.getByPosition(arguments.front()).column.get();
+        return std::make_shared<DataTypeUInt8>();
+    }
 
-        if (!execute<UInt8>(block, arguments, result, value_col)
-            && !execute<UInt16>(block, arguments, result, value_col)
-            && !execute<UInt32>(block, arguments, result, value_col)
-            && !execute<UInt64>(block, arguments, result, value_col)
-            && !execute<Int8>(block, arguments, result, value_col)
-            && !execute<Int16>(block, arguments, result, value_col)
-            && !execute<Int32>(block, arguments, result, value_col)
-            && !execute<Int64>(block, arguments, result, value_col))
-            throw Exception{"Illegal column " + value_col->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN};
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const override
+    {
+        const auto * value_col = arguments.front().column.get();
+
+        ColumnPtr res;
+        if (!((res = execute<UInt8>(arguments, result_type, value_col, input_rows_count))
+            || (res = execute<UInt16>(arguments, result_type, value_col, input_rows_count))
+            || (res = execute<UInt32>(arguments, result_type, value_col, input_rows_count))
+            || (res = execute<UInt64>(arguments, result_type, value_col, input_rows_count))
+            || (res = execute<Int8>(arguments, result_type, value_col, input_rows_count))
+            || (res = execute<Int16>(arguments, result_type, value_col, input_rows_count))
+            || (res = execute<Int32>(arguments, result_type, value_col, input_rows_count))
+            || (res = execute<Int64>(arguments, result_type, value_col, input_rows_count))))
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}", value_col->getName(), getName());
+
+        return res;
     }
 
 private:
     template <typename T>
-    bool execute(
-        Block & block, const ColumnNumbers & arguments, const size_t result,
-        const IColumn * const value_col_untyped)
+    ColumnPtr execute(
+            const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
+            const IColumn * const value_col_untyped,
+            size_t input_rows_count) const
     {
         if (const auto value_col = checkAndGetColumn<ColumnVector<T>>(value_col_untyped))
         {
-            const auto size = value_col->size();
             bool is_const;
-            const auto const_mask = createConstMaskIfConst<T>(block, arguments, is_const);
+            const auto const_mask = createConstMaskIfConst<T>(arguments, is_const);
             const auto & val = value_col->getData();
 
-            auto out_col = ColumnVector<UInt8>::create(size);
+            auto out_col = ColumnVector<UInt8>::create(input_rows_count);
             auto & out = out_col->getData();
 
             if (is_const)
             {
-                for (const auto i : ext::range(0, size))
+                for (size_t i = 0; i < input_rows_count; ++i)
                     out[i] = Impl::apply(val[i], const_mask);
             }
             else
             {
-                const auto mask = createMask<T>(size, block, arguments);
+                const auto mask = createMask<T>(input_rows_count, arguments);
 
-                for (const auto i : ext::range(0, size))
+                for (size_t i = 0; i < input_rows_count; ++i)
                     out[i] = Impl::apply(val[i], mask[i]);
             }
 
-            block.getByPosition(result).column = std::move(out_col);
-            return true;
+            return out_col;
         }
-        else if (const auto value_col_const = checkAndGetColumnConst<ColumnVector<T>>(value_col_untyped))
+        if (const auto value_col_const = checkAndGetColumnConst<ColumnVector<T>>(value_col_untyped))
         {
-            const auto size = value_col_const->size();
             bool is_const;
-            const auto const_mask = createConstMaskIfConst<T>(block, arguments, is_const);
+            const auto const_mask = createConstMaskIfConst<T>(arguments, is_const);
             const auto val = value_col_const->template getValue<T>();
 
             if (is_const)
             {
-                block.getByPosition(result).column = block.getByPosition(result).type->createColumnConst(size, toField(Impl::apply(val, const_mask)));
-            }
-            else
-            {
-                const auto mask = createMask<T>(size, block, arguments);
-                auto out_col = ColumnVector<UInt8>::create(size);
-
-                auto & out = out_col->getData();
-
-                for (const auto i : ext::range(0, size))
-                    out[i] = Impl::apply(val, mask[i]);
-
-                block.getByPosition(result).column = std::move(out_col);
+                return result_type->createColumnConst(input_rows_count, toField(Impl::apply(val, const_mask)));
             }
 
-            return true;
+            const auto mask = createMask<T>(input_rows_count, arguments);
+            auto out_col = ColumnVector<UInt8>::create(input_rows_count);
+
+            auto & out = out_col->getData();
+
+            for (size_t i = 0; i < input_rows_count; ++i)
+                out[i] = Impl::apply(val, mask[i]);
+
+            return out_col;
         }
 
-        return false;
+        return nullptr;
     }
 
     template <typename ValueType>
-    ValueType createConstMaskIfConst(const Block & block, const ColumnNumbers & arguments, bool & out_is_const)
+    ValueType createConstMaskIfConst(const ColumnsWithTypeAndName & arguments, bool & out_is_const) const
     {
         out_is_const = true;
         ValueType mask = 0;
 
-        for (const auto i : ext::range(1, arguments.size()))
+        for (size_t i = 1; i < arguments.size(); ++i)
         {
-            if (auto pos_col_const = checkAndGetColumnConst<ColumnVector<ValueType>>(block.getByPosition(arguments[i]).column.get()))
+            if (auto pos_col_const = checkAndGetColumnConst<ColumnVector<ValueType>>(arguments[i].column.get()))
             {
                 const auto pos = pos_col_const->getUInt(0);
                 if (pos < 8 * sizeof(ValueType))
-                    mask = mask | (ValueType(1) << pos);
+                    mask = static_cast<ValueType>(mask | (static_cast<ValueType>(1) << pos));
+                else
+                    throw Exception(ErrorCodes::PARAMETER_OUT_OF_BOUND,
+                                   "The bit position argument {} is out of bounds for number", static_cast<UInt64>(pos));
             }
             else
             {
@@ -156,44 +163,53 @@ private:
     }
 
     template <typename ValueType>
-    PaddedPODArray<ValueType> createMask(const size_t size, const Block & block, const ColumnNumbers & arguments)
+    PaddedPODArray<ValueType> createMask(const size_t size, const ColumnsWithTypeAndName & arguments) const
     {
         PaddedPODArray<ValueType> mask(size, ValueType{});
 
-        for (const auto i : ext::range(1, arguments.size()))
+        for (size_t i = 1; i < arguments.size(); ++i)
         {
-            const auto pos_col = block.getByPosition(arguments[i]).column.get();
+            const auto * pos_col = arguments[i].column.get();
 
             if (!addToMaskImpl<UInt8>(mask, pos_col)
                 && !addToMaskImpl<UInt16>(mask, pos_col)
                 && !addToMaskImpl<UInt32>(mask, pos_col)
                 && !addToMaskImpl<UInt64>(mask, pos_col))
-                throw Exception{"Illegal column " + pos_col->getName() + " of argument of function " + getName(), ErrorCodes::ILLEGAL_COLUMN};
+                throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Illegal column {} of argument of function {}", pos_col->getName(), getName());
         }
 
         return mask;
     }
 
     template <typename PosType, typename ValueType>
-    bool NO_SANITIZE_UNDEFINED addToMaskImpl(PaddedPODArray<ValueType> & mask, const IColumn * const pos_col_untyped)
+    bool NO_SANITIZE_UNDEFINED addToMaskImpl(PaddedPODArray<ValueType> & mask, const IColumn * const pos_col_untyped) const
     {
         if (const auto pos_col = checkAndGetColumn<ColumnVector<PosType>>(pos_col_untyped))
         {
             const auto & pos = pos_col->getData();
 
-            for (const auto i : ext::range(0, mask.size()))
+            for (size_t i = 0; i < mask.size(); ++i)
                 if (pos[i] < 8 * sizeof(ValueType))
-                    mask[i] = mask[i] | (ValueType(1) << pos[i]);
+                    mask[i] = static_cast<ValueType>(mask[i] | (static_cast<ValueType>(1) << pos[i]));
+                else
+                    throw Exception(ErrorCodes::PARAMETER_OUT_OF_BOUND,
+                                    "The bit position argument {} is out of bounds for number", static_cast<UInt64>(pos[i]));
 
             return true;
         }
-        else if (const auto pos_col_const = checkAndGetColumnConst<ColumnVector<PosType>>(pos_col_untyped))
+        if (const auto pos_col_const = checkAndGetColumnConst<ColumnVector<PosType>>(pos_col_untyped))
         {
             const auto & pos = pos_col_const->template getValue<PosType>();
-            const auto new_mask = pos < 8 * sizeof(ValueType) ? ValueType(1) << pos : 0;
+            if (pos >= 8 * sizeof(ValueType))
+                throw Exception(
+                    ErrorCodes::PARAMETER_OUT_OF_BOUND,
+                    "The bit position argument {} is out of bounds for number",
+                    static_cast<UInt64>(pos));
 
-            for (const auto i : ext::range(0, mask.size()))
-                mask[i] = mask[i] | new_mask;
+            const auto new_mask = ValueType(1) << pos;
+
+            for (size_t i = 0; i < mask.size(); ++i)
+                mask[i] = static_cast<ValueType>(mask[i] | new_mask);
 
             return true;
         }

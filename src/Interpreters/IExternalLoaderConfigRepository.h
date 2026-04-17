@@ -23,7 +23,7 @@ class IExternalLoaderConfigRepository
 {
 public:
     /// Returns the name of the repository.
-    virtual const std::string & getName() const = 0;
+    virtual std::string getName() const = 0;
 
     /// Whether this repository is temporary:
     /// it's created and destroyed while executing the same query.
@@ -37,12 +37,12 @@ public:
     virtual bool exists(const std::string & path) = 0;
 
     /// Returns entity last update time
-    virtual Poco::Timestamp getUpdateTime(const std::string & path) = 0;
+    virtual std::optional<Poco::Timestamp> getUpdateTime(const std::string & /* path */) { return {}; }
 
     /// Load configuration from some concrete source to AbstractConfiguration
     virtual LoadablesConfigurationPtr load(const std::string & path) = 0;
 
-    virtual ~IExternalLoaderConfigRepository() {}
+    virtual ~IExternalLoaderConfigRepository() = default;
 };
 
 }

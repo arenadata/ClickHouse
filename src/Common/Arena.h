@@ -1,16 +1,18 @@
 #pragma once
 
-#include <string.h>
+#include <cstring>
 #include <memory>
 #include <vector>
-#include <boost/noncopyable.hpp>
 #include <Core/Defines.h>
+#include <boost/noncopyable.hpp>
+#include <Common/Allocator.h>
+#include <Common/ProfileEvents.h>
+#include <Common/memcpySmall.h>
+#include <base/getPageSize.h>
+
 #if __has_include(<sanitizer/asan_interface.h>) && defined(ADDRESS_SANITIZER)
 #   include <sanitizer/asan_interface.h>
 #endif
-#include <Common/memcpySmall.h>
-#include <Common/ProfileEvents.h>
-#include <Common/Allocator.h>
 
 
 namespace ProfileEvents
@@ -28,25 +30,45 @@ namespace DB
   * - put lot of strings inside pool, keep their addresses;
   * - addresses remain valid during lifetime of pool;
   * - at destruction of pool, all memory is freed;
-  * - memory is allocated and freed by large chunks;
+  * - memory is allocated and freed by large MemoryChunks;
   * - freeing parts of data is not possible (but look at ArenaWithFreeLists if you need);
   */
 class Arena : private boost::noncopyable
 {
 private:
-    /// Padding allows to use 'memcpySmallAllowReadWriteOverflow15' instead of 'memcpy'.
-    static constexpr size_t pad_right = 15;
+    static constexpr size_t pad_right = PADDING_FOR_SIMD - 1;
 
-    /// Contiguous chunk of memory and pointer to free space inside it. Member of single-linked list.
-    struct alignas(16) Chunk : private Allocator<false>    /// empty base optimization
+    /// Contiguous MemoryChunk of memory and pointer to free space inside it. Member of single-linked list.
+    struct alignas(16) MemoryChunk : private Allocator<false>    /// empty base optimization
     {
-        char * begin;
-        char * pos;
-        char * end; /// does not include padding.
+        char * begin = nullptr;
+        char * pos = nullptr;
+        char * end = nullptr; /// does not include padding.
 
-        Chunk * prev;
+        std::unique_ptr<MemoryChunk> prev;
 
-        Chunk(size_t size_, Chunk * prev_)
+        MemoryChunk() = default;
+
+        void swap(MemoryChunk & other) noexcept
+        {
+            std::swap(begin, other.begin);
+            std::swap(pos, other.pos);
+            std::swap(end, other.end);
+            prev.swap(other.prev);
+        }
+
+        MemoryChunk(MemoryChunk && other) noexcept
+        {
+            *this = std::move(other);
+        }
+
+        MemoryChunk & operator=(MemoryChunk && other) noexcept
+        {
+            swap(other);
+            return *this;
+        }
+
+        explicit MemoryChunk(size_t size_)
         {
             ProfileEvents::increment(ProfileEvents::ArenaAllocChunks);
             ProfileEvents::increment(ProfileEvents::ArenaAllocBytes, size_);
@@ -54,13 +76,15 @@ private:
             begin = reinterpret_cast<char *>(Allocator<false>::alloc(size_));
             pos = begin;
             end = begin + size_ - pad_right;
-            prev = prev_;
 
             ASAN_POISON_MEMORY_REGION(begin, size_);
         }
 
-        ~Chunk()
+        ~MemoryChunk()
         {
+            if (empty())
+                return;
+
             /// We must unpoison the memory before returning to the allocator,
             /// because the allocator might not have asan integration, and the
             /// memory would stay poisoned forever. If the allocator supports
@@ -68,42 +92,47 @@ private:
             ASAN_UNPOISON_MEMORY_REGION(begin, size());
 
             Allocator<false>::free(begin, size());
-
-            if (prev)
-                delete prev;
         }
 
+        bool empty() const { return begin == end;}
         size_t size() const { return end + pad_right - begin; }
         size_t remaining() const { return end - pos; }
     };
 
+    size_t initial_size;
     size_t growth_factor;
     size_t linear_growth_threshold;
 
-    /// Last contiguous chunk of memory.
-    Chunk * head;
-    size_t size_in_bytes;
+    /// Last contiguous MemoryChunk of memory.
+    MemoryChunk head;
+    size_t allocated_bytes = 0;
+    size_t used_bytes = 0;
+    size_t page_size;
 
-    static size_t roundUpToPageSize(size_t s)
+    static size_t roundUpToPageSize(size_t s, size_t page_size)
     {
-        return (s + 4096 - 1) / 4096 * 4096;
+        return (s + page_size - 1) / page_size * page_size;
     }
 
-    /// If chunks size is less than 'linear_growth_threshold', then use exponential growth, otherwise - linear growth
+    /// If MemoryChunks size is less than 'linear_growth_threshold', then use exponential growth, otherwise - linear growth
     ///  (to not allocate too much excessive memory).
     size_t nextSize(size_t min_next_size) const
     {
         size_t size_after_grow = 0;
 
-        if (head->size() < linear_growth_threshold)
+        if (head.empty())
         {
-            size_after_grow = std::max(min_next_size, head->size() * growth_factor);
+            size_after_grow = std::max(min_next_size, initial_size);
+        }
+        else if (head.size() < linear_growth_threshold)
+        {
+            size_after_grow = std::max(min_next_size, head.size() * growth_factor);
         }
         else
         {
             // allocContinue() combined with linear growth results in quadratic
             // behavior: we append the data by small amounts, and when it
-            // doesn't fit, we create a new chunk and copy all the previous data
+            // doesn't fit, we create a new MemoryChunk and copy all the previous data
             // into it. The number of times we do this is directly proportional
             // to the total size of data that is going to be serialized. To make
             // the copying happen less often, round the next size up to the
@@ -113,39 +142,48 @@ private:
         }
 
         assert(size_after_grow >= min_next_size);
-        return roundUpToPageSize(size_after_grow);
+        return roundUpToPageSize(size_after_grow, page_size);
     }
 
-    /// Add next contiguous chunk of memory with size not less than specified.
-    void NO_INLINE addChunk(size_t min_size)
+    /// Add next contiguous MemoryChunk of memory with size not less than specified.
+    void NO_INLINE addMemoryChunk(size_t min_size)
     {
-        head = new Chunk(nextSize(min_size + pad_right), head);
-        size_in_bytes += head->size();
+        size_t next_size = nextSize(min_size + pad_right);
+        if (head.empty())
+        {
+            head = MemoryChunk(next_size);
+        }
+        else
+        {
+            auto chunk = std::make_unique<MemoryChunk>(next_size);
+            head.swap(*chunk);
+            head.prev = std::move(chunk);
+        }
+        allocated_bytes += head.size();
     }
 
     friend class ArenaAllocator;
     template <size_t> friend class AlignedArenaAllocator;
 
 public:
-    Arena(size_t initial_size_ = 4096, size_t growth_factor_ = 2, size_t linear_growth_threshold_ = 128 * 1024 * 1024)
-        : growth_factor(growth_factor_), linear_growth_threshold(linear_growth_threshold_),
-        head(new Chunk(initial_size_, nullptr)), size_in_bytes(head->size())
+    explicit Arena(size_t initial_size_ = 4096, size_t growth_factor_ = 2, size_t linear_growth_threshold_ = 128 * 1024 * 1024)
+        : initial_size(initial_size_)
+        , growth_factor(growth_factor_)
+        , linear_growth_threshold(linear_growth_threshold_)
+        , page_size(static_cast<size_t>(::getPageSize()))
     {
-    }
-
-    ~Arena()
-    {
-        delete head;
     }
 
     /// Get piece of memory, without alignment.
+    /// Note: we expect it will return a non-nullptr even if the size is zero.
     char * alloc(size_t size)
     {
-        if (unlikely(head->pos + size > head->end))
-            addChunk(size);
+        used_bytes += size;
+        if (unlikely(head.empty() || size > head.remaining()))
+            addMemoryChunk(size);
 
-        char * res = head->pos;
-        head->pos += size;
+        char * res = head.pos;
+        head.pos += size;
         ASAN_UNPOISON_MEMORY_REGION(res, size + pad_right);
         return res;
     }
@@ -153,21 +191,25 @@ public:
     /// Get piece of memory with alignment
     char * alignedAlloc(size_t size, size_t alignment)
     {
+        used_bytes += size;
+        if (unlikely(head.empty() || size > head.remaining()))
+            addMemoryChunk(size + alignment);
+
         do
         {
-            void * head_pos = head->pos;
-            size_t space = head->end - head->pos;
+            void * head_pos = head.pos;
+            size_t space = head.end - head.pos;
 
-            auto res = static_cast<char *>(std::align(alignment, size, head_pos, space));
+            auto * res = static_cast<char *>(std::align(alignment, size, head_pos, space));
             if (res)
             {
-                head->pos = static_cast<char *>(head_pos);
-                head->pos += size;
+                head.pos = static_cast<char *>(head_pos);
+                head.pos += size;
                 ASAN_UNPOISON_MEMORY_REGION(res, size + pad_right);
                 return res;
             }
 
-            addChunk(size + alignment);
+            addMemoryChunk(size + alignment);
         } while (true);
     }
 
@@ -184,16 +226,17 @@ public:
       */
     void * rollback(size_t size)
     {
-        head->pos -= size;
-        ASAN_POISON_MEMORY_REGION(head->pos, size + pad_right);
-        return head->pos;
+        used_bytes -= size;
+        head.pos -= size;
+        ASAN_POISON_MEMORY_REGION(head.pos, size + pad_right);
+        return head.pos;
     }
 
     /** Begin or expand a contiguous range of memory.
       * 'range_start' is the start of range. If nullptr, a new range is
       * allocated.
-      * If there is no space in the current chunk to expand the range,
-      * the entire range is copied to a new, bigger memory chunk, and the value
+      * If there is no space in the current MemoryChunk to expand the range,
+      * the entire range is copied to a new, bigger memory MemoryChunk, and the value
       * of 'range_start' is updated.
       * If the optional 'start_alignment' is specified, the start of range is
       * kept aligned to this value.
@@ -204,11 +247,10 @@ public:
     char * allocContinue(size_t additional_bytes, char const *& range_start,
                          size_t start_alignment = 0)
     {
-        /*
-         * Allocating zero bytes doesn't make much sense. Also, a zero-sized
-         * range might break the invariant that the range begins at least before
-         * the current chunk end.
-         */
+        /** Allocating zero bytes doesn't make much sense. Also, a zero-sized
+          * range might break the invariant that the range begins at least before
+          * the current MemoryChunk end.
+          */
         assert(additional_bytes > 0);
 
         if (!range_start)
@@ -226,19 +268,19 @@ public:
 
         // This method only works for extending the last allocation. For lack of
         // original size, check a weaker condition: that 'begin' is at least in
-        // the current Chunk.
-        assert(range_start >= head->begin);
-        assert(range_start < head->end);
+        // the current MemoryChunk.
+        assert(range_start >= head.begin);
+        assert(range_start < head.end);
 
-        if (head->pos + additional_bytes <= head->end)
+        if (head.pos + additional_bytes <= head.end)
         {
-            // The new size fits into the last chunk, so just alloc the
+            // The new size fits into the last MemoryChunk, so just alloc the
             // additional size. We can alloc without alignment here, because it
             // only applies to the start of the range, and we don't change it.
             return alloc(additional_bytes);
         }
 
-        // New range doesn't fit into this chunk, will copy to a new one.
+        // New range doesn't fit into this MemoryChunk, will copy to a new one.
         //
         // Note: among other things, this method is used to provide a hack-ish
         // implementation of realloc over Arenas in ArenaAllocators. It wastes a
@@ -247,7 +289,7 @@ public:
         // solved not by complicating this method, but by rethinking the
         // approach to memory management for aggregate function states, so that
         // we can provide a proper realloc().
-        const size_t existing_bytes = head->pos - range_start;
+        const size_t existing_bytes = head.pos - range_start;
         const size_t new_bytes = existing_bytes + additional_bytes;
         const char * old_range = range_start;
 
@@ -299,23 +341,22 @@ public:
         return res;
     }
 
-    /// Size of chunks in bytes.
-    size_t size() const
-    {
-        return size_in_bytes;
-    }
+    /// Size of all MemoryChunks in bytes.
+    size_t allocatedBytes() const { return allocated_bytes; }
 
-    /// Bad method, don't use it -- the chunks are not your business, the entire
+    /// Total space actually used (not counting padding or space unused by caller allocations) in all MemoryChunks in bytes.
+    size_t usedBytes() const { return used_bytes; }
+
+    /// Bad method, don't use it -- the MemoryChunks are not your business, the entire
     /// purpose of the arena code is to manage them for you, so if you find
     /// yourself having to use this method, probably you're doing something wrong.
-    size_t remainingSpaceInCurrentChunk() const
+    size_t remainingSpaceInCurrentMemoryChunk() const
     {
-        return head->remaining();
+        return head.remaining();
     }
 };
 
 using ArenaPtr = std::shared_ptr<Arena>;
 using Arenas = std::vector<ArenaPtr>;
-
 
 }

@@ -1,11 +1,12 @@
 #pragma once
 #include <Processors/Formats/IOutputFormat.h>
 #include <Common/ConcurrentBoundedQueue.h>
-#include <DataStreams/BlockStreamProfileInfo.h>
-#include <IO/WriteBuffer.h>
+#include <QueryPipeline/ProfileInfo.h>
 
 namespace DB
 {
+
+class NullWriteBuffer;
 
 /// LazyOutputFormat is used to retrieve ready data from executing pipeline.
 /// You can periodically call `getChunk` from separate thread.
@@ -14,8 +15,7 @@ class LazyOutputFormat : public IOutputFormat
 {
 
 public:
-    explicit LazyOutputFormat(const Block & header)
-        : IOutputFormat(header, out), queue(2), finished_processing(false) {}
+    explicit LazyOutputFormat(SharedHeader header);
 
     String getName() const override { return "LazyOutputFormat"; }
 
@@ -23,36 +23,34 @@ public:
     Chunk getTotals();
     Chunk getExtremes();
 
-    bool isFinished() { return finished_processing && queue.size() == 0; }
+    bool isFinished() { return queue.isFinishedAndEmpty(); }
 
-    BlockStreamProfileInfo & getProfileInfo() { return info; }
+    ProfileInfo & getProfileInfo() { return info; }
 
     void setRowsBeforeLimit(size_t rows_before_limit) override;
+    void setRowsBeforeAggregation(size_t rows_before_aggregation) override;
 
-    void finish()
+    void onCancel() noexcept override
     {
-        finished_processing = true;
-        /// Clear queue in case if somebody is waiting lazy_format to push.
-        queue.clear();
+        queue.clearAndFinish();
     }
+
+    void finalizeImpl() override
+    {
+        queue.finish();
+    }
+
+    bool expectMaterializedColumns() const override { return false; }
+    bool supportsSpecialSerializationKinds() const override { return true; }
 
 protected:
     void consume(Chunk chunk) override
     {
-        if (!finished_processing)
-            queue.emplace(std::move(chunk));
+        (void)(queue.emplace(std::move(chunk)));
     }
 
     void consumeTotals(Chunk chunk) override { totals = std::move(chunk); }
     void consumeExtremes(Chunk chunk) override { extremes = std::move(chunk); }
-
-    void finalize() override
-    {
-        finished_processing = true;
-
-        /// In case we are waiting for result.
-        queue.emplace(Chunk());
-    }
 
 private:
 
@@ -61,11 +59,9 @@ private:
     Chunk extremes;
 
     /// Is not used.
-    static WriteBuffer out;
+    static NullWriteBuffer out;
 
-    BlockStreamProfileInfo info;
-
-    std::atomic<bool> finished_processing;
+    ProfileInfo info;
 };
 
 }

@@ -5,7 +5,7 @@
 #include <Interpreters/EmbeddedDictionaries.h>
 #include <Common/setThreadName.h>
 #include <Common/Exception.h>
-#include <common/logger_useful.h>
+#include <Common/logger_useful.h>
 #include <Poco/Util/Application.h>
 
 
@@ -35,7 +35,7 @@ bool EmbeddedDictionaries::reloadDictionary(
     const bool throw_on_error,
     const bool force_reload)
 {
-    const auto & config = context.getConfigRef();
+    const auto & config = getContext()->getConfigRef();
 
     bool not_initialized = dictionary.get() == nullptr;
 
@@ -60,7 +60,7 @@ bool EmbeddedDictionaries::reloadDictionary(
 
 bool EmbeddedDictionaries::reloadImpl(const bool throw_on_error, const bool force_reload)
 {
-    std::unique_lock lock(mutex);
+    std::lock_guard lock(mutex);
 
     /** If you can not update the directories, then despite this, do not throw an exception (use the old directories).
       * If there are no old correct directories, then when using functions that depend on them,
@@ -72,17 +72,17 @@ bool EmbeddedDictionaries::reloadImpl(const bool throw_on_error, const bool forc
 
     bool was_exception = false;
 
-    DictionaryReloader<RegionsHierarchies> reload_regions_hierarchies = [=, this] (const Poco::Util::AbstractConfiguration & config)
+    DictionaryReloader<RegionsHierarchies> reload_regions_hierarchies = [=] (const Poco::Util::AbstractConfiguration & config)
     {
-        return geo_dictionaries_loader->reloadRegionsHierarchies(config);
+        return DB::GeoDictionariesLoader::reloadRegionsHierarchies(config);
     };
 
     if (!reloadDictionary<RegionsHierarchies>(regions_hierarchies, std::move(reload_regions_hierarchies), throw_on_error, force_reload))
         was_exception = true;
 
-    DictionaryReloader<RegionsNames> reload_regions_names = [=, this] (const Poco::Util::AbstractConfiguration & config)
+    DictionaryReloader<RegionsNames> reload_regions_names = [=] (const Poco::Util::AbstractConfiguration & config)
     {
-        return geo_dictionaries_loader->reloadRegionsNames(config);
+        return DB::GeoDictionariesLoader::reloadRegionsNames(config);
     };
 
     if (!reloadDictionary<RegionsNames>(regions_names, std::move(reload_regions_names), throw_on_error, force_reload))
@@ -97,7 +97,7 @@ bool EmbeddedDictionaries::reloadImpl(const bool throw_on_error, const bool forc
 
 void EmbeddedDictionaries::reloadPeriodically()
 {
-    setThreadName("DictReload");
+    DB::setThreadName(ThreadName::DICT_RELOAD);
 
     while (true)
     {
@@ -122,12 +122,12 @@ void EmbeddedDictionaries::reloadPeriodically()
 
 EmbeddedDictionaries::EmbeddedDictionaries(
     std::unique_ptr<GeoDictionariesLoader> geo_dictionaries_loader_,
-    Context & context_,
+    ContextPtr context_,
     const bool throw_on_error)
-    : log(&Poco::Logger::get("EmbeddedDictionaries"))
-    , context(context_)
+    : WithContext(context_)
+    , log(getLogger("EmbeddedDictionaries"))
     , geo_dictionaries_loader(std::move(geo_dictionaries_loader_))
-    , reload_period(context_.getConfigRef().getInt("builtin_dictionaries_reload_interval", 3600))
+    , reload_period(getContext()->getConfigRef().getInt("builtin_dictionaries_reload_interval", 3600))
 {
     reloadImpl(throw_on_error);
     reloading_thread = ThreadFromGlobalPool([this] { reloadPeriodically(); });
@@ -143,7 +143,7 @@ EmbeddedDictionaries::~EmbeddedDictionaries()
 void EmbeddedDictionaries::reload()
 {
     if (!reloadImpl(true, true))
-        throw Exception("Some embedded dictionaries were not successfully reloaded", ErrorCodes::UNFINISHED);
+        throw Exception(ErrorCodes::UNFINISHED, "Some embedded dictionaries were not successfully reloaded");
 }
 
 

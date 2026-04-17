@@ -16,10 +16,6 @@ SELECT sum(a), sum(b), sum(c), sumWithOverflow(a), sumWithOverflow(b), sumWithOv
 SELECT sum(a+1), sum(b+1), sum(c+1), sumWithOverflow(a+1), sumWithOverflow(b+1), sumWithOverflow(c+1) FROM decimal;
 SELECT sum(a-1), sum(b-1), sum(c-1), sumWithOverflow(a-1), sumWithOverflow(b-1), sumWithOverflow(c-1) FROM decimal;
 
-SELECT avg(a) as aa, avg(b) as ab, avg(c) as ac, toTypeName(aa), toTypeName(ab),toTypeName(ac) FROM decimal;
-SELECT avg(a) as aa, avg(b) as ab, avg(c) as ac, toTypeName(aa), toTypeName(ab),toTypeName(ac) FROM decimal WHERE a > 0;
-SELECT avg(a) as aa, avg(b) as ab, avg(c) as ac, toTypeName(aa), toTypeName(ab),toTypeName(ac) FROM decimal WHERE a < 0;
-
 SELECT (uniq(a), uniq(b), uniq(c)),
     (uniqCombined(a), uniqCombined(b), uniqCombined(c)),
     (uniqCombined(17)(a), uniqCombined(17)(b), uniqCombined(17)(c)),
@@ -81,9 +77,9 @@ SELECT stddevPop(toFloat64(a)), stddevPop(toFloat64(b)), stddevPop(toFloat64(c))
 SELECT stddevSamp(a) AS da, stddevSamp(b) AS db, stddevSamp(c) AS dc, toTypeName(da), toTypeName(db), toTypeName(dc) FROM decimal;
 SELECT stddevSamp(toFloat64(a)), stddevSamp(toFloat64(b)), stddevSamp(toFloat64(c)) FROM decimal;
 
-SELECT covarPop(a, a), covarPop(b, b), covarPop(c, c) FROM decimal; -- { serverError 43 }
-SELECT covarSamp(a, a), covarSamp(b, b), covarSamp(c, c) FROM decimal; -- { serverError 43 }
-SELECT corr(a, a), corr(b, b), corr(c, c) FROM decimal; -- { serverError 43 }
+SELECT covarPop(a, a), covarPop(b, b), covarPop(c, c) FROM decimal; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
+SELECT covarSamp(a, a), covarSamp(b, b), covarSamp(c, c) FROM decimal; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
+SELECT corr(a, a), corr(b, b), corr(c, c) FROM decimal; -- { serverError ILLEGAL_TYPE_OF_ARGUMENT }
 SELECT 1 LIMIT 0;
 
 DROP TABLE decimal;

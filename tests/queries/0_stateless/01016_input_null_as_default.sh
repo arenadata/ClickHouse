@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
 $CLICKHOUSE_CLIENT --query="DROP TABLE IF EXISTS null_as_default";
+$CLICKHOUSE_CLIENT --query="DROP TABLE IF EXISTS default_by_other_column";
 $CLICKHOUSE_CLIENT --query="CREATE TABLE null_as_default (i Int8, s String DEFAULT 'Hello', n UInt64 DEFAULT 42, d Date DEFAULT '2019-06-19', a Array(UInt8) DEFAULT [1, 2, 3], t Tuple(String, Float64) DEFAULT ('default', i / 4)) ENGINE = Memory";
+$CLICKHOUSE_CLIENT --query="CREATE TABLE default_by_other_column (a Float32 DEFAULT 100, b Float64 DEFAULT a, c Tuple(String, Float64) DEFAULT ('default', b / 4)) ENGINE = Memory";
 
 echo 'CSV'
 echo '\N, 1, \N, "2019-07-22", "[10, 20, 30]", \N
@@ -38,6 +41,14 @@ echo '{"i": null, "s": "1", "n": null, "d": "2019-07-22", "a": [10, 20, 30], "t"
 $CLICKHOUSE_CLIENT --query="SELECT * FROM null_as_default ORDER BY i";
 $CLICKHOUSE_CLIENT --query="TRUNCATE TABLE null_as_default";
 
+echo 'JSONStringsEachRow'
+echo '{"i": "null", "s": "1", "n": "ᴺᵁᴸᴸ", "d": "2019-07-22", "a": "[10, 20, 30]", "t": "NULL"}
+{"i": "1", "s": "world", "n": "3", "d": "2019-07-23", "a": "null", "t": "('\''tuple'\'', 3.14)"}
+{"i": "2", "s": "null", "n": "123", "d": "null", "a": "[]", "t": "('\''test'\'', 2.71828)"}
+{"i": "3", "s": "null", "n": "null", "d": "null", "a": "null", "t": "null"}' | $CLICKHOUSE_CLIENT --input_format_null_as_default=1 --query="INSERT INTO null_as_default FORMAT JSONStringsEachRow";
+$CLICKHOUSE_CLIENT --query="SELECT * FROM null_as_default ORDER BY i";
+$CLICKHOUSE_CLIENT --query="TRUNCATE TABLE null_as_default";
+
 echo 'Template (Quoted)'
 echo 'NULL, '\''1'\'', null, '\''2019-07-22'\'', [10, 20, 30], NuLl
 1, '\''world'\'', 3, '\''2019-07-23'\'', NULL, ('\''tuple'\'', 3.14)
@@ -48,8 +59,17 @@ $CLICKHOUSE_CLIENT --query="TRUNCATE TABLE null_as_default";
 
 echo 'Values'
 echo '(NULL, '\''1'\'', (null), '\''2019-07-22'\'', ([10, 20, 30]), (NuLl)),
-(1, '\''world'\'', (3), '\''2019-07-23'\'', (NULL), (('\''tuple'\'', 3.14))),
-(2, null, (123), null, ([]), (('\''test'\'', 2.71828))),
+(1, '\''world'\'', (3), '\''2019-07-23'\'', (NULL), ('\''tuple'\'', 3.14)),
+(2, null, (123), null, ([]), ('\''test'\'', 2.71828)),
 (3, null, (null), null, (null), (null))' | $CLICKHOUSE_CLIENT --input_format_null_as_default=1 --query="INSERT INTO null_as_default VALUES";
 $CLICKHOUSE_CLIENT --query="SELECT * FROM null_as_default ORDER BY i";
 $CLICKHOUSE_CLIENT --query="DROP TABLE null_as_default";
+
+echo 'default_by_other_column'
+$CLICKHOUSE_CLIENT --input_format_null_as_default=1 --query="INSERT INTO default_by_other_column(c) VALUES(null)";
+$CLICKHOUSE_CLIENT --input_format_null_as_default=1 --query="INSERT INTO default_by_other_column(b, c) VALUES(null, null)";
+$CLICKHOUSE_CLIENT --input_format_null_as_default=1 --query="INSERT INTO default_by_other_column(a, b, c) VALUES(null, null, null)";
+$CLICKHOUSE_CLIENT --input_format_null_as_default=1 --query="INSERT INTO default_by_other_column(a) VALUES(10)";
+$CLICKHOUSE_CLIENT --input_format_null_as_default=1 --query="INSERT INTO default_by_other_column(a, b, c) VALUES(1, 2, ('tuple', 3))";
+$CLICKHOUSE_CLIENT --query="SELECT * FROM default_by_other_column ORDER BY a";
+$CLICKHOUSE_CLIENT --query="DROP TABLE default_by_other_column";

@@ -1,93 +1,84 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <DataTypes/DataTypeArray.h>
-#include <DataTypes/DataTypesNumber.h>
-#include <DataTypes/DataTypeDate.h>
-#include <DataTypes/DataTypeDateTime.h>
-#include <DataTypes/DataTypeDateTime64.h>
-#include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <Columns/ColumnArray.h>
-#include <Columns/ColumnString.h>
-#include <Columns/ColumnsNumber.h>
 
 
 namespace DB
 {
 
-/// TODO Make it simple.
-
-template <typename Type> struct TypeToColumnType { using ColumnType = ColumnVector<Type>; };
-template <> struct TypeToColumnType<String> { using ColumnType = ColumnString; };
-
-template <typename DataType> struct DataTypeToName : TypeName<typename DataType::FieldType> { };
-template <> struct DataTypeToName<DataTypeDate> { static std::string get() { return "Date"; } };
-template <> struct DataTypeToName<DataTypeDateTime> { static std::string get() { return "DateTime"; } };
-
-
-template <typename DataType>
-struct FunctionEmptyArray : public IFunction
+namespace
 {
-    static constexpr auto base_name = "emptyArray";
-    static const String name;
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionEmptyArray>(); }
+
+class FunctionEmptyArray : public IFunction
+{
+private:
+    String element_type;
+
+public:
+    static String getNameImpl(const String & element_type) { return "emptyArray" + element_type; }
+
+    explicit FunctionEmptyArray(const String & element_type_) : element_type(element_type_) {}
 
 private:
     String getName() const override
     {
-        return name;
+        return getNameImpl(element_type);
     }
 
     size_t getNumberOfArguments() const override { return 0; }
 
     DataTypePtr getReturnTypeImpl(const DataTypes & /*arguments*/) const override
     {
-        return std::make_shared<DataTypeArray>(std::make_shared<DataType>());
+        return std::make_shared<DataTypeArray>(DataTypeFactory::instance().get(element_type));
     }
 
-    void executeImpl(Block & block, const ColumnNumbers &, size_t result, size_t input_rows_count) override
-    {
-        using UnderlyingColumnType = typename TypeToColumnType<typename DataType::FieldType>::ColumnType;
+    bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
-        block.getByPosition(result).column = ColumnArray::create(
-            UnderlyingColumnType::create(),
+    ColumnPtr executeImpl(const ColumnsWithTypeAndName &, const DataTypePtr &, size_t input_rows_count) const override
+    {
+        return ColumnArray::create(
+            DataTypeFactory::instance().get(element_type)->createColumn(),
             ColumnArray::ColumnOffsets::create(input_rows_count, 0));
     }
 };
 
-
-template <typename DataType>
-const String FunctionEmptyArray<DataType>::name = FunctionEmptyArray::base_name + String(DataTypeToName<DataType>::get());
-
-using FunctionEmptyArrayUInt8 = FunctionEmptyArray<DataTypeUInt8>;
-using FunctionEmptyArrayUInt16 = FunctionEmptyArray<DataTypeUInt16>;
-using FunctionEmptyArrayUInt32 = FunctionEmptyArray<DataTypeUInt32>;
-using FunctionEmptyArrayUInt64 = FunctionEmptyArray<DataTypeUInt64>;
-using FunctionEmptyArrayInt8 = FunctionEmptyArray<DataTypeInt8>;
-using FunctionEmptyArrayInt16 = FunctionEmptyArray<DataTypeInt16>;
-using FunctionEmptyArrayInt32 = FunctionEmptyArray<DataTypeInt32>;
-using FunctionEmptyArrayInt64 = FunctionEmptyArray<DataTypeInt64>;
-using FunctionEmptyArrayFloat32 = FunctionEmptyArray<DataTypeFloat32>;
-using FunctionEmptyArrayFloat64 = FunctionEmptyArray<DataTypeFloat64>;
-using FunctionEmptyArrayDate = FunctionEmptyArray<DataTypeDate>;
-using FunctionEmptyArrayDateTime = FunctionEmptyArray<DataTypeDateTime>;
-using FunctionEmptyArrayString = FunctionEmptyArray<DataTypeString>;
-
-
-void registerFunctionsEmptyArray(FunctionFactory & factory)
+void registerFunction(FunctionFactory & factory, const String & element_type)
 {
-    factory.registerFunction<FunctionEmptyArrayUInt8>();
-    factory.registerFunction<FunctionEmptyArrayUInt16>();
-    factory.registerFunction<FunctionEmptyArrayUInt32>();
-    factory.registerFunction<FunctionEmptyArrayUInt64>();
-    factory.registerFunction<FunctionEmptyArrayInt8>();
-    factory.registerFunction<FunctionEmptyArrayInt16>();
-    factory.registerFunction<FunctionEmptyArrayInt32>();
-    factory.registerFunction<FunctionEmptyArrayInt64>();
-    factory.registerFunction<FunctionEmptyArrayFloat32>();
-    factory.registerFunction<FunctionEmptyArrayFloat64>();
-    factory.registerFunction<FunctionEmptyArrayDate>();
-    factory.registerFunction<FunctionEmptyArrayDateTime>();
-    factory.registerFunction<FunctionEmptyArrayString>();
+    FunctionDocumentation::Description description = fmt::format("Returns an empty {} array", element_type);
+    FunctionDocumentation::Syntax syntax = fmt::format("emptyArray{}()", element_type);
+    FunctionDocumentation::Arguments arguments = {};
+    FunctionDocumentation::ReturnedValue returned_value = {fmt::format("An empty {} array.", element_type), {"Array(T)"}};
+    FunctionDocumentation::Examples examples = {{"Usage example", fmt::format("SELECT emptyArray{}", element_type), "[]"}};
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Array;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+
+    factory.registerFunction(
+        FunctionEmptyArray::getNameImpl(element_type),
+        [element_type](ContextPtr){ return std::make_shared<FunctionEmptyArray>(element_type); },
+        documentation
+    );
+}
+
+}
+
+REGISTER_FUNCTION(EmptyArray)
+{
+    registerFunction(factory, "UInt8");
+    registerFunction(factory, "UInt16");
+    registerFunction(factory, "UInt32");
+    registerFunction(factory, "UInt64");
+    registerFunction(factory, "Int8");
+    registerFunction(factory, "Int16");
+    registerFunction(factory, "Int32");
+    registerFunction(factory, "Int64");
+    registerFunction(factory, "Float32");
+    registerFunction(factory, "Float64");
+    registerFunction(factory, "Date");
+    registerFunction(factory, "DateTime");
+    registerFunction(factory, "String");
 }
 
 }

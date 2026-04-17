@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Common/HashTable/HashTable.h>
+#include <array>
 
 
 /** Two-level hash table.
@@ -15,13 +16,10 @@
   */
 
 template <size_t initial_size_degree = 8>
-struct TwoLevelHashTableGrower : public HashTableGrower<initial_size_degree>
+struct TwoLevelHashTableGrower : public HashTableGrowerWithPrecalculation<initial_size_degree>
 {
     /// Increase the size of the hash table.
-    void increaseSize()
-    {
-        this->size_degree += this->size_degree >= 15 ? 1 : 2;
-    }
+    void increaseSize() { this->increaseSizeDegree(this->sizeDegree() >= 15 ? 1 : 2); }
 };
 
 template
@@ -47,8 +45,8 @@ protected:
 public:
     using Impl = ImplTable;
 
-    static constexpr size_t NUM_BUCKETS = 1ULL << BITS_FOR_BUCKET;
-    static constexpr size_t MAX_BUCKET = NUM_BUCKETS - 1;
+    static constexpr UInt32 NUM_BUCKETS = 1ULL << BITS_FOR_BUCKET;
+    static constexpr UInt32 MAX_BUCKET = NUM_BUCKETS - 1;
 
     size_t hash(const Key & x) const { return Hash::operator()(x); }
 
@@ -91,12 +89,23 @@ public:
 
     Impl impls[NUM_BUCKETS];
 
+    /// Cached prefix sums of bucket capacities in cells to speed up offsetInternal
+    /// bucket_cells_prefix[b] = sum_{i=0..b-1} impls[i].getBufferSizeInCells()
+    mutable std::array<size_t, NUM_BUCKETS> bucket_cells_prefix{};
+    mutable std::once_flag bucket_prefix_once;
 
-    TwoLevelHashTable() {}
+
+    TwoLevelHashTable() = default;
+
+    explicit TwoLevelHashTable(size_t size_hint)
+    {
+        for (auto & impl : impls)
+            impl.reserve(size_hint / NUM_BUCKETS);
+    }
 
     /// Copy the data from another (normal) hash table. It should have the same hash function.
     template <typename Source>
-    TwoLevelHashTable(const Source & src)
+    explicit TwoLevelHashTable(const Source & src)
     {
         typename Source::const_iterator it = src.begin();
 
@@ -117,11 +126,11 @@ public:
     }
 
 
-    class iterator
+    class iterator /// NOLINT
     {
-        Self * container;
-        size_t bucket;
-        typename Impl::iterator current_it;
+        Self * container{};
+        size_t bucket{};
+        typename Impl::iterator current_it{};
 
         friend class TwoLevelHashTable;
 
@@ -129,7 +138,7 @@ public:
             : container(container_), bucket(bucket_), current_it(current_it_) {}
 
     public:
-        iterator() {}
+        iterator() = default;
 
         bool operator== (const iterator & rhs) const { return bucket == rhs.bucket && current_it == rhs.current_it; }
         bool operator!= (const iterator & rhs) const { return !(*this == rhs); }
@@ -151,23 +160,26 @@ public:
 
         Cell * getPtr() const { return current_it.getPtr(); }
         size_t getHash() const { return current_it.getHash(); }
+        size_t getBucket() const { return bucket; }
     };
 
 
-    class const_iterator
+    class const_iterator /// NOLINT
     {
-        Self * container;
-        size_t bucket;
-        typename Impl::const_iterator current_it;
+        const Self * container{};
+        size_t bucket{};
+        typename Impl::const_iterator current_it{};
 
         friend class TwoLevelHashTable;
 
-        const_iterator(Self * container_, size_t bucket_, typename Impl::const_iterator current_it_)
-            : container(container_), bucket(bucket_), current_it(current_it_) {}
+        const_iterator(const Self * container_, size_t bucket_, typename Impl::const_iterator current_it_)
+            : container(container_), bucket(bucket_), current_it(current_it_)
+        {
+        }
 
     public:
-        const_iterator() {}
-        const_iterator(const iterator & rhs) : container(rhs.container), bucket(rhs.bucket), current_it(rhs.current_it) {}
+        const_iterator() = default;
+        const_iterator(const iterator & rhs) : container(rhs.container), bucket(rhs.bucket), current_it(rhs.current_it) {} /// NOLINT
 
         bool operator== (const const_iterator & rhs) const { return bucket == rhs.bucket && current_it == rhs.current_it; }
         bool operator!= (const const_iterator & rhs) const { return !(*this == rhs); }
@@ -185,10 +197,11 @@ public:
         }
 
         const Cell & operator* () const { return *current_it; }
-        const Cell * operator->() const { return current_it->getPtr(); }
+        const Cell * operator->() const { return current_it.getPtr(); }
 
         const Cell * getPtr() const { return current_it.getPtr(); }
         size_t getHash() const { return current_it.getHash(); }
+        size_t getBucket() const { return bucket; }
     };
 
 
@@ -209,6 +222,22 @@ public:
     const_iterator end() const         { return { this, MAX_BUCKET, impls[MAX_BUCKET].end() }; }
     iterator end()                     { return { this, MAX_BUCKET, impls[MAX_BUCKET].end() }; }
 
+    const_iterator iteratorAt(size_t bucket) const
+    {
+        if (bucket >= NUM_BUCKETS)
+            return end();
+        auto impl_it = beginOfNextNonEmptyBucket(bucket);
+        return { this, bucket, impl_it };
+    }
+
+    iterator iteratorAt(size_t bucket)
+    {
+        if (bucket >= NUM_BUCKETS)
+            return end();
+        auto impl_it = beginOfNextNonEmptyBucket(bucket);
+        return { this, bucket, impl_it };
+    }
+
 
     /// Insert a value. In the case of any more complex values, it is better to use the `emplace` function.
     std::pair<LookupResult, bool> ALWAYS_INLINE insert(const value_type & x)
@@ -219,11 +248,32 @@ public:
         emplace(Cell::getKey(x), res.first, res.second, hash_value);
 
         if (res.second)
-            insertSetMapped(res.first->getMapped(), x);
+            res.first->setMapped(x);
 
         return res;
     }
 
+    std::pair<LookupResult, bool> ALWAYS_INLINE insert(const Cell & cell)
+    {
+        auto hash_value = cell.getHash(*this);
+
+        std::pair<LookupResult, bool> res;
+        emplace(cell.getKey(), res.first, res.second, hash_value);
+
+        if (res.second)
+            res.first->setMapped(cell.getValue());
+
+        return res;
+    }
+
+    template <typename KeyHolder>
+    void ALWAYS_INLINE prefetch(KeyHolder && key_holder) const
+    {
+        const auto & key = keyHolderGetKey(key_holder);
+        const auto key_hash = hash(key);
+        const auto bucket = getBucketFromHash(key_hash);
+        impls[bucket].prefetchByHash(key_hash);
+    }
 
     /** Insert the key,
       * return an iterator to a position that can be used for `placement new` of value,
@@ -275,13 +325,13 @@ public:
 
     void write(DB::WriteBuffer & wb) const
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             impls[i].write(wb);
     }
 
     void writeText(DB::WriteBuffer & wb) const
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
         {
             if (i != 0)
                 DB::writeChar(',', wb);
@@ -291,13 +341,13 @@ public:
 
     void read(DB::ReadBuffer & rb)
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             impls[i].read(rb);
     }
 
     void readText(DB::ReadBuffer & rb)
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
         {
             if (i != 0)
                 DB::assertChar(',', rb);
@@ -309,7 +359,7 @@ public:
     size_t size() const
     {
         size_t res = 0;
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             res += impls[i].size();
 
         return res;
@@ -317,7 +367,7 @@ public:
 
     bool empty() const
     {
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             if (!impls[i].empty())
                 return false;
 
@@ -327,9 +377,37 @@ public:
     size_t getBufferSizeInBytes() const
     {
         size_t res = 0;
-        for (size_t i = 0; i < NUM_BUCKETS; ++i)
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
             res += impls[i].getBufferSizeInBytes();
 
         return res;
+    }
+
+    size_t getBufferSizeInCells() const
+    {
+        size_t res = 0;
+        for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
+            res += impls[i].getBufferSizeInCells();
+        return res;
+    }
+
+    size_t offsetInternal(ConstLookupResult ptr) const
+    {
+        const size_t buck = getBucketFromHash(ptr->getHash(*this));
+        if (ptr->isZero(impls[buck]))
+            return 0;
+
+        // Lazily compute prefix sums across buckets once; subsequent calls are O(1).
+        std::call_once(bucket_prefix_once, [this]()
+        {
+            size_t run = 0;
+            for (UInt32 i = 0; i < NUM_BUCKETS; ++i)
+            {
+                bucket_cells_prefix[i] = run;
+                run += impls[i].getBufferSizeInCells();
+            }
+        });
+
+        return bucket_cells_prefix[buck] + (ptr - impls[buck].buf) + 1;
     }
 };

@@ -1,15 +1,14 @@
 #pragma once
 
-#include <mutex>
-#include <atomic>
-#include <thread>
-#include <ext/shared_ptr_helper.h>
-#include <Core/NamesAndTypes.h>
+#include <Core/BackgroundSchedulePoolTaskHolder.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <Storages/IStorage.h>
-#include <DataStreams/IBlockOutputStream.h>
+#include <Common/ThreadPool.h>
+
 #include <Poco/Event.h>
-#include <Interpreters/Context.h>
+
+#include <atomic>
+#include <mutex>
 
 
 namespace Poco { class Logger; }
@@ -34,116 +33,30 @@ namespace DB
   * Thresholds can be exceeded. For example, if max_rows = 1 000 000, the buffer already had 500 000 rows,
   *  and a part of 800 000 rows is added, then there will be 1 300 000 rows in the buffer, and then such a block will be written to the subordinate table.
   *
+  * There are also separate thresholds for flush, those thresholds are checked only for non-direct flush.
+  * This maybe useful if you do not want to add extra latency for INSERT queries,
+  * so you can set max_rows=1e6 and flush_rows=500e3, then each 500e3 rows buffer will be flushed in background only.
+  *
   * When you destroy a Buffer table, all remaining data is flushed to the subordinate table.
   * The data in the buffer is not replicated, not logged to disk, not indexed. With a rough restart of the server, the data is lost.
   */
-class StorageBuffer final : public ext::shared_ptr_helper<StorageBuffer>, public IStorage
+class StorageBuffer final : public IStorage, WithContext
 {
-friend struct ext::shared_ptr_helper<StorageBuffer>;
 friend class BufferSource;
-friend class BufferBlockOutputStream;
+friend class BufferSink;
+
+    static VirtualColumnsDescription createVirtuals();
 
 public:
-    /// Thresholds.
     struct Thresholds
     {
-        time_t time;    /// The number of seconds from the insertion of the first row into the block.
-        size_t rows;    /// The number of rows in the block.
-        size_t bytes;   /// The number of (uncompressed) bytes in the block.
+        time_t time = 0;  /// The number of seconds from the insertion of the first row into the block.
+        size_t rows = 0;  /// The number of rows in the block.
+        size_t bytes = 0; /// The number of (uncompressed) bytes in the block.
+
+        std::string toString() const;
     };
 
-    std::string getName() const override { return "Buffer"; }
-
-    QueryProcessingStage::Enum getQueryProcessingStage(const Context &, QueryProcessingStage::Enum /*to_stage*/, const ASTPtr &) const override;
-
-    Pipes read(
-        const Names & column_names,
-        const StorageMetadataPtr & /*metadata_snapshot*/,
-        const SelectQueryInfo & query_info,
-        const Context & context,
-        QueryProcessingStage::Enum processed_stage,
-        size_t max_block_size,
-        unsigned num_streams) override;
-
-    BlockOutputStreamPtr write(const ASTPtr & query, const StorageMetadataPtr & /*metadata_snapshot*/, const Context & context) override;
-
-    void startup() override;
-    /// Flush all buffers into the subordinate table and stop background thread.
-    void shutdown() override;
-    bool optimize(const ASTPtr & query, const StorageMetadataPtr & metadata_snapshot, const ASTPtr & partition, bool final, bool deduplicate, const Context & context) override;
-
-    bool supportsSampling() const override { return true; }
-    bool supportsPrewhere() const override
-    {
-        if (!destination_id)
-            return false;
-        auto dest = DatabaseCatalog::instance().tryGetTable(destination_id, global_context);
-        if (dest && dest.get() != this)
-            return dest->supportsPrewhere();
-        return false;
-    }
-    bool supportsFinal() const override { return true; }
-    bool supportsIndexForIn() const override { return true; }
-
-    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand, const Context & query_context, const StorageMetadataPtr & metadata_snapshot) const override;
-
-    void checkAlterIsPossible(const AlterCommands & commands, const Settings & /* settings */) const override;
-
-    /// The structure of the subordinate table is not checked and does not change.
-    void alter(const AlterCommands & params, const Context & context, TableLockHolder & table_lock_holder) override;
-
-    std::optional<UInt64> totalRows() const override;
-    std::optional<UInt64> totalBytes() const override;
-
-    std::optional<UInt64> lifetimeRows() const override { return writes.rows; }
-    std::optional<UInt64> lifetimeBytes() const override { return writes.bytes; }
-
-
-private:
-    Context global_context;
-
-    struct Buffer
-    {
-        time_t first_write_time = 0;
-        Block data;
-        mutable std::mutex mutex;
-    };
-
-    /// There are `num_shards` of independent buffers.
-    const size_t num_shards;
-    std::vector<Buffer> buffers;
-
-    const Thresholds min_thresholds;
-    const Thresholds max_thresholds;
-
-    StorageID destination_id;
-    bool allow_materialized;
-
-    /// Lifetime
-    struct LifeTimeWrites
-    {
-        std::atomic<size_t> rows = 0;
-        std::atomic<size_t> bytes = 0;
-    } writes;
-
-    Poco::Logger * log;
-
-    void flushAllBuffers(bool check_thresholds = true);
-    /// Reset the buffer. If check_thresholds is set - resets only if thresholds are exceeded.
-    void flushBuffer(Buffer & buffer, bool check_thresholds, bool locked = false);
-    bool checkThresholds(const Buffer & buffer, time_t current_time, size_t additional_rows = 0, size_t additional_bytes = 0) const;
-    bool checkThresholdsImpl(size_t rows, size_t bytes, time_t time_passed) const;
-
-    /// `table` argument is passed, as it is sometimes evaluated beforehand. It must match the `destination`.
-    void writeBlockToDestination(const Block & block, StoragePtr table);
-
-    void flushBack();
-    void reschedule();
-
-    BackgroundSchedulePool & bg_pool;
-    BackgroundSchedulePoolTaskHolder flush_handle;
-
-protected:
     /** num_shards - the level of internal parallelism (the number of independent buffers)
       * The buffer is flushed if all minimum thresholds or at least one of the maximum thresholds are exceeded.
       */
@@ -151,12 +64,144 @@ protected:
         const StorageID & table_id_,
         const ColumnsDescription & columns_,
         const ConstraintsDescription & constraints_,
-        Context & context_,
+        const String & comment,
+        ContextPtr context_,
         size_t num_shards_,
         const Thresholds & min_thresholds_,
         const Thresholds & max_thresholds_,
+        const Thresholds & flush_thresholds_,
         const StorageID & destination_id,
         bool allow_materialized_);
+
+    std::string getName() const override { return "Buffer"; }
+
+    QueryProcessingStage::Enum
+    getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
+
+    void read(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        size_t max_block_size,
+        size_t num_streams) override;
+    bool isRemote() const override;
+
+    bool supportsParallelInsert() const override { return true; }
+
+    bool supportsSubcolumns() const override { return true; }
+
+    bool supportsColumnsWithDynamicStructure() const override { return true; }
+
+    SinkToStoragePtr write(const ASTPtr & query, const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr context, bool /*async_insert*/) override;
+
+    void startup() override;
+    /// Flush all buffers into the subordinate table and stop background thread.
+    void flushAndPrepareForShutdown() override;
+    bool optimize(
+        const ASTPtr & query,
+        const StorageMetadataPtr & metadata_snapshot,
+        const ASTPtr & partition,
+        bool final,
+        bool deduplicate,
+        const Names & deduplicate_by_columns,
+        bool cleanup,
+        ContextPtr context) override;
+
+    bool supportsSampling() const override
+    {
+        /// During reads, Buffer queries both the in-memory buffers and the destination table simultaneously.
+        /// Sampling on the buffer part is handled probabilistically (no sampling key required).
+        /// Sampling on the destination part requires the destination to have a sampling key.
+        /// If there is no destination, only the buffer is read, so sampling is always supported.
+        if (auto destination = getDestinationTable())
+            return destination->supportsSampling();
+        return true;
+    }
+    bool supportsPrewhere() const override;
+    bool supportsFinal() const override { return true; }
+
+    void checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const override;
+
+    /// The structure of the subordinate table is not checked and does not change.
+    void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & table_lock_holder) override;
+
+    std::optional<UInt64> totalRows(ContextPtr query_context) const override;
+    std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
+
+    std::optional<UInt64> lifetimeRows() const override { return lifetime_writes.rows; }
+    std::optional<UInt64> lifetimeBytes() const override { return lifetime_writes.bytes; }
+
+
+private:
+    struct Buffer
+    {
+        time_t first_write_time = 0;
+        Block data;
+
+        /// Schema version, checked to avoid mixing blocks with different sets of columns, from
+        /// before and after an ALTER. There are some remaining mild problems if an ALTER happens
+        /// in the middle of a long-running INSERT:
+        ///  * The data produced by the INSERT after the ALTER is not visible to SELECTs until flushed.
+        ///    That's because BufferSource skips buffers with old metadata_version instead of converting
+        ///    them to the latest schema, for simplicity.
+        ///  * If there are concurrent INSERTs, some of which started before the ALTER and some started
+        ///    after, then the buffer's metadata_version will oscillate back and forth between the two
+        ///    schemas, flushing the buffer each time. This is probably fine because long-running INSERTs
+        ///    usually don't produce lots of small blocks.
+        int32_t metadata_version = 0;
+
+        std::unique_lock<std::mutex> lockForReading() const;
+        std::unique_lock<std::mutex> lockForWriting() const;
+        std::unique_lock<std::mutex> tryLock() const;
+
+    private:
+        mutable std::mutex mutex;
+
+        std::unique_lock<std::mutex> lockImpl(bool read) const;
+    };
+
+    /// There are `num_shards` of independent buffers.
+    const size_t num_shards;
+    std::unique_ptr<ThreadPool> flush_pool;
+    std::vector<Buffer> buffers;
+
+    const Thresholds min_thresholds;
+    const Thresholds max_thresholds;
+    const Thresholds flush_thresholds;
+
+    StorageID destination_id;
+    bool allow_materialized;
+
+    struct Writes
+    {
+        std::atomic<size_t> rows = 0;
+        std::atomic<size_t> bytes = 0;
+    };
+    Writes lifetime_writes;
+    Writes total_writes;
+
+    LoggerPtr log;
+
+    void flushAllBuffers(bool check_thresholds = true);
+    bool flushBuffer(Buffer & buffer, bool check_thresholds, bool locked = false);
+    bool checkThresholds(const Buffer & buffer, bool direct, time_t current_time, size_t additional_rows = 0, size_t additional_bytes = 0) const;
+    bool checkThresholdsImpl(bool direct, size_t rows, size_t bytes, time_t time_passed) const;
+
+    /// `table` argument is passed, as it is sometimes evaluated beforehand. It must match the `destination`.
+    void writeBlockToDestination(const Block & block, StoragePtr table);
+
+    void backgroundFlush();
+    void reschedule(size_t min_delay);
+
+    StoragePtr getDestinationTable() const;
+
+    BackgroundSchedulePool & bg_pool;
+    BackgroundSchedulePoolTaskHolder flush_handle;
+
+    static constexpr size_t BACKGROUND_RESCHEDULE_MIN_DELAY = 1;
 };
 
 }

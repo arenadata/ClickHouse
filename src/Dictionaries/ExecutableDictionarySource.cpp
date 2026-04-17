@@ -1,191 +1,205 @@
-#include "ExecutableDictionarySource.h"
+#include <Dictionaries/ExecutableDictionarySource.h>
 
-#include <future>
-#include <thread>
-#include <ext/scope_guard.h>
-#include <DataStreams/IBlockOutputStream.h>
-#include <DataStreams/OwningBlockInputStream.h>
+#include <filesystem>
+
+#include <boost/algorithm/string/split.hpp>
+
+#include <Common/logger_useful.h>
+#include <Common/LocalDateTime.h>
+#include <Common/filesystemHelpers.h>
+
+#include <Processors/Sources/ShellCommandSource.h>
+#include <Processors/Sources/SourceFromSingleChunk.h>
+#include <Formats/formatBlock.h>
+
 #include <Interpreters/Context.h>
 #include <IO/WriteHelpers.h>
-#include <Common/ShellCommand.h>
-#include <Common/ThreadPool.h>
-#include <common/logger_useful.h>
-#include <common/LocalDateTime.h>
-#include "DictionarySourceFactory.h"
-#include "DictionarySourceHelpers.h"
-#include "DictionaryStructure.h"
-#include "registerDictionaries.h"
+
+#include <Dictionaries/DictionarySourceFactory.h>
+#include <Dictionaries/DictionarySourceHelpers.h>
+#include <Dictionaries/DictionaryStructure.h>
+
+#include <Core/Settings.h>
 
 namespace DB
 {
-static const UInt64 max_block_size = 8192;
+namespace Setting
+{
+    extern const SettingsBool cloud_mode;
+}
 
 namespace ErrorCodes
 {
-    extern const int LOGICAL_ERROR;
     extern const int DICTIONARY_ACCESS_DENIED;
+    extern const int UNSUPPORTED_METHOD;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace
 {
-    /// Owns ShellCommand and calls wait for it.
-    class ShellCommandOwningBlockInputStream : public OwningBlockInputStream<ShellCommand>
-    {
-    public:
-        ShellCommandOwningBlockInputStream(const BlockInputStreamPtr & impl, std::unique_ptr<ShellCommand> own_)
-            : OwningBlockInputStream(std::move(impl), std::move(own_))
-        {
-        }
 
-        void readSuffix() override
-        {
-            OwningBlockInputStream<ShellCommand>::readSuffix();
-            own->wait();
-        }
-    };
+    void updateCommandIfNeeded(String & command, bool execute_direct, ContextPtr context)
+    {
+        if (!execute_direct)
+            return;
+
+        auto global_context = context->getGlobalContext();
+        auto user_scripts_path = global_context->getUserScriptsPath();
+        auto script_path = user_scripts_path + '/' + command;
+
+        if (!fileOrSymlinkPathStartsWith(script_path, user_scripts_path))
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
+                "Executable file {} must be inside user scripts folder {}",
+                command,
+                user_scripts_path);
+
+        if (!FS::exists(script_path))
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
+                "Executable file {} does not exist inside user scripts folder {}",
+                command,
+                user_scripts_path);
+
+        if (!FS::canExecute(script_path))
+            throw Exception(ErrorCodes::UNSUPPORTED_METHOD,
+                "Executable file {} is not executable inside user scripts folder {}",
+                command,
+                user_scripts_path);
+
+        command = std::move(script_path);
+    }
 
 }
-
 
 ExecutableDictionarySource::ExecutableDictionarySource(
     const DictionaryStructure & dict_struct_,
-    const Poco::Util::AbstractConfiguration & config,
-    const std::string & config_prefix,
+    const Configuration & configuration_,
     Block & sample_block_,
-    const Context & context_)
-    : log(&Poco::Logger::get("ExecutableDictionarySource"))
-    , dict_struct{dict_struct_}
-    , command{config.getString(config_prefix + ".command")}
-    , update_field{config.getString(config_prefix + ".update_field", "")}
-    , format{config.getString(config_prefix + ".format")}
-    , sample_block{sample_block_}
+    std::shared_ptr<ShellCommandSourceCoordinator> coordinator_,
+    ContextPtr context_)
+    : log(getLogger("ExecutableDictionarySource"))
+    , dict_struct(dict_struct_)
+    , configuration(configuration_)
+    , sample_block(sample_block_)
+    , coordinator(std::move(coordinator_))
     , context(context_)
 {
+    /// Remove keys from sample_block for implicit_key dictionary because
+    /// these columns will not be returned from source
+    if (configuration.implicit_key)
+    {
+        auto keys_names = dict_struct.getKeysNames();
+
+        for (auto & key_name : keys_names)
+        {
+            size_t key_column_position_in_block = sample_block.getPositionByName(key_name);
+            sample_block.erase(key_column_position_in_block);
+        }
+    }
 }
 
 ExecutableDictionarySource::ExecutableDictionarySource(const ExecutableDictionarySource & other)
-    : log(&Poco::Logger::get("ExecutableDictionarySource"))
-    , update_time{other.update_time}
-    , dict_struct{other.dict_struct}
-    , command{other.command}
-    , update_field{other.update_field}
-    , format{other.format}
-    , sample_block{other.sample_block}
-    , context(other.context)
+    : log(getLogger("ExecutableDictionarySource"))
+    , update_time(other.update_time)
+    , dict_struct(other.dict_struct)
+    , configuration(other.configuration)
+    , sample_block(other.sample_block)
+    , coordinator(other.coordinator)
+    , context(Context::createCopy(other.context))
 {
 }
 
-BlockInputStreamPtr ExecutableDictionarySource::loadAll()
+BlockIO ExecutableDictionarySource::loadAll()
 {
+    if (configuration.implicit_key)
+        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "ExecutableDictionarySource with implicit_key does not support loadAll method");
+
     LOG_TRACE(log, "loadAll {}", toString());
-    auto process = ShellCommand::execute(command);
-    auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
-    return std::make_shared<ShellCommandOwningBlockInputStream>(input_stream, std::move(process));
+
+    const auto & coordinator_configuration = coordinator->getConfiguration();
+    auto command = configuration.command;
+    updateCommandIfNeeded(command, coordinator_configuration.execute_direct, context);
+
+    BlockIO io;
+    io.pipeline = QueryPipeline(coordinator->createPipe(command, configuration.command_arguments, {}, sample_block, context));
+    return io;
 }
 
-BlockInputStreamPtr ExecutableDictionarySource::loadUpdatedAll()
+BlockIO ExecutableDictionarySource::loadUpdatedAll()
 {
+    if (configuration.implicit_key)
+        throw Exception(ErrorCodes::UNSUPPORTED_METHOD, "ExecutableDictionarySource with implicit_key does not support loadUpdatedAll method");
+
     time_t new_update_time = time(nullptr);
-    SCOPE_EXIT(update_time = new_update_time);
 
-    std::string command_with_update_field = command;
+    const auto & coordinator_configuration = coordinator->getConfiguration();
+    auto command = configuration.command;
+    updateCommandIfNeeded(command, coordinator_configuration.execute_direct, context);
+
+    auto command_arguments = configuration.command_arguments;
+
     if (update_time)
-        command_with_update_field += " " + update_field + " " + DB::toString(LocalDateTime(update_time - 1));
-
-    LOG_TRACE(log, "loadUpdatedAll {}", command_with_update_field);
-    auto process = ShellCommand::execute(command_with_update_field);
-    auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
-    return std::make_shared<ShellCommandOwningBlockInputStream>(input_stream, std::move(process));
-}
-
-namespace
-{
-    /** A stream, that also runs and waits for background thread
-  * (that will feed data into pipe to be read from the other side of the pipe).
-  */
-    class BlockInputStreamWithBackgroundThread final : public IBlockInputStream
     {
-    public:
-        BlockInputStreamWithBackgroundThread(
-            const BlockInputStreamPtr & stream_, std::unique_ptr<ShellCommand> && command_, std::packaged_task<void()> && task_)
-            : stream{stream_}, command{std::move(command_)}, task(std::move(task_)), thread([this] {
-                task();
-                command->in.close();
-            })
+        auto update_difference = DB::toString(LocalDateTime(update_time - configuration.update_lag));
+
+        if (coordinator_configuration.execute_direct)
         {
-            children.push_back(stream);
+            command_arguments.emplace_back(configuration.update_field);
+            command_arguments.emplace_back(std::move(update_difference));
         }
-
-        ~BlockInputStreamWithBackgroundThread() override
+        else
         {
-            if (thread.joinable())
-            {
-                try
-                {
-                    readSuffix();
-                }
-                catch (...)
-                {
-                    tryLogCurrentException(__PRETTY_FUNCTION__);
-                }
-            }
+            command += ' ' + configuration.update_field + ' ' + update_difference;
         }
+    }
 
-        Block getHeader() const override { return stream->getHeader(); }
+    update_time = new_update_time;
 
-    private:
-        Block readImpl() override { return stream->read(); }
+    LOG_TRACE(log, "loadUpdatedAll {}", command);
 
-        void readSuffix() override
-        {
-            IBlockInputStream::readSuffix();
-            if (!wait_called)
-            {
-                wait_called = true;
-                command->wait();
-            }
-            thread.join();
-            /// To rethrow an exception, if any.
-            task.get_future().get();
-        }
-
-        String getName() const override { return "WithBackgroundThread"; }
-
-        BlockInputStreamPtr stream;
-        std::unique_ptr<ShellCommand> command;
-        std::packaged_task<void()> task;
-        ThreadFromGlobalPool thread;
-        bool wait_called = false;
-    };
-
+    BlockIO io;
+    io.pipeline = QueryPipeline(coordinator->createPipe(command, command_arguments, {}, sample_block, context));
+    return io;
 }
 
-
-BlockInputStreamPtr ExecutableDictionarySource::loadIds(const std::vector<UInt64> & ids)
+BlockIO ExecutableDictionarySource::loadIds(const VectorWithMemoryTracking<UInt64> & ids)
 {
     LOG_TRACE(log, "loadIds {} size = {}", toString(), ids.size());
-    auto process = ShellCommand::execute(command);
 
-    auto output_stream = context.getOutputFormat(format, process->in, sample_block);
-    auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
-
-    return std::make_shared<BlockInputStreamWithBackgroundThread>(
-        input_stream, std::move(process), std::packaged_task<void()>([output_stream, &ids]() mutable { formatIDs(output_stream, ids); }));
+    auto block = blockForIds(dict_struct, ids);
+    BlockIO io;
+    io.pipeline = getStreamForBlock(block);
+    return io;
 }
 
-BlockInputStreamPtr ExecutableDictionarySource::loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows)
+BlockIO ExecutableDictionarySource::loadKeys(const Columns & key_columns, const VectorWithMemoryTracking<size_t> & requested_rows)
 {
     LOG_TRACE(log, "loadKeys {} size = {}", toString(), requested_rows.size());
-    auto process = ShellCommand::execute(command);
 
-    auto output_stream = context.getOutputFormat(format, process->in, sample_block);
-    auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
+    auto block = blockForKeys(dict_struct, key_columns, requested_rows);
+    BlockIO io;
+    io.pipeline = getStreamForBlock(block);
+    return io;
+}
 
-    return std::make_shared<BlockInputStreamWithBackgroundThread>(
-        input_stream, std::move(process), std::packaged_task<void()>([output_stream, key_columns, &requested_rows, this]() mutable
-        {
-            formatKeys(dict_struct, output_stream, key_columns, requested_rows);
-        }));
+QueryPipeline ExecutableDictionarySource::getStreamForBlock(const Block & block)
+{
+    const auto & coordinator_configuration = coordinator->getConfiguration();
+    String command = configuration.command;
+    updateCommandIfNeeded(command, coordinator_configuration.execute_direct, context);
+
+    auto header = std::make_shared<const Block>(block);
+    auto source = std::make_shared<SourceFromSingleChunk>(header);
+    auto shell_input_pipe = Pipe(std::move(source));
+
+    Pipes shell_input_pipes;
+    shell_input_pipes.emplace_back(std::move(shell_input_pipe));
+
+    auto pipe = coordinator->createPipe(command, configuration.command_arguments, std::move(shell_input_pipes), sample_block, context);
+
+    if (configuration.implicit_key)
+        pipe.addTransform(std::make_shared<TransformWithAdditionalColumns>(header, pipe.getSharedHeader()));
+
+    return QueryPipeline(std::move(pipe));
 }
 
 bool ExecutableDictionarySource::isModified() const
@@ -200,43 +214,86 @@ bool ExecutableDictionarySource::supportsSelectiveLoad() const
 
 bool ExecutableDictionarySource::hasUpdateField() const
 {
-    return !update_field.empty();
+    return !configuration.update_field.empty();
 }
 
 DictionarySourcePtr ExecutableDictionarySource::clone() const
 {
-    return std::make_unique<ExecutableDictionarySource>(*this);
+    return std::make_shared<ExecutableDictionarySource>(*this);
 }
 
 std::string ExecutableDictionarySource::toString() const
 {
-    return "Executable: " + command;
+    return "Executable: " + configuration.command;
 }
 
 void registerDictionarySourceExecutable(DictionarySourceFactory & factory)
 {
-    auto create_table_source = [=](const DictionaryStructure & dict_struct,
+    auto create_table_source = [=](const String & /*name*/,
+                                 const DictionaryStructure & dict_struct,
                                  const Poco::Util::AbstractConfiguration & config,
                                  const std::string & config_prefix,
                                  Block & sample_block,
-                                 const Context & context,
-                                 bool check_config) -> DictionarySourcePtr
+                                 ContextPtr global_context,
+                                 const std::string & /* default_database */,
+                                 bool created_from_ddl) -> DictionarySourcePtr
     {
+        if (global_context->getSettingsRef()[Setting::cloud_mode])
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Dictionary source of type `executable` is disabled");
+
         if (dict_struct.has_expressions)
-            throw Exception{"Dictionary source of type `executable` does not support attribute expressions", ErrorCodes::LOGICAL_ERROR};
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Dictionary source of type `executable` does not support attribute expressions");
 
         /// Executable dictionaries may execute arbitrary commands.
         /// It's OK for dictionaries created by administrator from xml-file, but
         /// maybe dangerous for dictionaries created from DDL-queries.
-        if (check_config)
-            throw Exception("Dictionaries with Executable dictionary source is not allowed", ErrorCodes::DICTIONARY_ACCESS_DENIED);
+        if (created_from_ddl && global_context->getApplicationType() != Context::ApplicationType::LOCAL)
+            throw Exception(ErrorCodes::DICTIONARY_ACCESS_DENIED,
+                            "Dictionaries with executable dictionary source are not allowed "
+                            "to be created from DDL query");
 
-        Context context_local_copy = copyContextAndApplySettings(config_prefix, context, config);
+        auto context = copyContextAndApplySettingsFromDictionaryConfig(global_context, config, config_prefix);
 
-        return std::make_unique<ExecutableDictionarySource>(
-            dict_struct, config, config_prefix + ".executable",
-            sample_block, context_local_copy);
+        std::string settings_config_prefix = config_prefix + ".executable";
+
+        bool execute_direct = config.getBool(settings_config_prefix + ".execute_direct", false);
+        std::string command_value = config.getString(settings_config_prefix + ".command");
+        VectorWithMemoryTracking<String> command_arguments;
+
+        if (execute_direct)
+        {
+            boost::split(command_arguments, command_value, [](char c) { return c == ' '; });
+
+            command_value = std::move(command_arguments[0]);
+            command_arguments.erase(command_arguments.begin());
+        }
+
+        ExecutableDictionarySource::Configuration configuration
+        {
+            .command = std::move(command_value),
+            .command_arguments = std::move(command_arguments),
+            .update_field = config.getString(settings_config_prefix + ".update_field", ""),
+            .update_lag = config.getUInt64(settings_config_prefix + ".update_lag", 1),
+            .implicit_key = config.getBool(settings_config_prefix + ".implicit_key", false),
+        };
+
+        ShellCommandSourceCoordinator::Configuration shell_command_coordinator_configration
+        {
+            .format = config.getString(settings_config_prefix + ".format"),
+            .command_termination_timeout_seconds = config.getUInt64(settings_config_prefix + ".command_termination_timeout", 10),
+            .command_read_timeout_milliseconds = config.getUInt64(settings_config_prefix + ".command_read_timeout", 10000),
+            .command_write_timeout_milliseconds = config.getUInt64(settings_config_prefix + ".command_write_timeout", 10000),
+            .stderr_reaction = parseExternalCommandStderrReaction(config.getString(settings_config_prefix + ".stderr_reaction", "log_last")),
+            .check_exit_code = config.getBool(settings_config_prefix + ".check_exit_code", true),
+            .is_executable_pool = false,
+            .send_chunk_header = config.getBool(settings_config_prefix + ".send_chunk_header", false),
+            .execute_direct = config.getBool(settings_config_prefix + ".execute_direct", false)
+        };
+
+        auto coordinator = std::make_shared<ShellCommandSourceCoordinator>(shell_command_coordinator_configration);
+        return std::make_unique<ExecutableDictionarySource>(dict_struct, configuration, sample_block, std::move(coordinator), context);
     };
+
     factory.registerSource("executable", create_table_source);
 }
 

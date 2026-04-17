@@ -1,18 +1,23 @@
 #include <Processors/QueryPlan/ReadNothingStep.h>
-#include <Processors/QueryPipeline.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Processors/Sources/NullSource.h>
 
 namespace DB
 {
 
-ReadNothingStep::ReadNothingStep(Block output_header)
-    : ISourceStep(DataStream{.header = std::move(output_header), .has_single_port = true})
+ReadNothingStep::ReadNothingStep(SharedHeader output_header_)
+    : ISourceStep(std::move(output_header_))
 {
 }
 
-void ReadNothingStep::initializePipeline(QueryPipeline & pipeline)
+QueryPlanStepPtr ReadNothingStep::clone() const
 {
-    pipeline.init(Pipe(std::make_shared<NullSource>(getOutputStream().header)));
+    return std::make_unique<ReadNothingStep>(getOutputHeader());
+}
+
+void ReadNothingStep::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    pipeline.init(Pipe(std::make_shared<NullSource>(getOutputHeader())));
 }
 
 }

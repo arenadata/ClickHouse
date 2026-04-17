@@ -1,178 +1,155 @@
-#include <DataStreams/NativeBlockInputStream.h>
-#include <DataStreams/NativeBlockOutputStream.h>
+#include <Formats/NativeReader.h>
+#include <Formats/NativeWriter.h>
+
 #include <Formats/FormatFactory.h>
 #include <Processors/Formats/IInputFormat.h>
 #include <Processors/Formats/IOutputFormat.h>
+#include <Processors/Formats/ISchemaReader.h>
+#include <Processors/Transforms/AggregatingTransform.h>
 
 
 namespace DB
 {
 
-class NativeInputFormatFromNativeBlockInputStream : public IInputFormat
+
+class NativeInputFormat final : public IInputFormat
 {
 public:
-    NativeInputFormatFromNativeBlockInputStream(const Block & header, ReadBuffer & in_)
-        : IInputFormat(header, in_)
-        , stream(std::make_shared<NativeBlockInputStream>(in, header, 0))
-    {
-    }
+    NativeInputFormat(ReadBuffer & buf, SharedHeader header_, const FormatSettings & settings_)
+        : IInputFormat(header_, &buf)
+        , reader(std::make_unique<NativeReader>(
+              buf,
+              *header_,
+              0,
+              settings_,
+              settings_.defaults_for_omitted_fields ? &block_missing_values : nullptr))
+        , header(header_)
+        , block_missing_values(header->columns())
+        , settings(settings_)
+        {
+        }
 
-    String getName() const override { return "NativeInputFormatFromNativeBlockInputStream"; }
+    String getName() const override { return "Native"; }
 
-protected:
     void resetParser() override
     {
         IInputFormat::resetParser();
-        stream->resetParser();
-        read_prefix = false;
-        read_suffix = false;
+        reader->resetParser();
     }
 
-
-    Chunk generate() override
+    Chunk read() override
     {
-        /// TODO: do something with totals and extremes.
+        block_missing_values.clear();
+        size_t block_start = getDataOffsetMaybeCompressed(*in);
+        auto block = reader->read();
+        approx_bytes_read_for_chunk = getDataOffsetMaybeCompressed(*in) - block_start;
 
-        if (!read_prefix)
-        {
-            stream->readPrefix();
-            read_prefix = true;
-        }
-
-        auto block = stream->read();
-        if (!block)
-        {
-            if (!read_suffix)
-            {
-                stream->readSuffix();
-                read_suffix = true;
-            }
-
-            return Chunk();
-        }
+        if (block.empty())
+            return {};
 
         assertBlocksHaveEqualStructure(getPort().getHeader(), block, getName());
         block.checkNumberOfRows();
 
-        UInt64 num_rows = block.rows();
+        size_t num_rows = block.rows();
         return Chunk(block.getColumns(), num_rows);
     }
 
+    void setReadBuffer(ReadBuffer & in_) override
+    {
+        reader = std::make_unique<NativeReader>(in_, *header, 0, settings, settings.defaults_for_omitted_fields ? &block_missing_values : nullptr);
+        IInputFormat::setReadBuffer(in_);
+    }
+
+    const BlockMissingValues * getMissingValues() const override { return &block_missing_values; }
+
+    size_t getApproxBytesReadForChunk() const override { return approx_bytes_read_for_chunk; }
+
 private:
-    std::shared_ptr<NativeBlockInputStream> stream;
-    bool read_prefix = false;
-    bool read_suffix = false;
+    std::unique_ptr<NativeReader> reader;
+    SharedHeader header;
+    BlockMissingValues block_missing_values;
+    const FormatSettings settings;
+    size_t approx_bytes_read_for_chunk = 0;
 };
 
-
-class NativeOutputFormatFromNativeBlockOutputStream : public IOutputFormat
+class NativeOutputFormat final : public IOutputFormat
 {
 public:
-    NativeOutputFormatFromNativeBlockOutputStream(const Block & header, WriteBuffer & out_)
-            : IOutputFormat(header, out_)
-            , stream(std::make_shared<NativeBlockOutputStream>(out, 0, header))
+    NativeOutputFormat(WriteBuffer & buf, SharedHeader header, const FormatSettings & settings, UInt64 client_protocol_version = 0)
+        : IOutputFormat(header, buf)
+        , writer(buf, client_protocol_version, header, settings)
     {
     }
 
-    String getName() const override { return "NativeOutputFormatFromNativeBlockOutputStream"; }
-
-    void setRowsBeforeLimit(size_t rows_before_limit) override
-    {
-        stream->setRowsBeforeLimit(rows_before_limit);
-    }
-
-    void onProgress(const Progress & progress) override
-    {
-        stream->onProgress(progress);
-    }
-
-    std::string getContentType() const override
-    {
-        return stream->getContentType();
-    }
+    String getName() const override { return "Native"; }
 
 protected:
     void consume(Chunk chunk) override
     {
-        writePrefixIfNot();
-
         if (chunk)
         {
-
             auto block = getPort(PortKind::Main).getHeader();
             block.setColumns(chunk.detachColumns());
-            stream->write(block);
+            writer.write(block);
         }
     }
 
-    void consumeTotals(Chunk chunk) override
+private:
+    NativeWriter writer;
+};
+
+class NativeSchemaReader : public ISchemaReader
+{
+public:
+    explicit NativeSchemaReader(ReadBuffer & in_, const FormatSettings & settings_) : ISchemaReader(in_), settings(settings_) {}
+
+    NamesAndTypesList readSchema() override
     {
-        writePrefixIfNot();
-
-        auto block = getPort(PortKind::Totals).getHeader();
-        block.setColumns(chunk.detachColumns());
-        stream->setTotals(block);
-    }
-
-    void consumeExtremes(Chunk chunk) override
-    {
-        writePrefixIfNot();
-
-        auto block = getPort(PortKind::Extremes).getHeader();
-        block.setColumns(chunk.detachColumns());
-        stream->setExtremes(block);
-    }
-
-    void finalize() override
-    {
-        writePrefixIfNot();
-        writeSuffixIfNot();
+        auto reader = NativeReader(in, 0, settings);
+        auto block = reader.read();
+        return block.getNamesAndTypesList();
     }
 
 private:
-    std::shared_ptr<NativeBlockOutputStream> stream;
-    bool prefix_written = false;
-    bool suffix_written = false;
-
-    void writePrefixIfNot()
-    {
-        if (!prefix_written)
-            stream->writePrefix();
-
-        prefix_written = true;
-    }
-
-    void writeSuffixIfNot()
-    {
-        if (!suffix_written)
-            stream->writeSuffix();
-
-        suffix_written = true;
-    }
+    const FormatSettings settings;
 };
 
-void registerInputFormatProcessorNative(FormatFactory & factory)
+
+void registerInputFormatNative(FormatFactory & factory)
 {
-    factory.registerInputFormatProcessor("Native", [](
+    factory.registerInputFormat("Native", [](
         ReadBuffer & buf,
         const Block & sample,
         const RowInputFormatParams &,
-        const FormatSettings &)
+        const FormatSettings & settings)
     {
-        return std::make_shared<NativeInputFormatFromNativeBlockInputStream>(sample, buf);
+        return std::make_shared<NativeInputFormat>(buf, std::make_shared<const Block>(sample), settings);
+    });
+    factory.markFormatSupportsSubsetOfColumns("Native");
+}
+
+void registerOutputFormatNative(FormatFactory & factory)
+{
+    factory.registerOutputFormat("Native", [](
+        WriteBuffer & buf,
+        const Block & sample,
+        const FormatSettings & settings,
+        FormatFilterInfoPtr /*format_filter_info*/)
+    {
+        return std::make_shared<NativeOutputFormat>(buf, std::make_shared<const Block>(sample), settings, settings.client_protocol_version);
+    });
+    factory.markOutputFormatNotTTYFriendly("Native");
+    factory.setContentType("Native", "application/octet-stream");
+}
+
+
+void registerNativeSchemaReader(FormatFactory & factory)
+{
+    factory.registerSchemaReader("Native", [](ReadBuffer & buf, const FormatSettings & settings)
+    {
+        return std::make_shared<NativeSchemaReader>(buf, settings);
     });
 }
 
-void registerOutputFormatProcessorNative(FormatFactory & factory)
-{
-    factory.registerOutputFormatProcessor("Native", [](
-        WriteBuffer & buf,
-        const Block & sample,
-        FormatFactory::WriteCallback,
-        const FormatSettings &)
-    {
-        return std::make_shared<NativeOutputFormatFromNativeBlockOutputStream>(sample, buf);
-    });
-}
 
 }

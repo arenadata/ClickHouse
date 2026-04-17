@@ -8,13 +8,22 @@ namespace DB
 class SingleDiskVolume : public IVolume
 {
 public:
-    SingleDiskVolume(const String & name_, DiskPtr disk): IVolume(name_, {disk})
+    SingleDiskVolume(const String & name_, DiskPtr disk, size_t max_data_part_size_ = 0): IVolume(name_, {disk}, max_data_part_size_)
     {
     }
 
     ReservationPtr reserve(UInt64 bytes) override
     {
+        if (disks[0]->isReadOnly())
+            return {};
         return disks[0]->reserve(bytes);
+    }
+
+    ReservationPtr reserve(UInt64 bytes, const ReservationConstraints & constraints) override
+    {
+        if (disks[0]->isReadOnly())
+            return {};
+        return disks[0]->reserve(bytes, constraints);
     }
 
     VolumeType getType() const override { return VolumeType::SINGLE_DISK; }
@@ -22,5 +31,6 @@ public:
 };
 
 using VolumeSingleDiskPtr = std::shared_ptr<SingleDiskVolume>;
+using VolumesSingleDiskPtr = std::vector<VolumeSingleDiskPtr>;
 
 }

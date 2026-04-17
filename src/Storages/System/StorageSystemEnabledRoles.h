@@ -1,6 +1,5 @@
 #pragma once
 
-#include <ext/shared_ptr_helper.h>
 #include <Storages/System/IStorageSystemOneBlock.h>
 
 
@@ -9,16 +8,15 @@ namespace DB
 class Context;
 
 /// Implements `enabled_roles` system table, which allows you to get information about enabled roles.
-class StorageSystemEnabledRoles final : public ext::shared_ptr_helper<StorageSystemEnabledRoles>, public IStorageSystemOneBlock<StorageSystemEnabledRoles>
+class StorageSystemEnabledRoles final : public IStorageSystemOneBlock
 {
 public:
     std::string getName() const override { return "SystemEnabledRoles"; }
-    static NamesAndTypesList getNamesAndTypes();
+    static ColumnsDescription getColumnsDescription();
 
 protected:
-    friend struct ext::shared_ptr_helper<StorageSystemEnabledRoles>;
     using IStorageSystemOneBlock::IStorageSystemOneBlock;
-    void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo &) const override;
+    void fillData(MutableColumns & res_columns, ContextPtr context, const ActionsDAG::Node *, std::vector<UInt8>) const override;
 };
 
 }

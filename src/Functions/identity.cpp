@@ -1,44 +1,37 @@
-#include <Functions/IFunctionImpl.h>
+#include <Functions/identity.h>
 #include <Functions/FunctionFactory.h>
-
+#include <Common/FunctionDocumentation.h>
 
 namespace DB
 {
 
-class FunctionIdentity : public IFunction
+REGISTER_FUNCTION(Identity)
 {
-public:
-    static constexpr auto name = "identity";
-    static FunctionPtr create(const Context &)
-    {
-        return std::make_shared<FunctionIdentity>();
-    }
+    FunctionDocumentation::Description description = R"(
+This function returns the argument you pass to it, which is useful for debugging and testing. It lets you bypass index usage to see full scan performance instead. The query analyzer ignores anything inside identity functions when looking for indexes to use, and it also disables constant folding.
+)";
+    FunctionDocumentation::Syntax syntax = "identity(x)";
+    FunctionDocumentation::Arguments arguments = {
+        {"x", "Input value.", {"Any"}}
+    };
+    FunctionDocumentation::ReturnedValue returned_value = {"Returns the input value unchanged.", {"Any"}};
+    FunctionDocumentation::Examples examples = {
+        {"Usage example", "SELECT identity(42)", "42"}
+    };
+    FunctionDocumentation::IntroducedIn introduced_in = {1, 1};
+    FunctionDocumentation::Category category = FunctionDocumentation::Category::Other;
+    FunctionDocumentation documentation = {description, syntax, arguments, {}, returned_value, examples, introduced_in, category};
+    factory.registerFunction("identity", [](ContextPtr){ return FunctionIdentityBase::create({}, "identity", true); }, documentation);
+}
 
-    String getName() const override
-    {
-        return name;
-    }
-
-    size_t getNumberOfArguments() const override
-    {
-        return 1;
-    }
-
-    DataTypePtr getReturnTypeImpl(const DataTypes & arguments) const override
-    {
-        return arguments.front();
-    }
-
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
-    {
-        block.getByPosition(result).column = block.getByPosition(arguments.front()).column;
-    }
-};
-
-
-void registerFunctionIdentity(FunctionFactory & factory)
+REGISTER_FUNCTION(ScalarSubqueryResult)
 {
-    factory.registerFunction<FunctionIdentity>();
+    factory.registerFunction("__scalarSubqueryResult", [](ContextPtr){ return FunctionIdentityBase::create({}, "__scalarSubqueryResult", false); }, FunctionDocumentation::INTERNAL_FUNCTION_DOCS);
+}
+
+REGISTER_FUNCTION(ActionName)
+{
+    factory.registerFunction("__actionName", [](ContextPtr){ return FunctionActionName::create({}); }, FunctionDocumentation::INTERNAL_FUNCTION_DOCS);
 }
 
 }

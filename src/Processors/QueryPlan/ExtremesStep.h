@@ -7,11 +7,22 @@ namespace DB
 class ExtremesStep : public ITransformingStep
 {
 public:
-    explicit ExtremesStep(const DataStream & input_stream_);
+    explicit ExtremesStep(const SharedHeader & input_header_);
 
     String getName() const override { return "Extremes"; }
 
-    void transformPipeline(QueryPipeline & pipeline) override;
+    void transformPipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+
+    void serialize(Serialization & ctx) const override;
+    bool isSerializable() const override { return true; }
+
+    static QueryPlanStepPtr deserialize(Deserialization & ctx);
+
+private:
+    void updateOutputHeader() override
+    {
+        output_header = input_headers.front();
+    }
 };
 
 }

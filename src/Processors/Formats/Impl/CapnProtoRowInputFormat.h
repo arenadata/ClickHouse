@@ -1,11 +1,12 @@
 #pragma once
 
-#include "config_formats.h"
+#include "config.h"
 #if USE_CAPNP
 
-#include <Core/Block.h>
+#include <Formats/CapnProtoSchema.h>
+#include <Formats/CapnProtoSerializer.h>
 #include <Processors/Formats/IRowInputFormat.h>
-#include <capnp/schema-parser.h>
+#include <Processors/Formats/ISchemaReader.h>
 
 namespace DB
 {
@@ -19,57 +20,38 @@ class ReadBuffer;
   * The schema in this case cannot be compiled in, so it uses a runtime schema parser.
   * See https://capnproto.org/cxx.html
   */
-class CapnProtoRowInputFormat : public IRowInputFormat
+class CapnProtoRowInputFormat final : public IRowInputFormat
 {
 public:
-    struct NestedField
-    {
-        std::vector<std::string> tokens;
-        size_t pos;
-    };
-    using NestedFieldList = std::vector<NestedField>;
-
-    /** schema_dir  - base path for schema files
-      * schema_file - location of the capnproto schema, e.g. "schema.capnp"
-      * root_object - name to the root object, e.g. "Message"
-      */
-    CapnProtoRowInputFormat(ReadBuffer & in_, Block header, Params params_, const FormatSchemaInfo & info);
+    CapnProtoRowInputFormat(ReadBuffer & in_, SharedHeader header, Params params_, const CapnProtoSchemaInfo & info, const FormatSettings & format_settings);
 
     String getName() const override { return "CapnProtoRowInputFormat"; }
 
+private:
     bool readRow(MutableColumns & columns, RowReadExtension &) override;
 
-private:
+    bool supportsCountRows() const override { return true; }
+    size_t countRows(size_t max_block_size) override;
+
+    std::pair<kj::Array<capnp::word>, size_t> readMessagePrefix();
     kj::Array<capnp::word> readMessage();
+    void skipMessage();
 
-    // Build a traversal plan from a sorted list of fields
-    void createActions(const NestedFieldList & sorted_fields, capnp::StructSchema reader);
+    std::shared_ptr<CapnProtoSchemaParser> parser;
+    capnp::StructSchema schema;
+    std::unique_ptr<CapnProtoSerializer> serializer;
+    UInt64 max_message_size;
+};
 
-    /* Action for state machine for traversing nested structures. */
-    using BlockPositionList = std::vector<size_t>;
-    struct Action
-    {
-        enum Type { POP, PUSH, READ };
-        Type type;
-        capnp::StructSchema::Field field = {};
-        BlockPositionList columns = {};
-    };
+class CapnProtoSchemaReader : public IExternalSchemaReader
+{
+public:
+    explicit CapnProtoSchemaReader(const FormatSettings & format_settings_);
 
-    // Wrapper for classes that could throw in destructor
-    // https://github.com/capnproto/capnproto/issues/553
-    template <typename T>
-    struct DestructorCatcher
-    {
-        T impl;
-        template <typename ... Arg>
-        DestructorCatcher(Arg && ... args) : impl(kj::fwd<Arg>(args)...) {}
-        ~DestructorCatcher() noexcept try { } catch (...) { return; }
-    };
-    using SchemaParser = DestructorCatcher<capnp::SchemaParser>;
+    NamesAndTypesList readSchema() override;
 
-    std::shared_ptr<SchemaParser> parser;
-    capnp::StructSchema root;
-    std::vector<Action> actions;
+private:
+    const FormatSettings format_settings;
 };
 
 }

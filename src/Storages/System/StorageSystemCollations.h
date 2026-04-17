@@ -1,23 +1,21 @@
 #pragma once
+
 #include <Storages/System/IStorageSystemOneBlock.h>
-#include <ext/shared_ptr_helper.h>
 
 namespace DB
 {
 
-class StorageSystemCollations final : public ext::shared_ptr_helper<StorageSystemCollations>,
-                                public IStorageSystemOneBlock<StorageSystemCollations>
+class StorageSystemCollations final : public IStorageSystemOneBlock
 {
-    friend struct ext::shared_ptr_helper<StorageSystemCollations>;
 protected:
-    void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo & query_info) const override;
+    void fillData(MutableColumns & res_columns, ContextPtr, const ActionsDAG::Node *, std::vector<UInt8>) const override;
 
     using IStorageSystemOneBlock::IStorageSystemOneBlock;
-public:
 
+public:
     std::string getName() const override { return "SystemTableCollations"; }
 
-    static NamesAndTypesList getNamesAndTypes();
+    static ColumnsDescription getColumnsDescription();
 };
 
 }

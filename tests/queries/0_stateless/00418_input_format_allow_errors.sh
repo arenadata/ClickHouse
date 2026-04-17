@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-. $CURDIR/../shell_config.sh
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
 
 $CLICKHOUSE_CLIENT --query="DROP TABLE IF EXISTS formats_test"
 $CLICKHOUSE_CLIENT --query="CREATE TABLE formats_test (x UInt64, s String) ENGINE = Memory"
@@ -25,3 +26,5 @@ echo -ne 'x=1\ts=TSKV\nx=minus2\ts=trash1\ns=trash2\tx=-3\ns=TSKV Ok\tx=4\ns=tra
 $CLICKHOUSE_CLIENT --query="SELECT * FROM formats_test ORDER BY x, s"
 
 $CLICKHOUSE_CLIENT --query="DROP TABLE formats_test"
+
+echo '::' | $CLICKHOUSE_LOCAL --structure 'i IPv4' --query='SELECT * FROM table' --input_format_allow_errors_num=1

@@ -1,9 +1,11 @@
 #include <Parsers/ParserCheckQuery.h>
 #include <Parsers/CommonParsers.h>
-#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ASTCheckQuery.h>
+#include <Parsers/ASTCheckDatabaseQuery.h>
+#include <Parsers/ASTLiteral.h>
 #include <Parsers/ParserPartition.h>
+#include <Parsers/parseDatabaseAndTableName.h>
 
 
 namespace DB
@@ -11,41 +13,79 @@ namespace DB
 
 bool ParserCheckQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    ParserKeyword s_check_table("CHECK TABLE");
-    ParserKeyword s_partition("PARTITION");
+    ParserKeyword s_check_table(Keyword::CHECK_ALL_TABLES);
+    if (s_check_table.ignore(pos, expected))
+    {
+        auto query = make_intrusive<ASTCheckAllTablesQuery>();
+        node = query;
+        return true;
+    }
+
+    if (parseCheckTable(pos, node, expected))
+        return true;
+
+    return parseCheckDatabase(pos, node, expected);
+}
+
+bool ParserCheckQuery::parseCheckTable(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    ParserKeyword s_check_table(Keyword::CHECK_TABLE);
+    ParserKeyword s_partition(Keyword::PARTITION);
+    ParserKeyword s_part(Keyword::PART);
     ParserToken s_dot(TokenType::Dot);
 
-    ParserIdentifier table_parser;
     ParserPartition partition_parser;
-
-    ASTPtr table;
-    ASTPtr database;
+    ParserStringLiteral parser_string_literal;
 
     if (!s_check_table.ignore(pos, expected))
         return false;
-    if (!table_parser.parse(pos, database, expected))
+
+    auto query = make_intrusive<ASTCheckTableQuery>();
+
+    if (!parseDatabaseAndTableAsAST(pos, expected, query->database, query->table))
         return false;
-
-    auto query = std::make_shared<ASTCheckQuery>();
-    if (s_dot.ignore(pos))
-    {
-        if (!table_parser.parse(pos, table, expected))
-            return false;
-
-        tryGetIdentifierNameInto(database, query->database);
-        tryGetIdentifierNameInto(table, query->table);
-    }
-    else
-    {
-        table = database;
-        tryGetIdentifierNameInto(table, query->table);
-    }
 
     if (s_partition.ignore(pos, expected))
     {
         if (!partition_parser.parse(pos, query->partition, expected))
             return false;
     }
+    else if (s_part.ignore(pos, expected))
+    {
+        ASTPtr ast_part_name;
+        if (!parser_string_literal.parse(pos, ast_part_name, expected))
+            return false;
+
+        const auto * ast_literal = ast_part_name->as<ASTLiteral>();
+        if (!ast_literal || ast_literal->value.getType() != Field::Types::String)
+            return false;
+        query->part_name = ast_literal->value.safeGet<String>();
+    }
+
+    if (query->database)
+        query->children.push_back(query->database);
+
+    if (query->table)
+        query->children.push_back(query->table);
+
+    node = query;
+    return true;
+}
+
+bool ParserCheckQuery::parseCheckDatabase(Pos & pos, ASTPtr & node, Expected & expected)
+{
+    ParserKeyword s_check_database(Keyword::CHECK_DATABASE);
+
+    if (!s_check_database.ignore(pos, expected))
+        return false;
+
+    auto query = make_intrusive<ASTCheckDatabaseQuery>();
+
+    if (!parseDatabaseAsAST(pos, expected, query->database))
+        return false;
+
+    if (query->database)
+        query->children.push_back(query->database);
 
     node = query;
     return true;

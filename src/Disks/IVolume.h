@@ -8,12 +8,20 @@
 namespace DB
 {
 
-enum class VolumeType
+enum class VolumeType : uint8_t
 {
     JBOD,
     SINGLE_DISK,
     UNKNOWN
 };
+
+enum class VolumeLoadBalancing : uint8_t
+{
+    ROUND_ROBIN,
+    LEAST_USED,
+};
+
+VolumeLoadBalancing parseVolumeLoadBalancing(const String & config);
 
 class IVolume;
 using VolumePtr = std::shared_ptr<IVolume>;
@@ -33,7 +41,19 @@ using Volumes = std::vector<VolumePtr>;
 class IVolume : public Space
 {
 public:
-    IVolume(String name_, Disks disks_): disks(std::move(disks_)), name(name_)
+    /// This constructor is only for:
+    /// - SingleDiskVolume
+    /// From createVolumeFromReservation().
+    IVolume(String name_,
+            Disks disks_,
+            size_t max_data_part_size_ = 0,
+            bool perform_ttl_move_on_insert_ = true,
+            VolumeLoadBalancing load_balancing_ = VolumeLoadBalancing::ROUND_ROBIN)
+        : disks(std::move(disks_))
+        , name(name_)
+        , max_data_part_size(max_data_part_size_)
+        , perform_ttl_move_on_insert(perform_ttl_move_on_insert_)
+        , load_balancing(load_balancing_)
     {
     }
 
@@ -44,21 +64,50 @@ public:
         DiskSelectorPtr disk_selector
     );
 
-    virtual ReservationPtr reserve(UInt64 bytes) override = 0;
+    ReservationPtr reserve(UInt64 bytes) override = 0;
+
+    ReservationPtr reserve(UInt64 bytes, const ReservationConstraints & constraints) override = 0;
+
+    /// This is a volume.
+    bool isVolume() const override { return true; }
 
     /// Volume name from config
     const String & getName() const override { return name; }
     virtual VolumeType getType() const = 0;
 
     /// Return biggest unreserved space across all disks
-    UInt64 getMaxUnreservedFreeSpace() const;
+    std::optional<UInt64> getMaxUnreservedFreeSpace() const;
 
-    DiskPtr getDisk(size_t i = 0) const { return disks[i]; }
+    DiskPtr getDisk() const { return getDisk(0); }
+    virtual DiskPtr getDisk(size_t i) const { return disks[i]; }
+    Disks & getDisks() { return disks; }
     const Disks & getDisks() const { return disks; }
+
+    /// Returns true if all disks are readonly.
+    virtual bool isReadOnly() const;
+
+    /// Returns effective value of whether merges are allowed on this volume (false) or not (true).
+    virtual bool areMergesAvoided() const { return false; }
+
+    /// User setting for enabling and disabling merges on volume.
+    virtual void setAvoidMergesUserOverride(bool /*avoid*/) {}
 
 protected:
     Disks disks;
     const String name;
+
+public:
+    /// Volume priority. Maximum UInt64 value by default (lowest possible priority)
+    UInt64 volume_priority;
+    /// Max size of reservation, zero means unlimited size
+    UInt64 max_data_part_size = 0;
+    /// Should a new data part be synchronously moved to a volume according to ttl on insert
+    /// or move this part in background task asynchronously after insert.
+    bool perform_ttl_move_on_insert = true;
+    /// Load balancing, one of:
+    /// - ROUND_ROBIN
+    /// - LEAST_USED
+    const VolumeLoadBalancing load_balancing;
 };
 
 }

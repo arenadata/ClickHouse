@@ -1,10 +1,10 @@
 #pragma once
 
-#include <Common/LRUCache.h>
-#include <Common/SipHash.h>
-#include <Common/UInt128.h>
 #include <Common/ProfileEvents.h>
+#include <Common/HashTable/Hash.h>
+#include <Common/JemallocCacheAllocator.h>
 #include <IO/BufferWithOwnMemory.h>
+#include <Common/CacheBase.h>
 
 
 namespace ProfileEvents
@@ -20,7 +20,7 @@ namespace DB
 
 struct UncompressedCacheCell
 {
-    Memory<> data;
+    Memory<JemallocCacheAllocator> data;
     size_t compressed_size;
     UInt32 additional_bytes;
 };
@@ -33,47 +33,44 @@ struct UncompressedSizeWeightFunction
     }
 };
 
+extern template class CacheBase<UInt128, UncompressedCacheCell, UInt128TrivialHash, UncompressedSizeWeightFunction>;
 
 /** Cache of decompressed blocks for implementation of CachedCompressedReadBuffer. thread-safe.
   */
-class UncompressedCache : public LRUCache<UInt128, UncompressedCacheCell, UInt128TrivialHash, UncompressedSizeWeightFunction>
+class UncompressedCache : public CacheBase<UInt128, UncompressedCacheCell, UInt128TrivialHash, UncompressedSizeWeightFunction>
 {
 private:
-    using Base = LRUCache<UInt128, UncompressedCacheCell, UInt128TrivialHash, UncompressedSizeWeightFunction>;
+    using Base = CacheBase<UInt128, UncompressedCacheCell, UInt128TrivialHash, UncompressedSizeWeightFunction>;
 
 public:
-    UncompressedCache(size_t max_size_in_bytes)
-        : Base(max_size_in_bytes) {}
+    UncompressedCache(const String & cache_policy,
+        CurrentMetrics::Metric size_in_bytes_metric,
+        CurrentMetrics::Metric count_metric,
+        size_t max_size_in_bytes,
+        double size_ratio);
 
     /// Calculate key from path to file and offset.
-    static UInt128 hash(const String & path_to_file, size_t offset)
+    static UInt128 hash(const String & path_to_file, size_t offset);
+
+    template <typename LoadFunc>
+    MappedPtr getOrSet(const Key & key, LoadFunc && load)
     {
-        UInt128 key;
+        auto result = Base::getOrSet(key, std::forward<LoadFunc>(load));
 
-        SipHash hash;
-        hash.update(path_to_file.data(), path_to_file.size() + 1);
-        hash.update(offset);
-        hash.get128(key.low, key.high);
-
-        return key;
-    }
-
-    MappedPtr get(const Key & key)
-    {
-        MappedPtr res = Base::get(key);
-
-        if (res)
-            ProfileEvents::increment(ProfileEvents::UncompressedCacheHits);
-        else
+        if (result.second)
             ProfileEvents::increment(ProfileEvents::UncompressedCacheMisses);
+        else
+            ProfileEvents::increment(ProfileEvents::UncompressedCacheHits);
 
-        return res;
+        return result.first;
     }
 
 private:
-    void onRemoveOverflowWeightLoss(size_t weight_loss) override
+    /// Called for each individual entry being evicted from cache
+    void onEntryRemoval(const size_t weight_loss, const MappedPtr & mapped_ptr) override
     {
         ProfileEvents::increment(ProfileEvents::UncompressedCacheWeightLost, weight_loss);
+        UNUSED(mapped_ptr);
     }
 };
 

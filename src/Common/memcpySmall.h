@@ -1,10 +1,18 @@
 #pragma once
 
-#include <string.h>
+#include <base/MemorySanitizer.h>
+
+#include <cstring>
+#include <sys/types.h> /// ssize_t
 
 #ifdef __SSE2__
-#include <emmintrin.h>
+#    include <emmintrin.h>
+#endif
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#    include <arm_neon.h>
+#      pragma clang diagnostic ignored "-Wreserved-identifier"
+#endif
 
 /** memcpy function could work suboptimal if all the following conditions are met:
   * 1. Size of memory region is relatively small (approximately, under 50 bytes).
@@ -27,10 +35,12 @@
   * Use with caution.
   */
 
+#ifdef __SSE2__ /// Implementation for x86 platform
 namespace detail
 {
     inline void memcpySmallAllowReadWriteOverflow15Impl(char * __restrict dst, const char * __restrict src, ssize_t n)
     {
+        __msan_unpoison_overflow_15(src, n);
         while (n > 0)
         {
             _mm_storeu_si128(reinterpret_cast<__m128i *>(dst),
@@ -39,6 +49,9 @@ namespace detail
             dst += 16;
             src += 16;
             n -= 16;
+
+            /// Avoid clang loop-idiom optimization, which transforms _mm_storeu_si128 to built-in memcpy
+            __asm__ __volatile__("" : : : "memory");
         }
     }
 }
@@ -51,11 +64,34 @@ inline void memcpySmallAllowReadWriteOverflow15(void * __restrict dst, const voi
     detail::memcpySmallAllowReadWriteOverflow15Impl(reinterpret_cast<char *>(dst), reinterpret_cast<const char *>(src), n);
 }
 
+#elif defined(__aarch64__) && defined(__ARM_NEON) /// Implementation for arm platform, similar to x86
+
+namespace detail
+{
+inline void memcpySmallAllowReadWriteOverflow15Impl(char * __restrict dst, const char * __restrict src, ssize_t n)
+{
+    __msan_unpoison_overflow_15(src, n);
+    while (n > 0)
+    {
+        vst1q_s8(reinterpret_cast<signed char *>(dst), vld1q_s8(reinterpret_cast<const signed char *>(src)));
+
+        dst += 16;
+        src += 16;
+        n -= 16;
+    }
+}
+}
+
+inline void memcpySmallAllowReadWriteOverflow15(void * __restrict dst, const void * __restrict src, size_t n)
+{
+    detail::memcpySmallAllowReadWriteOverflow15Impl(reinterpret_cast<char *>(dst), reinterpret_cast<const char *>(src), n);
+}
+
 /** NOTE There was also a function, that assumes, that you could read any bytes inside same memory page of src.
   * This function was unused, and also it requires special handling for Valgrind and ASan.
   */
 
-#else    /// Implementation for other platforms.
+#else /// Implementation for other platforms.
 
 inline void memcpySmallAllowReadWriteOverflow15(void * __restrict dst, const void * __restrict src, size_t n)
 {

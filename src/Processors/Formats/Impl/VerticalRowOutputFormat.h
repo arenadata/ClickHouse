@@ -1,6 +1,5 @@
 #pragma once
 
-#include <Core/Block.h>
 #include <Formats/FormatSettings.h>
 #include <Processors/Formats/IRowOutputFormat.h>
 
@@ -10,19 +9,21 @@ namespace DB
 
 class WriteBuffer;
 class Context;
+class IDataType;
 
 
 /** Stream to output data in format "each value in separate row".
   * Usable to show few rows with many columns.
   */
-class VerticalRowOutputFormat : public IRowOutputFormat
+class VerticalRowOutputFormat final : public IRowOutputFormat
 {
 public:
-    VerticalRowOutputFormat(WriteBuffer & out_, const Block & header_, FormatFactory::WriteCallback callback, const FormatSettings & format_settings_);
+    VerticalRowOutputFormat(WriteBuffer & out_, SharedHeader header_, const FormatSettings & format_settings_);
 
     String getName() const override { return "VerticalRowOutputFormat"; }
 
-    void writeField(const IColumn & column, const IDataType & type, size_t row_num) override;
+private:
+    void writeField(const IColumn & column, const ISerialization & serialization, size_t row_num) override;
     void writeRowStartDelimiter() override;
     void writeRowBetweenDelimiter() override;
     void writeSuffix() override;
@@ -31,22 +32,34 @@ public:
     void writeMaxExtreme(const Columns & columns, size_t row_num) override;
     void writeTotals(const Columns & columns, size_t row_num) override;
 
+    bool supportTotals() const override { return true; }
+    bool supportExtremes() const override { return true; }
+
     void writeBeforeTotals() override;
     void writeBeforeExtremes() override;
 
-protected:
-    virtual void writeValue(const IColumn & column, const IDataType & type, size_t row_num) const;
+    void writeValue(const IColumn & column, const ISerialization & serialization, size_t row_num) const;
+
+    void onRowsReadBeforeUpdate() override { row_number = getRowsReadBefore(); }
 
     /// For totals and extremes.
-    void writeSpecialRow(const Columns & columns, size_t row_num, PortKind port_kind, const char * title);
+    void writeSpecialRow(const Columns & columns, size_t row_num, const char * title);
+
+    void resetFormatterImpl() override
+    {
+        row_number = 0;
+    }
 
     const FormatSettings format_settings;
     size_t field_number = 0;
     size_t row_number = 0;
-    bool was_totals_written = false;
 
     using NamesAndPaddings = std::vector<String>;
     NamesAndPaddings names_and_paddings;
+
+    std::vector<UInt8> is_number;
+    std::vector<UInt8> is_json;
+    bool color;
 };
 
 }

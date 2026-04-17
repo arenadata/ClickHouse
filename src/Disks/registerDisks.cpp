@@ -1,28 +1,44 @@
-#include "registerDisks.h"
+#include <Disks/registerDisks.h>
 
-#include "DiskFactory.h"
+#include <Disks/DiskFactory.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageFactory.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/MetadataStorageFactory.h>
 
-#if !defined(ARCADIA_BUILD)
-#    include <Common/config.h>
-#endif
+#include "config.h"
 
 namespace DB
 {
-void registerDiskLocal(DiskFactory & factory);
-void registerDiskMemory(DiskFactory & factory);
-#if USE_AWS_S3
-void registerDiskS3(DiskFactory & factory);
+
+void registerDiskLocal(DiskFactory & factory, bool global_skip_access_check);
+
+#if USE_SSL
+void registerDiskEncrypted(DiskFactory & factory, bool global_skip_access_check);
 #endif
 
-void registerDisks()
+void registerDiskCache(DiskFactory & factory, bool global_skip_access_check);
+void registerDiskObjectStorage(DiskFactory & factory, bool global_skip_access_check);
+
+
+void registerDisks(bool global_skip_access_check)
 {
     auto & factory = DiskFactory::instance();
 
-    registerDiskLocal(factory);
-    registerDiskMemory(factory);
-#if USE_AWS_S3
-    registerDiskS3(factory);
+    registerDiskLocal(factory, global_skip_access_check);
+
+#if USE_SSL
+    registerDiskEncrypted(factory, global_skip_access_check);
 #endif
+
+    registerDiskCache(factory, global_skip_access_check);
+
+    registerDiskObjectStorage(factory, global_skip_access_check);
+}
+
+void clearDiskRegistry()
+{
+    DiskFactory::instance().clearRegistry();
+    ObjectStorageFactory::instance().clearRegistry();
+    MetadataStorageFactory::instance().clearRegistry();
 }
 
 }

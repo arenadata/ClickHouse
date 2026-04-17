@@ -9,7 +9,7 @@ Many developers can say that the code is the best docs by itself, and they are r
 If you want to help ClickHouse with documentation you can face, for example, the following questions:
 
 - "I don't know how to write."
-    
+
     We have prepared some [recommendations](#what-to-write) for you.
 
 - "I know what I want to write, but I don't know how to contribute to docs."
@@ -36,11 +36,13 @@ Writing the docs is extremely useful for project's users and developers, and gro
 
 ## What is the ClickHouse Documentation
 
-The documentation contains information about all the aspects of the ClickHouse lifecycle: developing, testing, installing, operating, and using. The base language of the documentation is English. The English version is the most actual. All other languages are supported as much as they can by contributors from different countries.
+The documentation contains information about all the aspects of the ClickHouse lifecycle: developing, testing, installing, operating, and using. The base language of the documentation is English. The English version is the most current. All other languages are supported by contributors from different countries as much as possible.
 
-At the moment, [documentation](https://clickhouse.tech/docs) exists in English, Russian, Chinese, Japanese, and Farsi. We store the documentation besides the ClickHouse source code in the [GitHub repository](https://github.com/ClickHouse/ClickHouse/tree/master/docs).
+At the moment, [documentation](https://clickhouse.com/docs) exists in English, Russian, and Chinese. We store the reference documentation alongside the ClickHouse source code in the [GitHub repository](https://github.com/ClickHouse/ClickHouse/tree/master/docs), and user guides in a separate repo [ClickHouse/clickhouse-docs](https://github.com/ClickHouse/clickhouse-docs).
 
-Each language lays in the corresponding folder. Files that are not translated from English are the symbolic links to the English ones.
+To get the latter launch the `get-clickhouse-docs.sh` script.
+
+Each language lies in the corresponding folder. Files that are not translated from English are symbolic links to the English ones.
 
 <a name="how-to-contribute"/>
 
@@ -48,17 +50,17 @@ Each language lays in the corresponding folder. Files that are not translated fr
 
 You can contribute to the documentation in many ways, for example:
 
-- Fork the ClickHouse repository, edit, commit, push, and open a pull request.
+- Fork the ClickHouse and ClickHouse-docs repositories, edit, commit, push, and open a pull request.
 
-    Add the `documentation` label to this pull request for proper automatic checks applying. If you have no permissions for adding labels, the reviewer of your PR adds it.
+    Add the `pr-documentation` label to this pull request for proper automatic checks applying. If you do not have permission to add labels, then the reviewer of your PR will add it.
 
 - Open a required file in the ClickHouse repository and edit it from the GitHub web interface.
 
-    You can do it on GitHub, or on the [ClickHouse Documentation](https://clickhouse.tech/docs/en/) site. Each page of ClickHouse Documentation site contains an "Edit this page" (🖋) element in the upper right corner. Clicking this symbol, you get to the ClickHouse docs file opened for editing.
+    You can do it on GitHub, or on the [ClickHouse Documentation](https://clickhouse.com/docs/en/) site. Each page of ClickHouse Documentation site contains an "Edit this page" (🖋) element in the upper right corner. Clicking this symbol, you get to the ClickHouse docs file opened for editing.
 
     When you are saving a file, GitHub opens a pull-request for your contribution. Add the `documentation` label to this pull request for proper automatic checks applying. If you have no permissions for adding labels, the reviewer of your PR adds it.
 
-Contribute all new information in English language. Other languages are translations from English.
+Contribute all new information in English. Other languages are translations from English.
 
 <a name="markdown-cheatsheet"/>
 
@@ -71,17 +73,17 @@ Contribute all new information in English language. Other languages are translat
     ```
 
 - Bold text: `**asterisks**` or `__underlines__`.
-- Links: `[link text](uri)`. Examples: 
+- Links: `[link text](uri)`. Examples:
 
     - External link: `[ClickHouse repo](https://github.com/ClickHouse/ClickHouse)`
     - Cross link: `[How to build docs](tools/README.md)`
 
 - Images: `![Exclamation sign](uri)`. You can refer to local images as well as remote in internet.
 - Lists: Lists can be of two types:
-    
+
     - `- unordered`: Each item starts from the `-`.
     - `1. ordered`: Each item starts from the number.
-    
+
     A list must be separated from the text by an empty line. Nested lists must be indented with 4 spaces.
 
 - Inline code: `` `in backticks` ``.
@@ -104,10 +106,10 @@ Contribute all new information in English language. Other languages are translat
         4 spaces indented text.
     ```
 
-- Text hidden behind a cut (single sting that opens on click):
+- Text hidden behind a cut (single string that opens on click):
 
     ```text
-    <details markdown="1"> <summary>Visible text</summary> 
+    <details markdown="1"> <summary>Visible text</summary>
         Hidden content.
     </details>`.
     ```
@@ -126,7 +128,7 @@ Contribute all new information in English language. Other languages are translat
 
 ### Adding a New File
 
-When adding a new file:
+{## When adding a new file:
 
 - Make symbolic links for all other languages. You can use the following commands:
 
@@ -134,7 +136,7 @@ When adding a new file:
     $ cd /ClickHouse/clone/directory/docs
     $ ln -sr en/new/file.md lang/new/file.md
     ```
-
+##}
 <a name="adding-a-new-language"/>
 
 ### Adding a New Language
@@ -152,15 +154,15 @@ When everything is ready, we will add the new language to the website.
 
 <a name="target-audience"/>
 
-### Documentation for Different Audience
+### Documentation for Different Audiences
 
-When writing documentation, think about people who read it. Each audience has specific requirements for terms they use in communications.
+When writing documentation, think about the people who read it. Each audience has specific requirements for terms they use in communications.
 
-ClickHouse documentation can be divided by the audience for the following parts:
+ClickHouse documentation can be divided up by the audience for the following parts:
 
-- Conceptual topics in [Introduction](https://clickhouse.tech/docs/en/), tutorials and overviews, changelog.
+- Conceptual topics like tutorials and overviews.
 
-    These topics are for the most common auditory. When editing text in them, use the most common terms that are comfortable for the audience with basic technical skills.
+    These topics are for the most common audience. When editing text in them, use the most common terms that are comfortable for the audience with basic technical skills.
 
 - Query language reference and related topics.
 
@@ -194,13 +196,15 @@ When writing docs, you can use prepared templates. Copy the code of a template a
 Templates:
 
 - [Function](_description_templates/template-function.md)
-- [Setting](_description_templates/template-setting.md)
-- [Table engine](_description_templates/template-table-engine.md)
+- [Server Setting](_description_templates/template-server-setting.md)
+- [Database or Table engine](_description_templates/template-engine.md)
 - [System table](_description_templates/template-system-table.md)
+- [Data type](_description_templates/template-data-type.md)
+- [Statement](_description_templates/template-statement.md)
 
 
 <a name="how-to-build-docs"/>
 
 ## How to Build Documentation
 
-You can build your documentation manually by following the instructions in [docs/tools/README.md](../docs/tools/README.md). Also, our CI runs the documentation build after the `documentation` label is added to PR. You can see the results of a build in the GitHub interface. If you have no permissions to add labels, a reviewer of your PR will add it.
+You can build your documentation manually by following the instructions in the docs repo [contrib-writing-guide](https://github.com/ClickHouse/clickhouse-docs/blob/main/contribute/contrib-writing-guide.md). Also, our CI runs the documentation build after the `documentation` label is added to PR. You can see the results of a build in the GitHub interface. If you have no permissions to add labels, a reviewer of your PR will add it.

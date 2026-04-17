@@ -2,17 +2,13 @@
 
 #include <DataTypes/IDataType.h>
 
-#define MAX_FIXEDSTRING_SIZE 0xFFFFFF
-
+constexpr size_t MAX_FIXEDSTRING_SIZE = 0xFFFFFF;
+constexpr size_t MAX_FIXEDSTRING_SIZE_WITHOUT_SUSPICIOUS = 256;
 
 namespace DB
 {
 
-namespace ErrorCodes
-{
-    extern const int ARGUMENT_OUT_OF_BOUND;
-}
-
+class ColumnFixedString;
 
 class DataTypeFixedString final : public IDataType
 {
@@ -20,18 +16,15 @@ private:
     size_t n;
 
 public:
-    static constexpr bool is_parametric = true;
+    using ColumnType = ColumnFixedString;
 
-    DataTypeFixedString(size_t n_) : n(n_)
-    {
-        if (n == 0)
-            throw Exception("FixedString size must be positive", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
-        if (n > MAX_FIXEDSTRING_SIZE)
-            throw Exception("FixedString size is too large", ErrorCodes::ARGUMENT_OUT_OF_BOUND);
-    }
+    static constexpr bool is_parametric = true;
+    static constexpr auto type_id = TypeIndex::FixedString;
+
+    explicit DataTypeFixedString(size_t n_);
 
     std::string doGetName() const override;
-    TypeIndex getTypeId() const override { return TypeIndex::FixedString; }
+    TypeIndex getTypeId() const override { return type_id; }
 
     const char * getFamilyName() const override { return "FixedString"; }
 
@@ -40,40 +33,13 @@ public:
         return n;
     }
 
-    void serializeBinary(const Field & field, WriteBuffer & ostr) const override;
-    void deserializeBinary(Field & field, ReadBuffer & istr) const override;
-    void serializeBinary(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
-    void deserializeBinary(IColumn & column, ReadBuffer & istr) const override;
-
-    void serializeBinaryBulk(const IColumn & column, WriteBuffer & ostr, size_t offset, size_t limit) const override;
-    void deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, size_t limit, double avg_value_size_hint) const override;
-
-    void serializeText(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
-
-    void deserializeWholeText(IColumn & column, ReadBuffer & istr, const FormatSettings &) const override;
-
-    void serializeTextEscaped(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
-    void deserializeTextEscaped(IColumn & column, ReadBuffer & istr, const FormatSettings &) const override;
-
-    void serializeTextQuoted(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
-    void deserializeTextQuoted(IColumn & column, ReadBuffer & istr, const FormatSettings &) const override;
-
-    void serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
-    void deserializeTextJSON(IColumn & column, ReadBuffer & istr, const FormatSettings &) const override;
-
-    void serializeTextXML(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
-
-    void serializeTextCSV(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
-    void deserializeTextCSV(IColumn & column, ReadBuffer & istr, const FormatSettings &) const override;
-
-    void serializeProtobuf(const IColumn & column, size_t row_num, ProtobufWriter & protobuf, size_t & value_index) const override;
-    void deserializeProtobuf(IColumn & column, ProtobufReader & protobuf, bool allow_add_row, bool & row_added) const override;
-
     MutableColumnPtr createColumn() const override;
 
     Field getDefault() const override;
 
     bool equals(const IDataType & rhs) const override;
+
+    SerializationPtr doGetSerialization(const SerializationInfoSettings &) const override;
 
     bool isParametric() const override { return true; }
     bool haveSubtypes() const override { return false; }
@@ -85,6 +51,8 @@ public:
     bool isCategorial() const override { return true; }
     bool canBeInsideNullable() const override { return true; }
     bool canBeInsideLowCardinality() const override { return true; }
+
+    void updateHashImpl(SipHash & hash) const override;
 };
 
 }

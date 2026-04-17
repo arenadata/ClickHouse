@@ -3,3 +3,8 @@
 *.error
 *.dump
 test_data
+
+/queries/0_stateless/*.gen.sql
+/queries/0_stateless/*.gen.reference
+
+!*.lib

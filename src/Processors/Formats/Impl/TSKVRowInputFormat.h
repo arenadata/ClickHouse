@@ -1,7 +1,7 @@
 #pragma once
 
-#include <Core/Block.h>
 #include <Processors/Formats/IRowInputFormat.h>
+#include <Processors/Formats/ISchemaReader.h>
 #include <Formats/FormatSettings.h>
 #include <Common/HashTable/HashMap.h>
 
@@ -20,27 +20,32 @@ class ReadBuffer;
   * An equal sign can be escaped in the field name.
   * Also, as an additional element there may be a useless tskv fragment - it needs to be ignored.
   */
-class TSKVRowInputFormat : public IRowInputFormat
+class TSKVRowInputFormat final : public IRowInputFormat
 {
 public:
-    TSKVRowInputFormat(ReadBuffer & in_, Block header_, Params params_, const FormatSettings & format_settings_);
+    TSKVRowInputFormat(ReadBuffer & in_, SharedHeader header_, Params params_, const FormatSettings & format_settings_);
 
     String getName() const override { return "TSKVRowInputFormat"; }
 
+    void resetParser() override;
+
+private:
+    void readPrefix() override;
     bool readRow(MutableColumns & columns, RowReadExtension &) override;
     bool allowSyncAfterError() const override { return true; }
     void syncAfterError() override;
-    void resetParser() override;
 
+    bool supportsCountRows() const override { return true; }
+    size_t countRows(size_t max_block_size) override;
+    bool supportsCustomSerializations() const override { return true; }
 
-private:
     const FormatSettings format_settings;
 
     /// Buffer for the read from the stream the field name. Used when you have to copy it.
     String name_buf;
 
     /// Hash table matching `field name -> position in the block`. NOTE You can use perfect hash map.
-    using NameMap = HashMap<StringRef, size_t, StringRefHash>;
+    using NameMap = HashMap<std::string_view, size_t, StringViewHash>;
     NameMap name_map;
 
     /// Set of columns for which the values were read. The rest will be filled with default values.
@@ -49,6 +54,17 @@ private:
     std::vector<UInt8> seen_columns;
     /// These sets may be different, because if null_as_default=1 read_columns[i] will be false and seen_columns[i] will be true
     /// for row like ..., non-nullable column name=\N, ...
+};
+
+class TSKVSchemaReader : public IRowWithNamesSchemaReader
+{
+public:
+    TSKVSchemaReader(ReadBuffer & in_, const FormatSettings & format_settings_);
+
+private:
+    NamesAndTypesList readRowAndGetNamesAndDataTypes(bool & eof) override;
+
+    bool first_row = true;
 };
 
 }
