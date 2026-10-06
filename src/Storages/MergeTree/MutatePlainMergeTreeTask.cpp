@@ -161,16 +161,19 @@ bool MutatePlainMergeTreeTask::executeStep()
 
                     storage.renameTempPartAndReplaceUnlocked(new_part, transaction, lock, /*rename_in_transaction=*/ false);
 
-                    /// Final guard: a `KILL MUTATION` that lands between the pre-rename check above
-                    /// and the Active promotion at `transaction.commit()` must not publish the part.
-                    /// Throwing is safe: the part is already PreActive inside `transaction`; the
-                    /// non-empty destructor calls `rollback()`, which sets the part to Outdated and
-                    /// removes it from the working set. The exception propagates to `cancel()`,
-                    /// which removes the files on disk.
-                    if ((*merge_list_entry)->is_cancelled)
-                        throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
-
-                    transaction.commit(lock);
+                    /// Keep the pre-rename re-check above and pass the same cancellation check into
+                    /// `transaction.commit(lock)`: a `KILL MUTATION` that lands between the pre-rename
+                    /// check and the Active promotion inside `commit` must not publish the part. The
+                    /// check runs inside the commit path, under the parts lock, immediately before the
+                    /// PreActive -> Active handoff. Throwing is safe: the part is already PreActive
+                    /// inside `transaction`; the non-empty destructor calls `rollback()`, which sets
+                    /// the part to Outdated and removes it from the working set. The exception
+                    /// propagates to `cancel()`, which removes the files on disk.
+                    transaction.commit(lock, [&]
+                    {
+                        if ((*merge_list_entry)->is_cancelled)
+                            throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
+                    });
                 }
 
                 mutate_task->updateProfileEvents();

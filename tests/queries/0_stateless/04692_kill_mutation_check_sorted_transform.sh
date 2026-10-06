@@ -53,6 +53,16 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# The wait succeeded, i.e. the transform is genuinely paused mid-mutation. Prove it is still in flight:
+# exactly one mutation exists, not done, with no failure yet, and none has completed. If KILL MUTATION
+# below had nothing to cancel, this assertion would trip and the test would be meaningless.
+pending=$($CLICKHOUSE_CLIENT -q "SELECT count() FROM system.mutations WHERE database = '${CLICKHOUSE_DATABASE}' AND table = '${TABLE}' AND is_done = 0 AND latest_fail_reason = ''")
+done_ok_before=$($CLICKHOUSE_CLIENT -q "SELECT count() FROM system.mutations WHERE database = '${CLICKHOUSE_DATABASE}' AND table = '${TABLE}' AND is_done = 1 AND latest_fail_reason = ''")
+if [ "${pending:-0}" != "1" ] || [ "${done_ok_before:-0}" != "0" ]; then
+    echo "FAIL: expected exactly one in-flight mutation before KILL (pending=${pending:-0}, done_ok=${done_ok_before:-0})"
+    exit 1
+fi
+
 # Cancel the running mutation. This must cancel the mutation pipeline so that CheckSortedTransform
 # observes is_cancelled() and stops as soon as it resumes.
 $CLICKHOUSE_CLIENT -q "KILL MUTATION WHERE database = '${CLICKHOUSE_DATABASE}' AND table = '${TABLE}'" >/dev/null 2>&1

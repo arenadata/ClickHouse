@@ -363,7 +363,21 @@ bool MutateFromLogEntryTask::finalize(ReplicatedMergeMutateTaskBase::PartLogWrit
 
     try
     {
-        storage.checkPartChecksumsAndCommit(*transaction_ptr, new_part, hardlinked_files);
+        /// Pass the cancellation check into the commit path itself: `checkPartChecksumsAndCommit` runs
+        /// the ZooKeeper `multi`, then `Transaction::commit`. Re-checking only on the caller side above
+        /// leaves a window in which a `KILL MUTATION` landing after that check still publishes the part
+        /// during `Transaction::commit`'s PreActive -> Active handoff. Forwarded to `commit`, the check
+        /// runs under the parts lock immediately before the handoff. The part directory has already been
+        /// renamed to its final name, so roll the transaction back to return the part to its temporary
+        /// name before throwing; the caller's `cancel()` then removes the files on disk.
+        storage.checkPartChecksumsAndCommit(*transaction_ptr, new_part, hardlinked_files, /*replace_zero_copy_lock=*/ false, [&]
+        {
+            if ((*merge_mutate_entry)->is_cancelled)
+            {
+                transaction_ptr->rollback();
+                throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
+            }
+        });
     }
     catch (const Exception & e)
     {
