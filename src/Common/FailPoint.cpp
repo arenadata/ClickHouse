@@ -680,12 +680,24 @@ std::vector<FailPointInjection::FailPointInfo> FailPointInjection::getFailPoints
 {
     std::vector<FailPointInfo> result;
 
+    /// Snapshot channel pause state under the lock. Done once before iterating, not inside
+    /// the SUB_M macro, to avoid repeated lock/unlock cycles. A failpoint with no channel
+    /// entry is not paused.
+    std::unordered_map<String, bool> paused_state;
+    {
+        std::lock_guard lock(mu);
+        for (const auto & [name, channel] : fail_point_wait_channels)
+            paused_state[name] = channel->pause_epoch > channel->resume_epoch;
+    }
+
 #define SUB_M(NAME, TP)                                   \
     result.push_back(                                     \
         FailPointInfo{                                    \
             .name = FailPoints::NAME,                     \
             .type = FailPointType::TP,                    \
             .enabled = fiu_status(FailPoints::NAME) != 0, \
+            .paused = paused_state.count(FailPoints::NAME) \
+                && paused_state.at(FailPoints::NAME),      \
         });
 #define ADD_ONCE(NAME) SUB_M(NAME, Once)
 #define ADD_REGULAR(NAME) SUB_M(NAME, Regular)

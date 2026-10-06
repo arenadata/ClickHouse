@@ -53,6 +53,14 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# SYSTEM WAIT FAILPOINT PAUSE does not fail the query if the wait times out, so cross-check via
+# system.fail_points: a thread must really be paused at the failpoint right now.
+paused=$($CLICKHOUSE_CLIENT -q "SELECT paused FROM system.fail_points WHERE name = 'check_sorted_transform_pause'")
+if [ "${paused:-0}" != "1" ]; then
+    echo "FAIL: no thread is paused at check_sorted_transform_pause (paused=${paused:-0})"
+    exit 1
+fi
+
 # The wait succeeded, i.e. the transform is genuinely paused mid-mutation. Prove it is still in flight:
 # exactly one mutation exists, not done, with no failure yet, and none has completed. If KILL MUTATION
 # below had nothing to cancel, this assertion would trip and the test would be meaningless.

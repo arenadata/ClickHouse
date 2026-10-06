@@ -85,6 +85,10 @@ public:
 
         /// Whether the failpoint is currently active (i.e., present in fail_point_wait_channels).
         bool enabled;
+
+        /// Whether at least one thread is currently paused at this failpoint (pause_epoch > resume_epoch).
+        /// Only meaningful for pauseable failpoints; false for non-pauseable ones or when no channel exists.
+        bool paused;
     };
 
     /** Block the calling thread at a pauseable failpoint until notifyFailPoint()
