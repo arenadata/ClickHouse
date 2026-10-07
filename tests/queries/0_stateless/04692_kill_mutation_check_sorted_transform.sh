@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Tags: no-parallel, no-debug
+# Tags: no-parallel, no-debug, no-fasttest
 # Test that KILL MUTATION interrupts a running mutation inside CheckSortedTransform.
 # no-parallel: uses a PAUSEABLE_ONCE failpoint that fires exactly once globally.
 # no-debug: background merges inject CheckSortedTransform only in debug builds, so in a debug
 # build a concurrent merge could hit the failpoint instead of the mutation and make the test flaky.
+# no-fasttest: an armed failpoint fires in every concurrently running query, so the test must run
+# alone, and tests that run alone are kept out of the fast test.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
