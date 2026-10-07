@@ -717,8 +717,8 @@ std::vector<FailPointInjection::FailPointInfo> FailPointInjection::getFailPoints
             .name = FailPoints::NAME,                     \
             .type = FailPointType::TP,                    \
             .enabled = fiu_status(FailPoints::NAME) != 0, \
-            .paused = paused_state.count(FailPoints::NAME) \
-                && paused_state.at(FailPoints::NAME),      \
+            .paused = paused_state.contains(FailPoints::NAME) \
+                && paused_state.at(FailPoints::NAME),         \
         });
 #define ADD_ONCE(NAME) SUB_M(NAME, Once)
 #define ADD_REGULAR(NAME) SUB_M(NAME, Regular)
